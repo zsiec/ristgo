@@ -17,12 +17,14 @@ var (
 	_ wire.Feedback = wire.RttEchoResponse{}
 	_ wire.Feedback = wire.SenderReport{}
 	_ wire.Feedback = wire.Keepalive{}
+	_ wire.Feedback = wire.ExtSeq{}
 
 	_ wire.Feedback = (*wire.NackRequest)(nil)
 	_ wire.Feedback = (*wire.RttEchoRequest)(nil)
 	_ wire.Feedback = (*wire.RttEchoResponse)(nil)
 	_ wire.Feedback = (*wire.SenderReport)(nil)
 	_ wire.Feedback = (*wire.Keepalive)(nil)
+	_ wire.Feedback = (*wire.ExtSeq)(nil)
 )
 
 // feedbackName exhaustively dispatches over the sealed variant set, the way
@@ -40,6 +42,8 @@ func feedbackName(f wire.Feedback) string {
 		return "SenderReport"
 	case wire.Keepalive:
 		return "Keepalive"
+	case wire.ExtSeq:
+		return "ExtSeq"
 	default:
 		return "unknown"
 	}
@@ -55,6 +59,7 @@ func TestFeedbackTypeSwitch(t *testing.T) {
 		{"RttEchoResponse", wire.RttEchoResponse{Timestamp: 42, ProcessingDelay: 7}},
 		{"SenderReport", wire.SenderReport{NTP: 99, RTPTime: 100}},
 		{"Keepalive", wire.Keepalive{}},
+		{"ExtSeq", wire.ExtSeq{SeqHigh: 0x1234}},
 	}
 
 	for _, tt := range tests {

@@ -95,7 +95,12 @@ type MediaPacket struct {
 // policy) — never branch on profile inside flow.
 type Feedback interface {
 	// isFeedback is the sealing marker. It is intentionally unexported so
-	// that no type outside this package can satisfy Feedback.
+	// that no new variant can be added outside this package. Note the
+	// limit of the guarantee: a foreign type CAN satisfy Feedback by
+	// embedding a variant, but its dynamic type matches no case of an
+	// exhaustive switch over the variants defined here — so switches must
+	// treat their default case as a reachable programming error, not as
+	// impossible.
 	isFeedback()
 }
 
@@ -163,9 +168,27 @@ type SenderReport struct {
 // against the waist without a profile branch.
 type Keepalive struct{}
 
+// ExtSeq announces the upper 16 bits of the 32-bit extended sequence space
+// that subsequent 16-bit NACK entries belong to. On the Main profile wire it
+// is the EXTSEQ RTCP APP packet (PT 204, name "RIST", subtype 1) defined by
+// VSF TR-06-2 §8.4, sent immediately before the NACK packet it qualifies.
+//
+// It exists at the waist because widening is a codec concern: a receiving
+// codec folds SeqHigh into the following NackRequest's 32-bit Missing values,
+// and a sending codec derives ExtSeq packets by splitting a NackRequest's
+// Missing list by upper half. flow itself never emits or consumes ExtSeq —
+// it lives here so the profile strategies can exchange it without a profile
+// branch.
+type ExtSeq struct {
+	// SeqHigh is the most significant 16 bits prepended to the 16-bit
+	// starting sequence numbers of the NACK entries that follow.
+	SeqHigh uint16
+}
+
 // Marker-method implementations sealing the Feedback variant set.
 func (NackRequest) isFeedback()     {}
 func (RttEchoRequest) isFeedback()  {}
 func (RttEchoResponse) isFeedback() {}
 func (SenderReport) isFeedback()    {}
 func (Keepalive) isFeedback()       {}
+func (ExtSeq) isFeedback()          {}
