@@ -98,6 +98,9 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 	if err != nil {
 		return nil, err
 	}
+	if mp.EAPClient, err = buildEAPClient(cfg); err != nil {
+		return nil, err
+	}
 	conn, err := socket.ListenEphemeralSingle("")
 	if err != nil {
 		return nil, err

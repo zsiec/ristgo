@@ -3,6 +3,7 @@ package ristgo_test
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -136,6 +137,135 @@ func TestE2EMainProfile(t *testing.T) {
 				t.Fatal("receiver delivered 0 packets")
 			}
 		})
+	}
+}
+
+// eapConfig returns a Main-profile config with PSK (AES-256) for the data
+// channel and EAP-SRP credentials gating it.
+func eapConfig(username, password string) ristgo.Config {
+	cfg := mainConfig("ristgo-eap-psk", 256)
+	cfg.Username = username
+	cfg.Password = password
+	cfg.BufferMin = 300 * time.Millisecond
+	cfg.BufferMax = 300 * time.Millisecond
+	return cfg
+}
+
+// TestE2EMainEAPSRP verifies the full authenticated Main flow end to end: the
+// sender and receiver run the EAP-SRP handshake (over GRE EAPOL frames) before
+// the data channel opens, then stream PSK-encrypted media that is delivered
+// bit-exact. It exercises the session's EAPOL routing, the handshake pumping,
+// and the auth gate (the sender holds media and the receiver holds delivery
+// until authentication succeeds).
+func TestE2EMainEAPSRP(t *testing.T) {
+	const totalBytes = 64 * 1024
+	const chunk = 1316
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+
+	rx, err := ristgo.NewReceiver(addr, eapConfig("rist", "mainprofile"))
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewSender(addr, eapConfig("rist", "mainprofile"))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+
+	payload := make([]byte, totalBytes)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	want := sha256.Sum256(payload)
+
+	done := make(chan [32]byte, 1)
+	go func() {
+		rx.SetReadDeadline(time.Now().Add(10 * time.Second))
+		got := make([]byte, 0, totalBytes)
+		buf := make([]byte, 4096)
+		h := sha256.New()
+		for len(got) < totalBytes {
+			n, rerr := rx.Read(buf)
+			if n > 0 {
+				h.Write(buf[:n])
+				got = append(got, buf[:n]...)
+			}
+			if rerr != nil {
+				done <- [32]byte{}
+				return
+			}
+		}
+		var sum [32]byte
+		copy(sum[:], h.Sum(nil))
+		done <- sum
+	}()
+
+	tx.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	for off := 0; off < totalBytes; off += chunk {
+		end := off + chunk
+		if end > totalBytes {
+			end = totalBytes
+		}
+		if _, werr := tx.Write(payload[off:end]); werr != nil {
+			t.Fatalf("Write at %d: %v", off, werr)
+		}
+		if off%(chunk*16) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	select {
+	case got := <-done:
+		if got != want {
+			t.Fatalf("authenticated Main delivery hash mismatch (delivered=%d)", rx.Stats().Delivered)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out on the authenticated Main stream")
+	}
+}
+
+// TestE2EMainEAPSRPWrongPassword verifies that a sender with the wrong password
+// fails the EAP-SRP handshake: the data channel never opens, and the receiver's
+// Read surfaces ErrAuth rather than delivering anything.
+func TestE2EMainEAPSRPWrongPassword(t *testing.T) {
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+
+	rx, err := ristgo.NewReceiver(addr, eapConfig("rist", "mainprofile"))
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewSender(addr, eapConfig("rist", "WRONG-password"))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+
+	// Try to push media; with auth failing, nothing should ever be delivered.
+	go func() {
+		tx.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1316)
+		for i := 0; i < 64; i++ {
+			if _, err := tx.Write(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	rx.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := rx.Read(make([]byte, 4096))
+	if n != 0 {
+		t.Fatalf("delivered %d bytes despite failed authentication", n)
+	}
+	if err == nil {
+		t.Fatal("Read returned nil error despite failed authentication")
+	}
+	// The receiver tears down with ErrAuth on the failed handshake (or the read
+	// deadline fires first if the FAILURE is still in flight); both are
+	// acceptable proof that the data channel never opened.
+	if !errors.Is(err, ristgo.ErrAuth) && !errors.Is(err, ristgo.ErrTimeout) {
+		t.Fatalf("Read error = %v, want ErrAuth or ErrTimeout", err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package ristgo
 
 import (
+	crand "crypto/rand"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -9,8 +10,10 @@ import (
 
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
+	"github.com/zsiec/ristgo/internal/eap"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/session"
+	"github.com/zsiec/ristgo/internal/srp"
 )
 
 // wrapInvalid wraps a validation error so callers can match it with
@@ -78,6 +81,47 @@ func buildMainParams(cfg Config) (*session.MainParams, error) {
 	return mp, nil
 }
 
+// buildEAPClient builds the EAP-SRP authenticatee for a Main sender when
+// credentials are configured (the sender authenticates to the receiver); it
+// returns (nil, nil) when no Username is set.
+func buildEAPClient(cfg Config) (*eap.Authenticatee, error) {
+	if cfg.Username == "" {
+		return nil, nil
+	}
+	a, err := eap.NewAuthenticatee(cfg.Username, cfg.Password)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	return a, nil
+}
+
+// buildEAPServer builds the EAP-SRP authenticator for a Main receiver when
+// credentials are configured (the receiver authenticates the sender). It
+// provisions a fresh random salt and the verifier derived from the configured
+// username/password, served by a single-user lookup. Returns (nil, nil) when no
+// Username is set.
+func buildEAPServer(cfg Config) (*eap.Authenticator, error) {
+	if cfg.Username == "" {
+		return nil, nil
+	}
+	salt := make([]byte, 32)
+	if _, err := crand.Read(salt); err != nil {
+		return nil, fmt.Errorf("%w: SRP salt: %v", ErrInvalidConfig, err)
+	}
+	verifier := srp.MakeVerifier(srp.DefaultGroup(), cfg.Username, cfg.Password, salt)
+	lookup := func(user string) ([]byte, []byte, bool) {
+		if user == cfg.Username {
+			return verifier, salt, true
+		}
+		return nil, nil, false
+	}
+	a, err := eap.NewAuthenticator(lookup)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	return a, nil
+}
+
 // toFlowConfig maps the public Config to the deterministic core's config.
 func toFlowConfig(cfg Config) flow.Config {
 	return flow.Config{
@@ -117,6 +161,7 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 		ErrTimeout:        ErrTimeout,
 		ErrSessionTimeout: ErrSessionTimeout,
 		ErrBufferOverflow: ErrBufferOverflow,
+		ErrAuth:           ErrAuth,
 	}
 }
 

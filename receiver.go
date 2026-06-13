@@ -71,6 +71,9 @@ func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
 	if err != nil {
 		return nil, err
 	}
+	if mp.EAPServer, err = buildEAPServer(cfg); err != nil {
+		return nil, err
+	}
 	conn, err := socket.ListenSingle(host, port)
 	if err != nil {
 		return nil, err

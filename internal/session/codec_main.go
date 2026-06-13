@@ -412,6 +412,39 @@ func (c *mainCodec) frame(dst, inner []byte) ([]byte, error) {
 	return append(out, ct...), nil
 }
 
+// encodeEAPOL frames an EAP-over-GRE authentication payload: the GRE header
+// (version 1, sequence present, protocol type EAPOL) followed by the EAP
+// payload, never encrypted (libRIST excludes EAPOL from PSK, gre.c:25). It
+// increments the GRE sequence once per call, like frame.
+func (c *mainCodec) encodeEAPOL(dst, eap []byte) ([]byte, error) {
+	seq := c.greSeq
+	c.greSeq++
+	hdr := gre.Header{
+		Version:  gre.VersionMin,
+		HasSeq:   true,
+		ProtType: gre.ProtoEAPOL,
+		Seq:      seq,
+	}
+	out, err := hdr.AppendTo(dst)
+	if err != nil {
+		return dst, err
+	}
+	return append(out, eap...), nil
+}
+
+// peekEAPOL reports whether b is an EAP-over-GRE authentication frame and, if
+// so, returns the EAP payload (the bytes after the GRE header; EAPOL is never
+// encrypted). The host runs it before decodeMain so authentication frames route
+// to the EAP state machine instead of the media/RTCP demux. It never panics on
+// arbitrary input.
+func (c *mainCodec) peekEAPOL(b []byte) (eap []byte, ok bool) {
+	hdr, off, err := gre.Parse(b)
+	if err != nil || hdr.ProtType != gre.ProtoEAPOL {
+		return nil, false
+	}
+	return b[off:], true
+}
+
 // decodeMain parses one Main-profile datagram. It returns isMedia true with the
 // reconstructed MediaPacket when the inner packet is RTP media, or isMedia
 // false with the decoded feedback list when it is compound RTCP, demultiplexing

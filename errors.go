@@ -27,4 +27,10 @@ var (
 	// more data, e.g. the sender's retransmission history or the
 	// receiver's recovery buffer is full because the consumer is too slow.
 	ErrBufferOverflow = errors.New("rist: buffer overflow")
+
+	// ErrAuth is returned when the Main-profile EAP-SRP handshake fails — the
+	// configured username/password did not authenticate against the peer (or the
+	// peer's proof was refused). It is reported by Read/Write after the session
+	// tears down.
+	ErrAuth = errors.New("rist: authentication failed")
 )

@@ -20,6 +20,7 @@ import (
 
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
+	"github.com/zsiec/ristgo/internal/eap"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/peer"
 	"github.com/zsiec/ristgo/internal/rtcp"
@@ -59,6 +60,9 @@ type Config struct {
 	ErrTimeout        error
 	ErrSessionTimeout error
 	ErrBufferOverflow error
+	// ErrAuth is returned to the caller when the Main-profile EAP-SRP handshake
+	// fails (wrong credentials or a refused proof). Supplied by the public layer.
+	ErrAuth error
 
 	// Main, when non-nil, selects the Main profile (VSF TR-06-2): the flow is
 	// tunnelled over a single GRE port instead of the Simple even/odd RTP/RTCP
@@ -83,6 +87,14 @@ type MainParams struct {
 	// VirtSrcPort and VirtDstPort are the reduced-overhead virtual ports.
 	VirtSrcPort uint16
 	VirtDstPort uint16
+
+	// EAPClient, when non-nil, runs the EAP-SRP authenticatee handshake (a Main
+	// sender authenticating to the peer); outbound media is held until it
+	// succeeds. EAPServer, when non-nil, runs the authenticator handshake (a
+	// Main receiver authenticating the peer); delivery is held until it
+	// succeeds. At most one is set; both nil means no authentication.
+	EAPClient *eap.Authenticatee
+	EAPServer *eap.Authenticator
 }
 
 // inbound is one datagram handed from a reader goroutine to the event loop.
@@ -105,6 +117,15 @@ type Session struct {
 	// session reads/writes one GRE-tunnelled socket and demuxes media vs
 	// feedback by the inner payload-type byte instead of by socket.
 	main *mainCodec
+
+	// eapClient/eapServer drive the Main-profile EAP-SRP handshake when
+	// authentication is configured; at most one is non-nil. authed gates the
+	// data channel: true once the handshake succeeds (or immediately when no
+	// EAP role is configured). A sender holds outbound media and a receiver
+	// holds delivery until authed.
+	eapClient *eap.Authenticatee
+	eapServer *eap.Authenticator
+	authed    bool
 
 	// timers is the host's declarative timer wheel: the deadline the flow
 	// requested for each TimerID. A single time.Timer tracks the earliest.
@@ -215,10 +236,16 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	} else {
 		s.delivery = make(chan []byte, 4096)
 	}
+	s.authed = true // no EAP gate by default (Simple, or Main without auth)
 	if cfg.Main != nil {
 		mp := cfg.Main
 		s.main = newMainCodec(mp.SendKey, mp.RecvKey, mp.KeySize256, mp.VirtSrcPort, mp.VirtDstPort, mp.NPD, cfg.SSRC, cfg.CNAME, cfg.Bitmask)
 		s.mainIn = make(chan inbound, 256)
+		s.eapClient = mp.EAPClient
+		s.eapServer = mp.EAPServer
+		if s.eapClient != nil || s.eapServer != nil {
+			s.authed = false // hold the data channel until the handshake succeeds
+		}
 	} else {
 		s.rtcpIn = make(chan inbound, 64)
 		if !sender {
@@ -271,8 +298,20 @@ func (s *Session) loop() {
 	if s.sender {
 		s.sendKeepalive(s.clk.Now())
 	}
+	// A Main-profile EAP client opens authentication immediately with an
+	// EAPOL-START; media is held (appIn is gated below) until it succeeds.
+	if s.eapClient != nil {
+		s.sendEAP(s.eapClient.Start(), s.clk.Now())
+	}
 
 	for {
+		// Hold outbound media (appIn) until the data channel is authenticated;
+		// a nil channel never fires in the select, applying back-pressure to
+		// Write until the EAP handshake completes (or instantly when unused).
+		var appIn chan []byte
+		if s.authed {
+			appIn = s.appIn
+		}
 		select {
 		case <-s.done:
 			return
@@ -302,7 +341,10 @@ func (s *Session) loop() {
 			s.peer.LearnMedia(d.src)
 			s.peer.LearnRTCP(d.src)
 			s.peer.Observe(now)
-			if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
+			if eapPayload, ok := s.main.peekEAPOL(d.data); ok {
+				// Authentication frame: route to the EAP state machine.
+				s.handleEAP(now, eapPayload)
+			} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
 				if isMedia {
 					s.flow.Feed(now, 0, pkt)
 					s.observeRx(now, pkt)
@@ -320,7 +362,7 @@ func (s *Session) loop() {
 				s.logf("main: drop undecodable datagram (%d bytes): %v", len(d.data), err)
 			}
 			s.afterInput(now, timer)
-		case p := <-s.appIn:
+		case p := <-appIn:
 			now := s.clk.Now()
 			s.flow.PushApp(now, p)
 			s.afterInput(now, timer)
@@ -480,6 +522,62 @@ func (s *Session) writeFeedback(b []byte) error {
 	return s.conn.WriteRTCP(b, s.peer.RTCP)
 }
 
+// handleEAP drives the Main-profile EAP-SRP handshake for one received EAPOL
+// payload: it feeds the configured role, sends any reply EAPOL frame, opens the
+// data channel (authed) once the handshake authenticates, and tears the session
+// down with ErrAuth if it definitively fails.
+func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
+	var (
+		out  *eap.Frame
+		err  error
+		role interface {
+			Authenticated() bool
+			Done() bool
+		}
+	)
+	switch {
+	case s.eapClient != nil:
+		out, err = s.eapClient.Recv(payload)
+		role = s.eapClient
+	case s.eapServer != nil:
+		out, err = s.eapServer.Recv(payload)
+		role = s.eapServer
+	default:
+		return // not configured for EAP; ignore a stray EAPOL frame
+	}
+	if out != nil {
+		s.sendEAP(*out, now)
+	}
+	if err != nil {
+		s.logf("eap: %v", err)
+	}
+	if role.Authenticated() {
+		s.authed = true
+	} else if role.Done() {
+		// A terminal state without success means authentication failed.
+		s.shutdown(s.cfg.ErrAuth)
+	}
+}
+
+// sendEAP frames an EAP frame as a GRE EAPOL datagram and sends it to the peer
+// over the single Main socket. EAPOL is never encrypted (gre.c:25).
+func (s *Session) sendEAP(f eap.Frame, now clock.Timestamp) {
+	if s.main == nil || s.peer.Media == nil {
+		return
+	}
+	s.rtcpBuf = s.rtcpBuf[:0]
+	b, err := s.main.encodeEAPOL(s.rtcpBuf, f.AppendTo(nil))
+	if err != nil {
+		s.logf("encode eap: %v", err)
+		return
+	}
+	s.rtcpBuf = b
+	if err := s.conn.WriteMedia(b, s.peer.Media); err != nil {
+		s.logf("write eap: %v", err)
+	}
+	s.lastTx = now
+}
+
 // queueDelivery copies the delivered payload onto the read queue. The flow
 // hands back a reference into the receive buffer; the copy lets that buffer be
 // reclaimed and decouples the loop from a slow Read.
@@ -490,6 +588,9 @@ func (s *Session) writeFeedback(b []byte) error {
 // with ErrBufferOverflow — the next Read surfaces it. (shutdown is safe to call
 // from the loop; it does not wait on goroutines.)
 func (s *Session) queueDelivery(payload []byte) {
+	if !s.authed {
+		return // hold delivery until the EAP-SRP handshake authenticates the peer
+	}
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
 	select {
