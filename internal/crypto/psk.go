@@ -327,6 +327,21 @@ func NewDecryptor(password []byte, keyBits int) (*Decryptor, error) {
 	}, nil
 }
 
+// SetKeyBits sets the AES key size used for subsequent decryptions, forcing a
+// re-derivation if it changed. The Main receive path calls it with the size the
+// GRE H bit indicates (128 or 256; rist-common.c:2991), so a peer's configured
+// aes-type need not match this side's — matching libRIST, which reads the H bit
+// and keys accordingly. When the size is unchanged it is a no-op, so the warm
+// 0-alloc decrypt path is preserved. An invalid size is ignored here and
+// surfaces as ErrInvalidKeySize on the next Decrypt.
+func (d *Decryptor) SetKeyBits(keyBits int) {
+	if keyBits == d.keyBits {
+		return
+	}
+	d.keyBits = keyBits
+	d.hasNonce = false // force re-derivation at the new key size
+}
+
 // Decrypt decrypts len(src) payload bytes carried under the given inbound GRE
 // nonce and sequence number, appending the plaintext to dst and returning the
 // extended slice. A zero nonce is rejected with ErrZeroNonce (psk.c:271-275).

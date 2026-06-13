@@ -139,6 +139,79 @@ func TestE2EMainProfile(t *testing.T) {
 	}
 }
 
+// TestE2EMainMixedKeySize verifies the GRE-H-bit hardening end to end: the
+// sender is configured AES-256 and the receiver AES-128 (a mismatch), yet the
+// stream is delivered bit-exact because each side honors the peer's GRE H bit
+// and derives the decryption key at the signalled size — media (256, set by the
+// sender) and the receiver's feedback (128) both decrypt across the mismatch.
+func TestE2EMainMixedKeySize(t *testing.T) {
+	const totalBytes = 64 * 1024
+	const chunk = 1316
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+
+	rx, err := ristgo.NewReceiver(addr, mainConfig("ristgo-mixed", 128))
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewSender(addr, mainConfig("ristgo-mixed", 256))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+
+	payload := make([]byte, totalBytes)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	want := sha256.Sum256(payload)
+
+	done := make(chan [32]byte, 1)
+	go func() {
+		rx.SetReadDeadline(time.Now().Add(10 * time.Second))
+		got := make([]byte, 0, totalBytes)
+		buf := make([]byte, 4096)
+		h := sha256.New()
+		for len(got) < totalBytes {
+			n, rerr := rx.Read(buf)
+			if n > 0 {
+				h.Write(buf[:n])
+				got = append(got, buf[:n]...)
+			}
+			if rerr != nil {
+				done <- [32]byte{}
+				return
+			}
+		}
+		var sum [32]byte
+		copy(sum[:], h.Sum(nil))
+		done <- sum
+	}()
+
+	tx.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	for off := 0; off < totalBytes; off += chunk {
+		end := off + chunk
+		if end > totalBytes {
+			end = totalBytes
+		}
+		if _, werr := tx.Write(payload[off:end]); werr != nil {
+			t.Fatalf("Write at %d: %v", off, werr)
+		}
+		if off%(chunk*16) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	select {
+	case got := <-done:
+		if got != want {
+			t.Fatalf("mixed-key-size delivery hash mismatch (delivered=%d)", rx.Stats().Delivered)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out on the mixed-key-size stream")
+	}
+}
+
 // TestE2EMainCloseUnblocksRead is the Main-profile counterpart of
 // TestE2ECloseUnblocksRead: it verifies Close on a Main receiver wakes a blocked
 // Read with ErrClosed and that the session's goroutines — the event loop and the

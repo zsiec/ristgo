@@ -40,6 +40,38 @@ func TestCTRMatchesStdlib(t *testing.T) {
 	}
 }
 
+// TestDecryptorSetKeyBits verifies the GRE-H-bit hardening: a Decryptor
+// constructed with the "wrong" key size adapts to the sender's actual size via
+// SetKeyBits and decrypts correctly, and a no-op SetKeyBits leaves the warm path
+// intact.
+func TestDecryptorSetKeyBits(t *testing.T) {
+	const pw = "ristgo-mixed-keysize"
+	k, err := NewKey([]byte(pw), KeySize256, 0, false)
+	if err != nil {
+		t.Fatalf("NewKey: %v", err)
+	}
+	ct, err := k.Encrypt(7, nil, []byte("hello world"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	// A decryptor initialized at 128 must adapt to the 256-bit ciphertext.
+	d, err := NewDecryptor([]byte(pw), KeySize128)
+	if err != nil {
+		t.Fatalf("NewDecryptor: %v", err)
+	}
+	d.SetKeyBits(KeySize256)
+	pt, err := d.Decrypt(k.Nonce(), 7, nil, ct)
+	if err != nil || string(pt) != "hello world" {
+		t.Fatalf("after SetKeyBits(256): pt=%q err=%v", pt, err)
+	}
+	// A redundant SetKeyBits at the same size must not disturb the keyed state.
+	d.SetKeyBits(KeySize256)
+	if pt2, err := d.Decrypt(k.Nonce(), 8, nil, ct); err != nil || len(pt2) != len(ct) {
+		t.Fatalf("no-op SetKeyBits broke decryption: err=%v", err)
+	}
+}
+
 // TestDeriveKeyPasswordBounding pins ristgo's PBKDF2 passphrase to libRIST's
 // effective bound: the bytes up to the first NUL, capped at 127 (psk.c:38,327;
 // psk.h:48). A passphrase longer than 127 bytes must derive identically to its

@@ -77,6 +77,15 @@ const (
 // ignored on decode (matching libRIST's be16toh(length)==1 gate).
 const npdExtPayloadLen = 4
 
+// hBitKeySize maps the GRE H bit (KeySize256) to the AES key size in bits the
+// receiver derives with: 256 when set, 128 when clear (rist-common.c:2991).
+func hBitKeySize(keySize256 bool) int {
+	if keySize256 {
+		return crypto.KeySize256
+	}
+	return crypto.KeySize128
+}
+
 // mainCodec is the stateful Main-profile codec for one direction of a flow. It
 // is the analog of the Simple codec's loose function set, gathered into a
 // struct because the Main profile carries direction-scoped state: the GRE
@@ -98,13 +107,11 @@ type mainCodec struct {
 	// non-nil; the host configures it to match the send Key's key size
 	// (crypto.Key does not expose its key size).
 	//
-	// NOTE: the receive path does NOT adapt to the inbound H bit — recvKey
-	// decrypts with its construction-time key size — so both peers must be
-	// configured with the same AES key size. libRIST instead reads the H bit and
-	// sets the key size accordingly (rist-common.c:2991); matching ristgo's
-	// configured aes-type to the peer's is required for interop until the receive
-	// path honors the H bit. A size (or secret) mismatch makes every datagram
-	// fail to decrypt; decodeMain returns an error and the loop logs it.
+	// The receive path honors the INBOUND H bit independently: decodeMain calls
+	// recvKey.SetKeyBits with the size the peer signalled before decrypting
+	// (rist-common.c:2991), so a peer configured with a different aes-type still
+	// interoperates. A secret mismatch still fails every decrypt; decodeMain
+	// returns an error and the loop logs it.
 	keySize256 bool
 
 	// greSeq is the per-datagram GRE sequence counter (the AES IV high bytes
@@ -436,6 +443,10 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 		if c.recvKey == nil {
 			return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: encrypted datagram but no decryptor configured")
 		}
+		// Honor the GRE H bit: derive the decryption key at the size the sender
+		// signalled, so a peer configured with a different aes-type still
+		// interoperates (rist-common.c:2991). No-op when unchanged.
+		c.recvKey.SetKeyBits(hBitKeySize(hdr.KeySize256))
 		region, err = c.recvKey.Decrypt(hdr.Nonce, hdr.Seq, nil, region)
 		if err != nil {
 			return false, wire.MediaPacket{}, nil, err
