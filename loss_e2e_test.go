@@ -7,6 +7,7 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,8 +25,13 @@ type lossyProxy struct {
 	recvRTCP  *net.UDPAddr
 	loss      float64
 	rng       *mrand.Rand
+	dropped   atomic.Uint64
 	wg        sync.WaitGroup
 }
+
+// Dropped reports how many forward media datagrams the proxy has dropped — a
+// wire-independent witness that the loss path was actually exercised.
+func (p *lossyProxy) Dropped() uint64 { return p.dropped.Load() }
 
 // startLossyProxy binds the proxy on proxyPort/proxyPort+1 and relays to the
 // receiver on recvPort/recvPort+1, dropping forward media with probability
@@ -65,6 +71,7 @@ func (p *lossyProxy) relayMedia() {
 			return
 		}
 		if p.rng.Float64() < p.loss {
+			p.dropped.Add(1)
 			continue // drop
 		}
 		p.mediaSock.WriteToUDP(buf[:n], p.recvMedia)

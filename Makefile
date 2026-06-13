@@ -7,7 +7,7 @@
 GO ?= go
 MODULE := github.com/zsiec/ristgo
 
-.PHONY: test lint bench build check-deps check-flow-imports
+.PHONY: test lint bench build check-deps check-flow-imports interop
 
 test:
 	@if [ -z "$$($(GO) list ./... 2>/dev/null)" ]; then \
@@ -39,6 +39,14 @@ bench:
 
 build:
 	$(GO) build ./...
+
+# interop: run the libRIST reference-tool interop suite (Simple profile, 4
+# role/direction combos behind //go:build interop). Requires the libRIST CLI
+# tools — set RISTGO_LIBRIST_TOOLS to their directory, or build them with
+# `meson setup build && ninja -C build` in ~/dev/librist (the suite t.Skips
+# gracefully when the tools are absent, e.g. in CI).
+interop:
+	$(GO) test -tags interop -run TestInterop -v -count=1 -timeout 300s ./...
 
 # check-deps: the module dependency graph may contain only this module,
 # golang.org/x/crypto, and the Go standard library. (PLAN.md: deps rule.)
