@@ -1,0 +1,9 @@
+# binaries & build artifacts
+/bin/
+*.test
+*.out
+coverage.*
+dist/
+
+# OS noise
+.DS_Store
