@@ -62,8 +62,56 @@ community <https://pion.ly>
 word-for-word identical to the pion/rtp MIT License text reproduced in the
 section above, and that reproduction equally covers this port.
 
+## LZ4 (lz4/lz4)
+
+`internal/lpc` is a pure-Go reimplementation of the LZ4 *block* format
+compressor and decompressor, ported from the published LZ4 block-format
+specification and the algorithm of the reference implementation,
+[lz4/lz4](https://github.com/lz4/lz4) (Yann Collet's `lz4.c`/`lz4.h`). It is
+used by the RIST Advanced Profile for payload compression (Layer Payload
+Compression, LPC=1 = LZ4; libRIST `src/proto/adv.h:210`). libRIST vendors the
+same reference `contrib/lz4/lz4.c` and uses the raw block format via
+`LZ4_compress_default` (send, `src/udp.c`) and `LZ4_decompress_safe` with an
+external decompressed bound (receive, `src/rist-common.c:2855`); this port
+mirrors that API shape — `Compress` emits a raw block and `Decompress` decodes
+one against a caller-supplied maximum-output bound. Notable points: no C code
+is copied (the implementation is idiomatic Go that allocates nothing on the
+decode path and never panics on malformed input); the match finder is the
+simple LZ4 "fast" single-table variant (match-finding parameters affect only
+compression ratio, never decodability); and the decoder is verified against
+golden blocks produced by libRIST's own vendored `lz4.c`, while blocks this
+package emits are verified to decode under libRIST's `LZ4_decompress_safe`.
+
+lz4 is licensed under the BSD 2-Clause License, Copyright (C) 2011-2023, Yann
+Collet (<https://github.com/lz4/lz4/blob/dev/lib/LICENSE>), reproduced here:
+
+> LZ4 - Fast LZ compression algorithm
+> Copyright (C) 2011-2023, Yann Collet.
+>
+> BSD 2-Clause License (http://www.opensource.org/licenses/bsd-license.php)
+>
+> Redistribution and use in source and binary forms, with or without
+> modification, are permitted provided that the following conditions are met:
+>
+>     * Redistributions of source code must retain the above copyright notice,
+>       this list of conditions and the following disclaimer.
+>     * Redistributions in binary form must reproduce the above copyright
+>       notice, this list of conditions and the following disclaimer in the
+>       documentation and/or other materials provided with the distribution.
+>
+> THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+> AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+> IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+> ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+> LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+> CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+> SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+> INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+> CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+> ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+> POSSIBILITY OF SUCH DAMAGE.
+
 ## Future attributions
 
-Additional ports planned for later phases (for example a pure-Go LZ4
-implementation for the Advanced-profile LPC feature, also MIT-licensed) will
-be attributed here when the code arrives.
+Additional ports planned for later phases will be attributed here when the
+code arrives.
