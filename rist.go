@@ -31,13 +31,12 @@
 //
 // # Status
 //
-// ristgo is in early development. This package currently provides the
-// configuration surface (Config, DefaultConfig), profile and NACK-type
-// enums, sentinel errors, and the Logger interface. The Sender and
-// Receiver types — the io-native data path — arrive in a later milestone,
-// followed by Main profile (GRE + PSK encryption), the Advanced profile,
-// and SMPTE 2022-7 bonding. Only the Simple profile wire format is being
-// implemented first; see Config.Profile for the interim default.
+// ristgo is in active development. The Simple profile (VSF TR-06-1) is
+// implemented end to end: the io-native Sender and Receiver, ARQ recovery
+// over the even/odd RTP/RTCP UDP port pair, and rist:// URL parsing. Still to
+// come are the Main profile (GRE tunneling + PSK encryption + SRP), the
+// Advanced profile, and SMPTE 2022-7 bonding; see Config.Profile for the
+// interim default and the per-profile constructors' errors.
 package ristgo
 
 // Version is the ristgo library version.
