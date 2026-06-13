@@ -125,7 +125,9 @@ type Session struct {
 	// holds delivery until authed.
 	eapClient *eap.Authenticatee
 	eapServer *eap.Authenticator
-	authed    bool
+	// authed gates the data channel; written by the loop, read by the loop and
+	// by Authenticated() (hence atomic).
+	authed atomic.Bool
 
 	// timers is the host's declarative timer wheel: the deadline the flow
 	// requested for each TimerID. A single time.Timer tracks the earliest.
@@ -236,7 +238,7 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	} else {
 		s.delivery = make(chan []byte, 4096)
 	}
-	s.authed = true // no EAP gate by default (Simple, or Main without auth)
+	s.authed.Store(true) // no EAP gate by default (Simple, or Main without auth)
 	if cfg.Main != nil {
 		mp := cfg.Main
 		s.main = newMainCodec(mp.SendKey, mp.RecvKey, mp.KeySize256, mp.VirtSrcPort, mp.VirtDstPort, mp.NPD, cfg.SSRC, cfg.CNAME, cfg.Bitmask)
@@ -244,7 +246,7 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		s.eapClient = mp.EAPClient
 		s.eapServer = mp.EAPServer
 		if s.eapClient != nil || s.eapServer != nil {
-			s.authed = false // hold the data channel until the handshake succeeds
+			s.authed.Store(false) // hold the data channel until the handshake succeeds
 		}
 	} else {
 		s.rtcpIn = make(chan inbound, 64)
@@ -309,7 +311,7 @@ func (s *Session) loop() {
 		// a nil channel never fires in the select, applying back-pressure to
 		// Write until the EAP handshake completes (or instantly when unused).
 		var appIn chan []byte
-		if s.authed {
+		if s.authed.Load() {
 			appIn = s.appIn
 		}
 		select {
@@ -552,7 +554,7 @@ func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 		s.logf("eap: %v", err)
 	}
 	if role.Authenticated() {
-		s.authed = true
+		s.authed.Store(true)
 	} else if role.Done() {
 		// A terminal state without success means authentication failed.
 		s.shutdown(s.cfg.ErrAuth)
@@ -588,7 +590,7 @@ func (s *Session) sendEAP(f eap.Frame, now clock.Timestamp) {
 // with ErrBufferOverflow — the next Read surfaces it. (shutdown is safe to call
 // from the loop; it does not wait on goroutines.)
 func (s *Session) queueDelivery(payload []byte) {
-	if !s.authed {
+	if !s.authed.Load() {
 		return // hold delivery until the EAP-SRP handshake authenticates the peer
 	}
 	cp := make([]byte, len(payload))

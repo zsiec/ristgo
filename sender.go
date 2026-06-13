@@ -141,6 +141,11 @@ func (s *Sender) SetWriteDeadline(t time.Time) error {
 // Stats returns a snapshot of the sender's counters.
 func (s *Sender) Stats() Stats { return toStats(s.sess.Stats()) }
 
+// Authenticated reports whether the data channel is open. For a Main-profile
+// sender configured with EAP-SRP credentials it becomes true once the peer has
+// authenticated it; otherwise it is always true.
+func (s *Sender) Authenticated() bool { return s.sess.Authenticated() }
+
 // RemoteAddr returns the receiver's media address.
 func (s *Sender) RemoteAddr() net.Addr { return s.remote }
 

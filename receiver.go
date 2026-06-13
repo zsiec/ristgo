@@ -103,5 +103,10 @@ func (r *Receiver) LocalPort() int { return r.sess.MediaPort() }
 // Stats returns a snapshot of the receiver's counters.
 func (r *Receiver) Stats() Stats { return toStats(r.sess.Stats()) }
 
+// Authenticated reports whether the data channel is open. For a Main-profile
+// receiver configured with EAP-SRP credentials it becomes true once the sender
+// has been authenticated; otherwise it is always true.
+func (r *Receiver) Authenticated() bool { return r.sess.Authenticated() }
+
 // Close stops the receiver and releases its sockets and goroutines.
 func (r *Receiver) Close() error { return r.sess.Close() }

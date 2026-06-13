@@ -148,6 +148,11 @@ func (s *Session) SetWriteDeadline(t time.Time) {
 // Stats returns the most recent snapshot of the flow's counters.
 func (s *Session) Stats() flow.Stats { return *s.stats.Load() }
 
+// Authenticated reports whether the data channel is open: true for a Simple
+// session or a Main session without EAP, and for a Main+EAP session once the
+// EAP-SRP handshake has succeeded. It is safe to call concurrently.
+func (s *Session) Authenticated() bool { return s.authed.Load() }
+
 // MediaPort returns the local media (even) UDP port.
 func (s *Session) MediaPort() int { return s.conn.MediaPort() }
 

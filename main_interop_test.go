@@ -69,6 +69,61 @@ func TestInteropMainGoRxFromLibristTx(t *testing.T) {
 	}
 }
 
+// mainSRPConfig is a Main-profile config with PSK AES-256 plus EAP-SRP
+// credentials. The shared secret keys the data channel; SRP gates it (this
+// avoids the libRIST passphrase-exchange path, which keys the data channel from
+// the SRP session key only when no secret is configured).
+func mainSRPConfig() ristgo.Config {
+	cfg := mainInteropConfig(256)
+	cfg.Username = "rist"
+	cfg.Password = "mainprofile"
+	return cfg
+}
+
+// TestInteropMainSRPHandshake: libRIST ristsender (Main, SRP client) -> ristgo
+// Receiver acting as the EAP-SRP authenticator. Proves ristgo's EAP-SRP
+// handshake — the EAPOL/EAP/SRP framing AND the SRP-6a math — interoperates
+// byte-for-byte with libRIST: libRIST's client authenticates through ristgo's
+// full handshake (START, IDENTITY, CHALLENGE, CLIENT-KEY, SERVER-KEY,
+// CLIENT-VALIDATOR, SERVER-VALIDATOR, SUCCESS) and ristgo's data channel opens.
+//
+// NOTE: this asserts the handshake interop, not full PSK media after SRP. Once
+// SRP succeeds, libRIST negotiates the data-channel key via the EAP passphrase
+// exchange (EAP-SRP subtype 0x10), which ristgo does not yet implement, so
+// post-SRP PSK media does not flow with libRIST. That passphrase exchange is the
+// documented remaining follow-on; the authentication itself — the hard,
+// security-critical part — is proven here.
+func TestInteropMainSRPHandshake(t *testing.T) {
+	sender := libristTool(t, "ristsender")
+	goPort := freeMainPort(t)
+	feedPort := freeUDPPort(t, goPort)
+
+	rx, err := ristgo.NewReceiver(fmt.Sprintf("127.0.0.1:%d", goPort), mainSRPConfig())
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+
+	// libRIST client carries username/password in the rist:// URL; the shared
+	// secret + aes-type come from -s/-e.
+	spawnTool(t, sender, "-p", "1", "-s", mainInteropSecret, "-e", "256", "-b", "200",
+		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedPort),
+		"-o", fmt.Sprintf("rist://127.0.0.1:%d?username=rist&password=mainprofile", goPort))
+	waitToolReady(t, feedPort, 5*time.Second)
+	go feedUDP(t, feedPort, make([]byte, interopChunk*interopN))
+
+	// The EAP-SRP handshake must complete: ristgo (the authenticator) verifies
+	// libRIST's client and opens its data channel.
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if rx.Authenticated() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("ristgo did not authenticate the libRIST SRP client within 8s")
+}
+
 // TestInteropMainLibristRxFromGoTx: ristgo Sender (Main, PSK) -> libRIST
 // ristreceiver. Proves libRIST decrypts and decodes ristgo's GRE+PSK
 // Main-profile output byte-exactly, at AES-128 and AES-256.
