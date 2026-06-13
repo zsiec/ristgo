@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zsiec/ristgo/internal/adv"
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/eap"
@@ -68,6 +69,12 @@ type Config struct {
 	// tunnelled over a single GRE port instead of the Simple even/odd RTP/RTCP
 	// pair. nil means the Simple profile.
 	Main *MainParams
+
+	// Adv, when non-nil, selects the Advanced profile (VSF TR-06-3): a single
+	// UDP port carrying RTP-based media (PT=127, 1 MHz) and native control
+	// messages, with no GRE framing. At most one of Main/Adv is non-nil; both
+	// nil means the Simple profile.
+	Adv *AdvParams
 }
 
 // MainParams carries the Main-profile codec parameters. The public layer builds
@@ -97,6 +104,34 @@ type MainParams struct {
 	EAPServer *eap.Authenticator
 }
 
+// AdvParams carries the Advanced-profile codec parameters. As with MainParams
+// the public layer builds the PSK keys (so the session constructor stays
+// infallible); nil keys mean cleartext Advanced (no encryption).
+type AdvParams struct {
+	// SendKey encrypts outbound media payloads (AES-CTR, payload-only); nil
+	// disables encryption.
+	SendKey *crypto.Key
+	// RecvKey decrypts inbound media payloads; nil disables decryption. It must
+	// be non-nil exactly when SendKey is (both derive from the same passphrase).
+	RecvKey *crypto.Decryptor
+	// GRESendKey / GRERecvKey encrypt and decrypt the Main-profile GRE control
+	// substrate (the RTCP SDES handshake) when a secret is configured. They are
+	// SEPARATE crypto instances from SendKey/RecvKey — GRE framing and adv media
+	// advance independent IV/sequence state — derived from the same passphrase.
+	// Both nil means a cleartext GRE substrate.
+	GRESendKey *crypto.Key
+	GRERecvKey *crypto.Decryptor
+	// KeySize256 sets the GRE H bit for the encrypted control substrate (true
+	// for a 256-bit AES key), mirroring MainParams.
+	KeySize256 bool
+	// Compression enables LZ4 payload compression on the media send path.
+	Compression bool
+	// VirtSrcPort and VirtDstPort are the reduced-overhead virtual ports encoded
+	// into the optional Flow ID field on the media send path.
+	VirtSrcPort uint16
+	VirtDstPort uint16
+}
+
 // inbound is one datagram handed from a reader goroutine to the event loop.
 type inbound struct {
 	data []byte
@@ -118,6 +153,23 @@ type Session struct {
 	// feedback by the inner payload-type byte instead of by socket.
 	main *mainCodec
 
+	// adv is the Advanced-profile codec, non-nil in Advanced mode. Like main it
+	// reads/writes one UDP socket, demuxing media vs control by the
+	// encapsulation Type field rather than by socket.
+	adv *advCodec
+
+	// advGRE is the Main-profile GRE control substrate used in Advanced mode.
+	// libRIST's Advanced profile begins with the Main-profile GRE handshake —
+	// it authenticates a peer ONLY via a GRE-framed RTCP SDES packet
+	// (rist-common.c:2455, the gate at :1932 that lets data flow) — and gates
+	// media transmission on that authentication (udp.c:960). So an Advanced
+	// session sends the same GRE RTCP (SR/RR + SDES) handshake the Main profile
+	// does (which WP6 proved interoperates byte-exactly), advertises Advanced
+	// capability via the adv keepalive I-bit, and then carries media as adv
+	// Type=5 and NACK/RTT as adv Type=4. advGRE also decodes inbound raw-GRE
+	// (RTCP feedback) and the inner GRE of Type=8 (GRE_MAIN) adv packets.
+	advGRE *mainCodec
+
 	// eapClient/eapServer drive the Main-profile EAP-SRP handshake when
 	// authentication is configured; at most one is non-nil. authed gates the
 	// data channel: true once the handshake succeeds (or immediately when no
@@ -136,6 +188,11 @@ type Session struct {
 	// addressing
 	highestSent uint32 // sender: reference for widening inbound NACK seqs
 
+	// advPeerKnown records that an Advanced session has learned its peer and
+	// sent the immediate authentication handshake (so it is sent once, on the
+	// first inbound datagram, not repeatedly).
+	advPeerKnown bool
+
 	// lastTx is the instant of the last RTCP/media transmission; the
 	// keepalive ticker only emits a periodic RTCP when the flow has been
 	// quiet for a full interval, so it fills idle gaps without doubling the
@@ -148,6 +205,7 @@ type Session struct {
 	mediaIn chan inbound // Simple media socket
 	rtcpIn  chan inbound // Simple RTCP socket
 	mainIn  chan inbound // Main single GRE socket (media and feedback)
+	advIn   chan inbound // Advanced single UDP socket (media and control)
 	appIn   chan []byte
 
 	// delivery to Read
@@ -219,6 +277,30 @@ func NewMainReceiver(conn *socket.Conn, cfg Config) *Session {
 	return s
 }
 
+// NewAdvSender builds an Advanced-profile sender that transmits RTP-based media
+// and reads control over the single UDP socket conn, addressing remote. cfg.Adv
+// must be set.
+func NewAdvSender(conn *socket.Conn, remote *net.UDPAddr, cfg Config) *Session {
+	s := newSession(conn, cfg, true)
+	// One UDP port carries everything, so the media and control peer addresses
+	// are the same (matching the Main profile's single-port model).
+	s.peer.Media = remote
+	s.peer.RTCP = remote
+	s.flow = flow.New(flow.RoleSender, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewAdvReceiver builds an Advanced-profile receiver that reads media and
+// control over the single UDP socket conn and learns the sender's address from
+// inbound traffic. cfg.Adv must be set.
+func NewAdvReceiver(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
 func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	s := &Session{
 		cfg:       cfg,
@@ -248,6 +330,16 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		if s.eapClient != nil || s.eapServer != nil {
 			s.authed.Store(false) // hold the data channel until the handshake succeeds
 		}
+	} else if cfg.Adv != nil {
+		ap := cfg.Adv
+		s.adv = newAdvCodec(ap.SendKey, ap.RecvKey, ap.Compression, cfg.SSRC, ap.VirtSrcPort, ap.VirtDstPort)
+		// The GRE control substrate carries the RTCP SDES handshake that
+		// authenticates this peer to libRIST. It uses the same PSK as the adv
+		// media path when encryption is configured (matching libRIST, which
+		// keeps the GRE control plane encrypted), with its own key/decryptor
+		// instances since GRE and adv media advance independent IV/seq state.
+		s.advGRE = newMainCodec(ap.GRESendKey, ap.GRERecvKey, ap.KeySize256, ap.VirtSrcPort, ap.VirtDstPort, false, cfg.SSRC, cfg.CNAME, cfg.Bitmask)
+		s.advIn = make(chan inbound, 256)
 	} else {
 		s.rtcpIn = make(chan inbound, 64)
 		if !sender {
@@ -268,6 +360,11 @@ func (s *Session) start() {
 	if s.main != nil {
 		s.wg.Add(1)
 		go s.readMain()
+		return
+	}
+	if s.adv != nil {
+		s.wg.Add(1)
+		go s.readAdv()
 		return
 	}
 	s.wg.Add(1)
@@ -364,6 +461,23 @@ func (s *Session) loop() {
 				s.logf("main: drop undecodable datagram (%d bytes): %v", len(d.data), err)
 			}
 			s.afterInput(now, timer)
+		case d := <-s.advIn:
+			now := s.clk.Now()
+			// One UDP port carries both directions, so the peer's media and
+			// control addresses are the one learned address.
+			s.peer.LearnMedia(d.src)
+			s.peer.LearnRTCP(d.src)
+			s.peer.Observe(now)
+			// Send our GRE+RTCP handshake the instant we learn the peer, rather
+			// than waiting for the keepalive ticker: libRIST's sender gates media
+			// on authenticating us (via our SDES), so a one-interval delay here
+			// would let it drop the early input before we are authenticated.
+			if !s.advPeerKnown {
+				s.advPeerKnown = true
+				s.sendKeepalive(now)
+			}
+			s.handleAdvInbound(now, d.data)
+			s.afterInput(now, timer)
 		case p := <-appIn:
 			now := s.clk.Now()
 			s.flow.PushApp(now, p)
@@ -378,9 +492,12 @@ func (s *Session) loop() {
 				s.shutdown(s.cfg.ErrSessionTimeout)
 				return
 			}
-			// Emit a periodic keepalive only if the flow has been quiet for a
-			// full interval (its own RTT-echo cadence covers the active case).
-			if s.peer.RTCP != nil && now.Sub(s.lastTx) >= ka {
+			// Emit a periodic keepalive. The Advanced profile sends its
+			// GRE+RTCP handshake and adv keepalive every interval (matching
+			// libRIST's unconditional periodic RTCP, which keeps the peer
+			// authenticated); the Simple/Main profiles only fill idle gaps so
+			// the flow's own RTT-echo cadence is not doubled.
+			if s.peer.RTCP != nil && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
 				s.sendKeepalive(now)
 			}
 		}
@@ -458,6 +575,8 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	var err error
 	if s.main != nil {
 		b, err = s.main.encodeMainMedia(s.mediaBuf, pkt)
+	} else if s.adv != nil {
+		b, err = s.adv.encodeAdvMedia(s.mediaBuf, pkt)
 	} else {
 		b, err = encodeMedia(s.mediaBuf, pkt)
 	}
@@ -478,6 +597,12 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 	if s.peer.RTCP == nil {
 		return // return path not learned yet
+	}
+	// Advanced profile has no compound RTCP: each feedback item is its own
+	// Type=Control datagram (libRIST sends/reads one entry per datagram).
+	if s.adv != nil {
+		s.sendAdvFeedback(fbs, now)
+		return
 	}
 	var lead rtcp.Packet
 	if s.sender {
@@ -522,6 +647,134 @@ func (s *Session) writeFeedback(b []byte) error {
 		return s.conn.WriteMedia(b, s.peer.RTCP)
 	}
 	return s.conn.WriteRTCP(b, s.peer.RTCP)
+}
+
+// advCtrlTS is the Advanced RTP timestamp stamped into an outbound control
+// packet's header, encoded at the same effective 2^16 MHz rate as media
+// (microseconds << advClockShift) so both paths and libRIST agree on the field's
+// units. It is informational — the peer ignores it (adv_ctrl.c does not read the
+// control timestamp).
+func advCtrlTS(now clock.Timestamp) uint32 { return uint32(uint64(int64(now)) << advClockShift) }
+
+// sendAdvFeedback encodes the drained feedback into Advanced-profile control
+// datagrams and sends each to the peer over the single UDP socket. Unlike the
+// Simple/Main compound-RTCP path, each feedback item becomes one or more
+// independent Type=Control datagrams.
+func (s *Session) sendAdvFeedback(fbs []wire.Feedback, now clock.Timestamp) {
+	dgs, err := s.adv.encodeFeedback(fbs, s.cfg.Bitmask, advCtrlTS(now))
+	if err != nil {
+		s.logf("adv: encode feedback: %v", err)
+		return
+	}
+	// Send every datagram; a single write error must not drop the remaining
+	// NACK ranges / echoes (control rate is low and the rest may succeed).
+	for _, dg := range dgs {
+		if werr := s.conn.WriteMedia(dg, s.peer.RTCP); werr != nil {
+			s.logf("adv: write control: %v", werr)
+		}
+	}
+	if len(dgs) > 0 {
+		s.lastTx = now
+	}
+}
+
+// sendAdvKeepalive emits one Advanced keep-alive control (CI 0x8000, I-bit) to
+// the peer — the Advanced analog of the periodic Main keepalive — advertising
+// Advanced capability so libRIST negotiates the profile and maintaining liveness
+// while idle. RTT echo requests are NOT sent here: the flow core drives them on
+// its own cadence (TimerRttEcho -> SendFeedback -> sendAdvFeedback), so emitting
+// one here too would double the echo rate.
+func (s *Session) sendAdvKeepalive(now clock.Timestamp) {
+	ka, err := s.adv.keepaliveDatagram(advCtrlTS(now))
+	if err != nil {
+		s.logf("adv: encode keepalive: %v", err)
+		return
+	}
+	if werr := s.conn.WriteMedia(ka, s.peer.RTCP); werr != nil {
+		s.logf("adv: write keepalive: %v", werr)
+		return
+	}
+	s.lastTx = now
+}
+
+// sendAdvGREHandshake sends the Main-profile GRE RTCP (SR/RR + SDES) datagram
+// that authenticates this peer to libRIST's Advanced receiver/sender — the
+// handshake libRIST requires before it accepts data or ungates media
+// transmission (rist-common.c:1932/2455, udp.c:960). It reuses the same GRE+RTCP
+// encoding WP6 proved interoperable; advGRE encrypts it under the PSK when one
+// is configured.
+func (s *Session) sendAdvGREHandshake(now clock.Timestamp) {
+	if s.peer.RTCP == nil {
+		return
+	}
+	s.rtcpBuf = s.rtcpBuf[:0]
+	b, err := s.advGRE.encodeMainFeedback(s.rtcpBuf, s.keepaliveLead(now), nil, s.cfg.Bitmask)
+	if err != nil {
+		s.logf("adv: encode GRE handshake: %v", err)
+		return
+	}
+	s.rtcpBuf = b
+	if err := s.conn.WriteMedia(b, s.peer.RTCP); err != nil {
+		s.logf("adv: write GRE handshake: %v", err)
+	}
+	s.lastTx = now
+}
+
+// handleAdvInbound demultiplexes one inbound Advanced-profile datagram. libRIST
+// mixes PT=127 adv framing (Type=5 media, Type=4 control, Type=8 GRE-wrapped)
+// with raw Main-profile GRE (the RTCP handshake and keepalives), so the host
+// tries adv framing first and falls back to the GRE substrate.
+func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
+	// Adv framing: RTP V=2 with PT 127 (or a dynamic type >= 96).
+	if len(data) >= 2 && data[0]&0xC0 == 0x80 {
+		if pt := data[1] & 0x7f; pt == adv.PayloadType || pt >= 96 {
+			if p, err := adv.Parse(data); err == nil {
+				if p.EncType == adv.TypeGREMain {
+					// Type=8: the payload is an inner Main-profile GRE packet.
+					s.handleAdvGRE(now, p.Payload)
+					return
+				}
+				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(p); derr == nil {
+					if isMedia {
+						s.flow.Feed(now, 0, pkt)
+						s.observeRx(now, pkt)
+					} else {
+						for _, fb := range fbs {
+							s.flow.FeedFeedback(now, fb)
+						}
+					}
+				} else {
+					s.logf("adv: drop undecodable adv datagram (%d bytes): %v", len(data), derr)
+				}
+				return
+			}
+			// not parseable as adv; fall through to the GRE substrate
+		}
+	}
+	// Raw Main-profile GRE: the RTCP handshake (SDES auth, SR/RR, NACK) or a
+	// keepalive. Liveness was already recorded by peer.Observe.
+	s.handleAdvGRE(now, data)
+}
+
+// handleAdvGRE decodes one Main-profile GRE datagram on the Advanced path: an
+// RTCP NACK becomes flow feedback; SR/RR/SDES and keepalives carry no flow data
+// (they served their handshake/liveness purpose at the peer layer). A decode
+// error (e.g. a GRE keepalive, whose protocol type is not REDUCED) is ignored.
+func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
+	isMedia, pkt, fbs, err := s.advGRE.decodeMain(data, s.highestSent)
+	if err != nil {
+		return // keepalive or otherwise not a GRE media/RTCP datagram; ignore
+	}
+	if isMedia {
+		// libRIST does not send GRE-framed media in Advanced mode; accept it
+		// defensively all the same.
+		s.flow.Feed(now, 0, pkt)
+		s.observeRx(now, pkt)
+		return
+	}
+	for _, fb := range fbs {
+		s.flow.FeedFeedback(now, fb)
+	}
 }
 
 // handleEAP drives the Main-profile EAP-SRP handshake for one received EAPOL
@@ -645,6 +898,25 @@ func (s *Session) readMain() {
 		}
 		select {
 		case s.mainIn <- inbound{data: buf[:n], src: src}:
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// readAdv reads datagrams off the single Advanced-profile UDP socket and
+// forwards them to the loop, which demuxes media vs control by the encapsulation
+// Type field. It is the Advanced-profile counterpart of readMain.
+func (s *Session) readAdv() {
+	defer s.wg.Done()
+	for {
+		buf := make([]byte, maxDatagram)
+		n, src, err := s.conn.ReadMedia(buf) // single UDP socket
+		if err != nil {
+			return
+		}
+		select {
+		case s.advIn <- inbound{data: buf[:n], src: src}:
 		case <-s.done:
 			return
 		}

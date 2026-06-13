@@ -95,6 +95,14 @@ func (s *Session) sendKeepalive(now clock.Timestamp) {
 	if s.peer.RTCP == nil {
 		return // return path not learned yet
 	}
+	// Advanced profile: send the Main-profile GRE+RTCP handshake (authenticates
+	// this peer to libRIST and keeps the control plane alive) plus the native
+	// adv keep-alive (I-bit, for capability negotiation) and RTT echo.
+	if s.adv != nil {
+		s.sendAdvGREHandshake(now)
+		s.sendAdvKeepalive(now)
+		return
+	}
 	echo := []wire.Feedback{wire.RttEchoRequest{Timestamp: uint64(clock.NTPTimeFromTimestamp(now))}}
 	s.rtcpBuf = s.rtcpBuf[:0]
 	b, err := s.encodeCompound(s.rtcpBuf, s.keepaliveLead(now), echo)

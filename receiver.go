@@ -23,9 +23,9 @@ type Receiver struct {
 
 // NewReceiver binds a RIST receiver at addr ("host:port" or a rist:// URL
 // whose query parameters override cfg). For the Simple profile the port is the
-// even media port and RTCP is bound on port+1; for the Main profile a single
-// port carries the GRE-tunnelled flow. The Advanced profile is not yet
-// implemented and returns an error wrapping ErrInvalidConfig.
+// even media port and RTCP is bound on port+1; for the Main and Advanced
+// profiles a single port carries the flow (GRE-tunnelled for Main, RTP-based
+// with native control for Advanced).
 func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -39,6 +39,8 @@ func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 		return newSimpleReceiver(addr, cfg)
 	case ProfileMain:
 		return newMainReceiver(addr, cfg)
+	case ProfileAdvanced:
+		return newAdvReceiver(addr, cfg)
 	default:
 		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
 	}
@@ -82,6 +84,29 @@ func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.Main = mp
 	sess := session.NewMainReceiver(conn, sc)
+	return &Receiver{sess: sess}, nil
+}
+
+// newAdvReceiver binds an Advanced-profile receiver: RTP-based media (with
+// optional AES-CTR payload decryption) on the single port at addr, with native
+// control messages on the same port.
+func newAdvReceiver(addr string, cfg Config) (*Receiver, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ap, err := buildAdvParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenSingle(host, port)
+	if err != nil {
+		return nil, err
+	}
+	fc := toFlowConfig(cfg)
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
+	sc.Adv = ap
+	sess := session.NewAdvReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }
 

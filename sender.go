@@ -35,9 +35,8 @@ type Sender struct {
 // NewSender dials a RIST receiver at addr ("host:port" or a rist:// URL whose
 // query parameters override cfg) and returns a ready Sender. For the Simple
 // profile the port is the receiver's even media port and RTCP feedback flows on
-// port+1; for the Main profile a single port carries the GRE-tunnelled flow.
-// The Advanced profile is not yet implemented and returns an error wrapping
-// ErrInvalidConfig.
+// port+1; for the Main and Advanced profiles a single port carries the flow
+// (GRE-tunnelled for Main, RTP-based with native control for Advanced).
 func NewSender(addr string, cfg Config) (*Sender, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -51,6 +50,8 @@ func NewSender(addr string, cfg Config) (*Sender, error) {
 		return newSimpleSender(addr, cfg)
 	case ProfileMain:
 		return newMainSender(addr, cfg)
+	case ProfileAdvanced:
+		return newAdvSender(addr, cfg)
 	default:
 		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
 	}
@@ -112,6 +113,36 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Main = mp
 	sess := session.NewMainSender(conn, remote, sc)
+	return &Sender{sess: sess, remote: remote}, nil
+}
+
+// newAdvSender constructs an Advanced-profile sender: RTP-based media (with
+// optional AES-CTR payload encryption and LZ4 compression) over the single port
+// at addr, with native control messages on the same port.
+func newAdvSender(addr string, cfg Config) (*Sender, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve address: %v", ErrInvalidConfig, err)
+	}
+	ap, err := buildAdvParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenEphemeralSingle("")
+	if err != nil {
+		return nil, err
+	}
+	ssrc := randomEvenSSRC()
+	fc := toFlowConfig(cfg)
+	fc.SSRC = ssrc
+	fc.StartSeq = randomStartSeq()
+	sc := toSessionConfig(cfg, fc, ssrc)
+	sc.Adv = ap
+	sess := session.NewAdvSender(conn, remote, sc)
 	return &Sender{sess: sess, remote: remote}, nil
 }
 

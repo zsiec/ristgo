@@ -81,6 +81,48 @@ func buildMainParams(cfg Config) (*session.MainParams, error) {
 	return mp, nil
 }
 
+// buildAdvParams derives the session Advanced-profile parameters from cfg,
+// constructing the PSK keys when a Secret is configured (cfg is already
+// validated, so AESKeyBits is 128 or 256). With no Secret the Advanced flow runs
+// in cleartext. Only AES-CTR (mode 1) is used — the sole encryption mode libRIST
+// implements for the Advanced profile.
+func buildAdvParams(cfg Config) (*session.AdvParams, error) {
+	ap := &session.AdvParams{
+		Compression: cfg.Compression,
+		VirtSrcPort: cfg.VirtSrcPort,
+		VirtDstPort: cfg.VirtDstPort,
+	}
+	if cfg.Secret == "" {
+		return ap, nil
+	}
+	sendKey, err := crypto.NewKey([]byte(cfg.Secret), cfg.AESKeyBits, cfg.KeyRotation, false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	recvKey, err := crypto.NewDecryptor([]byte(cfg.Secret), cfg.AESKeyBits)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	ap.SendKey = sendKey
+	ap.RecvKey = recvKey
+	// Separate key/decryptor instances for the GRE control substrate (the RTCP
+	// handshake): GRE framing and adv media advance independent IV/seq state, so
+	// they cannot share a stateful crypto.Key, though both derive from the same
+	// passphrase.
+	greSendKey, err := crypto.NewKey([]byte(cfg.Secret), cfg.AESKeyBits, cfg.KeyRotation, false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	greRecvKey, err := crypto.NewDecryptor([]byte(cfg.Secret), cfg.AESKeyBits)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	ap.GRESendKey = greSendKey
+	ap.GRERecvKey = greRecvKey
+	ap.KeySize256 = cfg.AESKeyBits == crypto.KeySize256
+	return ap, nil
+}
+
 // buildEAPClient builds the EAP-SRP authenticatee for a Main sender when
 // credentials are configured (the sender authenticates to the receiver); it
 // returns (nil, nil) when no Username is set.
