@@ -311,6 +311,13 @@ func (s *Session) loop() {
 						s.flow.FeedFeedback(now, fb)
 					}
 				}
+			} else {
+				// A decode failure on an otherwise-delivered datagram usually
+				// means a PSK secret or AES-key-size mismatch (decryption yields
+				// garbage), which would otherwise look like total packet loss.
+				// Surface it so it is diagnosable; logf is zero-cost when no
+				// logger is set.
+				s.logf("main: drop undecodable datagram (%d bytes): %v", len(d.data), err)
 			}
 			s.afterInput(now, timer)
 		case p := <-s.appIn:

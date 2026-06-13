@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -136,4 +137,54 @@ func TestE2EMainProfile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestE2EMainCloseUnblocksRead is the Main-profile counterpart of
+// TestE2ECloseUnblocksRead: it verifies Close on a Main receiver wakes a blocked
+// Read with ErrClosed and that the session's goroutines — the event loop and the
+// single readMain reader (not readMedia/readRTCP) — exit, returning the
+// goroutine count to its pre-construction baseline. The single GRE socket's
+// Close guard (socket.single) must still unblock readMain's blocking ReadMedia.
+// Run under -race for data-race coverage of the Main reader/loop seam too.
+func TestE2EMainCloseUnblocksRead(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+	rx, err := ristgo.NewReceiver(addr, mainConfig("ristgo-main-secret", 256))
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		_, err := rx.Read(buf) // blocks: no sender
+		readErr <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := rx.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-readErr:
+		if err != ristgo.ErrClosed {
+			t.Fatalf("Read after Close = %v, want ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not unblock Read")
+	}
+	if _, err := rx.Read(make([]byte, 16)); err != ristgo.ErrClosed {
+		t.Fatalf("Read on closed receiver = %v, want ErrClosed", err)
+	}
+
+	// The session's loop + readMain goroutines should have exited. Allow a brief
+	// settle and a small slack for runtime/test goroutines.
+	for i := 0; i < 20; i++ {
+		if runtime.NumGoroutine() <= baseline+1 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("goroutines did not return to baseline: have %d, baseline %d", runtime.NumGoroutine(), baseline)
 }

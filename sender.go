@@ -14,8 +14,11 @@ import (
 // profile sends one RTP packet per Write with no fragmentation, so the payload
 // plus the 12-byte RTP header and the UDP/IPv4 headers must fit a standard
 // 1500-byte MTU without IP fragmentation: 1500 − 20 (IP) − 8 (UDP) − 12 (RTP)
-// = 1460. Callers chunk larger media before Write (the example sender uses
-// 1316, a 7-cell MPEG-TS payload).
+// = 1460. The Main profile adds ~12–16 bytes of GRE + reduced-overhead framing
+// (plus the nonce when encrypted), so a Main payload at this limit is
+// IP-fragmented on a strict-MTU path — Main callers should chunk smaller.
+// Callers chunk larger media before Write anyway (the example sender uses 1316,
+// a 7-cell MPEG-TS payload, which is safe for both profiles).
 const MaxMediaPayload = 1460
 
 // Sender transmits media to a RIST receiver. It is an io.WriteCloser: each

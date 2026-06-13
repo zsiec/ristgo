@@ -96,8 +96,15 @@ type mainCodec struct {
 	// keySize256 selects the GRE H bit for outbound encrypted datagrams: true
 	// for a 256-bit AES key, false for 128-bit. Meaningful only when sendKey is
 	// non-nil; the host configures it to match the send Key's key size
-	// (crypto.Key does not expose its key size, and the receiver derives the
-	// size from the H bit it reads, gre.go bitH).
+	// (crypto.Key does not expose its key size).
+	//
+	// NOTE: the receive path does NOT adapt to the inbound H bit — recvKey
+	// decrypts with its construction-time key size — so both peers must be
+	// configured with the same AES key size. libRIST instead reads the H bit and
+	// sets the key size accordingly (rist-common.c:2991); matching ristgo's
+	// configured aes-type to the peer's is required for interop until the receive
+	// path honors the H bit. A size (or secret) mismatch makes every datagram
+	// fail to decrypt; decodeMain returns an error and the loop logs it.
 	keySize256 bool
 
 	// greSeq is the per-datagram GRE sequence counter (the AES IV high bytes
