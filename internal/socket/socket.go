@@ -1,6 +1,9 @@
-// Package socket is the UDP transport for the RIST Simple profile (VSF
-// TR-06-1): a pair of unconnected UDP sockets on adjacent even/odd ports —
-// RTP media on the even port P, compound RTCP on the odd port P+1.
+// Package socket is the UDP transport for RIST. The Simple profile (VSF
+// TR-06-1) uses a pair of unconnected UDP sockets on adjacent even/odd ports —
+// RTP media on the even port P, compound RTCP on the odd port P+1. The Main
+// profile (TR-06-2) tunnels everything over a single GRE port; ListenSingle /
+// ListenEphemeralSingle bind that one socket (the Conn's media and rtcp aliases
+// then refer to it, and the session reads/writes it via ReadMedia/WriteMedia).
 //
 // The sockets are deliberately unconnected (net.ListenUDP, not DialUDP) and
 // every send takes an explicit destination, so one transport serves both
@@ -21,11 +24,13 @@ import (
 	"net"
 )
 
-// Conn is a Simple-profile transport: a media socket (even port) and an RTCP
-// socket (odd port).
+// Conn is a RIST UDP transport. For the Simple profile it holds a media socket
+// (even port) and an RTCP socket (odd port). For the Main profile it holds one
+// socket carrying everything: media and rtcp both alias it and single is true.
 type Conn struct {
-	media *net.UDPConn
-	rtcp  *net.UDPConn
+	media  *net.UDPConn
+	rtcp   *net.UDPConn
+	single bool // Main profile: media == rtcp, one socket carries everything
 }
 
 // Listen binds the media socket to host:port and the RTCP socket to
@@ -72,6 +77,33 @@ func FromConns(media, rtcp *net.UDPConn) *Conn {
 	return &Conn{media: media, rtcp: rtcp}
 }
 
+// ListenSingle binds one UDP socket on host:port for the Main profile, where a
+// single GRE-tunnelled port carries both media and feedback (TR-06-2). Unlike
+// Listen it accepts any port (the Main port is not constrained to be even);
+// host may be empty to bind all interfaces. It is the Main receiver-side
+// constructor. Reads and writes use ReadMedia/WriteMedia on the single socket.
+func ListenSingle(host string, port int) (*Conn, error) {
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("rist: socket: main port %d out of range", port)
+	}
+	c, err := bind(host, port)
+	if err != nil {
+		return nil, fmt.Errorf("rist: socket: bind main port %d: %w", port, err)
+	}
+	return &Conn{media: c, rtcp: c, single: true}, nil
+}
+
+// ListenEphemeralSingle binds one OS-chosen UDP socket on host (empty host
+// binds all interfaces) for the Main profile. It is the Main sender-side
+// constructor; the receiver learns the local port from inbound datagrams.
+func ListenEphemeralSingle(host string) (*Conn, error) {
+	c, err := bind(host, 0)
+	if err != nil {
+		return nil, fmt.Errorf("rist: socket: bind main: %w", err)
+	}
+	return &Conn{media: c, rtcp: c, single: true}, nil
+}
+
 // bind opens an unconnected UDP socket on host:port.
 func bind(host string, port int) (*net.UDPConn, error) {
 	addr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
@@ -112,6 +144,9 @@ func (c *Conn) WriteRTCP(b []byte, dst *net.UDPAddr) error {
 // net.ErrClosed-wrapped error). It is safe to call more than once.
 func (c *Conn) Close() error {
 	err := c.media.Close()
+	if c.single {
+		return err // media and rtcp are the same socket; close it once
+	}
 	if e := c.rtcp.Close(); e != nil && err == nil {
 		err = e
 	}

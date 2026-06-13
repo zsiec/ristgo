@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/zsiec/ristgo/internal/clock"
+	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/peer"
 	"github.com/zsiec/ristgo/internal/rtcp"
@@ -58,6 +59,30 @@ type Config struct {
 	ErrTimeout        error
 	ErrSessionTimeout error
 	ErrBufferOverflow error
+
+	// Main, when non-nil, selects the Main profile (VSF TR-06-2): the flow is
+	// tunnelled over a single GRE port instead of the Simple even/odd RTP/RTCP
+	// pair. nil means the Simple profile.
+	Main *MainParams
+}
+
+// MainParams carries the Main-profile codec parameters. The public layer builds
+// the PSK keys (so the session constructor stays infallible) and supplies the
+// virtual ports; nil keys mean cleartext Main (no encryption).
+type MainParams struct {
+	// SendKey encrypts outbound datagrams; nil disables encryption.
+	SendKey *crypto.Key
+	// RecvKey decrypts inbound datagrams; nil disables decryption. It must be
+	// non-nil exactly when SendKey is (both derive from the same passphrase).
+	RecvKey *crypto.Decryptor
+	// KeySize256 sets the GRE H bit for outbound encrypted datagrams (true for
+	// a 256-bit AES key). Meaningful only when SendKey is non-nil.
+	KeySize256 bool
+	// NPD enables null-packet-deletion suppression on the media encode path.
+	NPD bool
+	// VirtSrcPort and VirtDstPort are the reduced-overhead virtual ports.
+	VirtSrcPort uint16
+	VirtDstPort uint16
 }
 
 // inbound is one datagram handed from a reader goroutine to the event loop.
@@ -76,6 +101,11 @@ type Session struct {
 	sender bool // role
 	mdec   mediaDecoder
 
+	// main is the Main-profile codec, non-nil in Main mode. When set, the
+	// session reads/writes one GRE-tunnelled socket and demuxes media vs
+	// feedback by the inner payload-type byte instead of by socket.
+	main *mainCodec
+
 	// timers is the host's declarative timer wheel: the deadline the flow
 	// requested for each TimerID. A single time.Timer tracks the earliest.
 	timers map[flow.TimerID]clock.Timestamp
@@ -92,8 +122,9 @@ type Session struct {
 	rx rxStats
 
 	// event-loop inputs
-	mediaIn chan inbound
-	rtcpIn  chan inbound
+	mediaIn chan inbound // Simple media socket
+	rtcpIn  chan inbound // Simple RTCP socket
+	mainIn  chan inbound // Main single GRE socket (media and feedback)
 	appIn   chan []byte
 
 	// delivery to Read
@@ -140,6 +171,31 @@ func NewReceiver(conn *socket.Conn, cfg Config) *Session {
 	return s
 }
 
+// NewMainSender builds a Main-profile sender that tunnels media and reads
+// feedback over the single GRE socket conn, addressing remote. cfg.Main must be
+// set.
+func NewMainSender(conn *socket.Conn, remote *net.UDPAddr, cfg Config) *Session {
+	s := newSession(conn, cfg, true)
+	// In Main profile a single port carries everything, so the media and RTCP
+	// peer addresses are the same; setting both keeps the liveness/feedback
+	// guards (peer.Media/RTCP != nil) working unchanged.
+	s.peer.Media = remote
+	s.peer.RTCP = remote
+	s.flow = flow.New(flow.RoleSender, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewMainReceiver builds a Main-profile receiver that reads media and feedback
+// over the single GRE socket conn and learns the sender's address from inbound
+// traffic. cfg.Main must be set.
+func NewMainReceiver(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
 func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	s := &Session{
 		cfg:       cfg,
@@ -148,7 +204,6 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		peer:      peer.New(cfg.SessionTimeout),
 		sender:    sender,
 		timers:    make(map[flow.TimerID]clock.Timestamp),
-		rtcpIn:    make(chan inbound, 64),
 		mediaBuf:  make([]byte, 0, maxDatagram),
 		rtcpBuf:   make([]byte, 0, maxDatagram),
 		readWake:  make(chan struct{}, 1),
@@ -158,18 +213,34 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	if sender {
 		s.appIn = make(chan []byte, 64)
 	} else {
-		s.mediaIn = make(chan inbound, 256)
 		s.delivery = make(chan []byte, 4096)
+	}
+	if cfg.Main != nil {
+		mp := cfg.Main
+		s.main = newMainCodec(mp.SendKey, mp.RecvKey, mp.KeySize256, mp.VirtSrcPort, mp.VirtDstPort, mp.NPD, cfg.SSRC, cfg.CNAME, cfg.Bitmask)
+		s.mainIn = make(chan inbound, 256)
+	} else {
+		s.rtcpIn = make(chan inbound, 64)
+		if !sender {
+			s.mediaIn = make(chan inbound, 256)
+		}
 	}
 	var zero flow.Stats
 	s.stats.Store(&zero)
 	return s
 }
 
-// start launches the reader goroutines and the event loop.
+// start launches the reader goroutines and the event loop. The Main profile
+// runs one reader on its single GRE socket; the Simple profile runs a reader
+// per socket (RTCP always, media on a receiver).
 func (s *Session) start() {
 	s.wg.Add(1)
 	go s.loop()
+	if s.main != nil {
+		s.wg.Add(1)
+		go s.readMain()
+		return
+	}
 	s.wg.Add(1)
 	go s.readRTCP()
 	if !s.sender {
@@ -221,6 +292,24 @@ func (s *Session) loop() {
 			if fbs, err := decodeFeedback(r.data, s.highestSent); err == nil {
 				for _, fb := range fbs {
 					s.flow.FeedFeedback(now, fb)
+				}
+			}
+			s.afterInput(now, timer)
+		case d := <-s.mainIn:
+			now := s.clk.Now()
+			// One GRE socket carries both directions, so the peer's media and
+			// RTCP addresses are the one learned address.
+			s.peer.LearnMedia(d.src)
+			s.peer.LearnRTCP(d.src)
+			s.peer.Observe(now)
+			if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
+				if isMedia {
+					s.flow.Feed(now, 0, pkt)
+					s.observeRx(now, pkt)
+				} else {
+					for _, fb := range fbs {
+						s.flow.FeedFeedback(now, fb)
+					}
 				}
 			}
 			s.afterInput(now, timer)
@@ -306,18 +395,27 @@ func (s *Session) drain(now clock.Timestamp) {
 	}
 }
 
-// sendMedia encodes and transmits one RTP packet to the peer's media address.
+// sendMedia encodes and transmits one media datagram to the peer's media
+// address: a bare RTP packet on the Simple profile, a GRE-tunnelled (and
+// PSK-encrypted) one on the Main profile, sent over the single GRE socket.
 func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	if s.peer.Media == nil {
 		return
 	}
 	s.mediaBuf = s.mediaBuf[:0]
-	b, err := encodeMedia(s.mediaBuf, pkt)
+	var b []byte
+	var err error
+	if s.main != nil {
+		b, err = s.main.encodeMainMedia(s.mediaBuf, pkt)
+	} else {
+		b, err = encodeMedia(s.mediaBuf, pkt)
+	}
 	if err != nil {
 		s.logf("encode media seq %d: %v", pkt.Seq, err)
 		return
 	}
 	s.mediaBuf = b
+	// WriteMedia targets the single GRE socket in Main mode (media == rtcp).
 	if err := s.conn.WriteMedia(b, s.peer.Media); err != nil {
 		s.logf("write media: %v", err)
 	}
@@ -344,16 +442,35 @@ func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 		lead = rtcp.EmptyReceiverReport{SSRC: s.cfg.SSRC}
 	}
 	s.rtcpBuf = s.rtcpBuf[:0]
-	b, err := encodeFeedback(s.rtcpBuf, lead, s.cfg.SSRC, s.cfg.CNAME, fbs, s.cfg.Bitmask)
+	b, err := s.encodeCompound(s.rtcpBuf, lead, fbs)
 	if err != nil {
 		s.logf("encode feedback: %v", err)
 		return
 	}
 	s.rtcpBuf = b
-	if err := s.conn.WriteRTCP(b, s.peer.RTCP); err != nil {
+	if err := s.writeFeedback(b); err != nil {
 		s.logf("write rtcp: %v", err)
 	}
 	s.lastTx = now
+}
+
+// encodeCompound builds one compound-RTCP datagram for the configured profile:
+// bare compound RTCP on the Simple profile, GRE-tunnelled (and PSK-encrypted)
+// on the Main profile.
+func (s *Session) encodeCompound(dst []byte, lead rtcp.Packet, fbs []wire.Feedback) ([]byte, error) {
+	if s.main != nil {
+		return s.main.encodeMainFeedback(dst, lead, fbs, s.cfg.Bitmask)
+	}
+	return encodeFeedback(dst, lead, s.cfg.SSRC, s.cfg.CNAME, fbs, s.cfg.Bitmask)
+}
+
+// writeFeedback transmits a feedback datagram to the peer: the RTCP socket on
+// the Simple profile, the single GRE socket (== media) on the Main profile.
+func (s *Session) writeFeedback(b []byte) error {
+	if s.main != nil {
+		return s.conn.WriteMedia(b, s.peer.RTCP)
+	}
+	return s.conn.WriteRTCP(b, s.peer.RTCP)
 }
 
 // queueDelivery copies the delivered payload onto the read queue. The flow
@@ -399,6 +516,25 @@ func (s *Session) readMedia() {
 		}
 		select {
 		case s.mediaIn <- inbound{data: buf[:n], src: src}:
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// readMain reads datagrams off the single Main-profile GRE socket and forwards
+// them to the loop, which demuxes media vs feedback by the inner payload-type
+// byte. It is the Main-profile counterpart of readMedia + readRTCP.
+func (s *Session) readMain() {
+	defer s.wg.Done()
+	for {
+		buf := make([]byte, maxDatagram)
+		n, src, err := s.conn.ReadMedia(buf) // single GRE socket
+		if err != nil {
+			return
+		}
+		select {
+		case s.mainIn <- inbound{data: buf[:n], src: src}:
 		case <-s.done:
 			return
 		}

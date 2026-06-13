@@ -30,9 +30,10 @@ type Sender struct {
 }
 
 // NewSender dials a RIST receiver at addr ("host:port" or a rist:// URL whose
-// query parameters override cfg) and returns a ready Sender. The port is the
-// receiver's even media port; RTCP feedback flows on port+1. Only the Simple
-// profile is implemented; other profiles return an error wrapping
+// query parameters override cfg) and returns a ready Sender. For the Simple
+// profile the port is the receiver's even media port and RTCP feedback flows on
+// port+1; for the Main profile a single port carries the GRE-tunnelled flow.
+// The Advanced profile is not yet implemented and returns an error wrapping
 // ErrInvalidConfig.
 func NewSender(addr string, cfg Config) (*Sender, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
@@ -42,9 +43,19 @@ func NewSender(addr string, cfg Config) (*Sender, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
-	if cfg.Profile != ProfileSimple {
-		return nil, fmt.Errorf("%w: only the Simple profile is implemented (got %s)", ErrInvalidConfig, cfg.Profile)
+	switch cfg.Profile {
+	case ProfileSimple:
+		return newSimpleSender(addr, cfg)
+	case ProfileMain:
+		return newMainSender(addr, cfg)
+	default:
+		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
 	}
+}
+
+// newSimpleSender constructs a Simple-profile sender: RTP on the receiver's
+// even media port, RTCP on port+1.
+func newSimpleSender(addr string, cfg Config) (*Sender, error) {
 	host, port, err := resolveMediaPort(addr)
 	if err != nil {
 		return nil, err
@@ -67,6 +78,35 @@ func NewSender(addr string, cfg Config) (*Sender, error) {
 	fc.StartSeq = randomStartSeq()
 	sess := session.NewSender(conn, mediaAddr, rtcpAddr, toSessionConfig(cfg, fc, ssrc))
 	return &Sender{sess: sess, remote: mediaAddr}, nil
+}
+
+// newMainSender constructs a Main-profile sender: the GRE-tunnelled flow (with
+// optional PSK encryption) over the single port at addr.
+func newMainSender(addr string, cfg Config) (*Sender, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve address: %v", ErrInvalidConfig, err)
+	}
+	mp, err := buildMainParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenEphemeralSingle("")
+	if err != nil {
+		return nil, err
+	}
+	ssrc := randomEvenSSRC()
+	fc := toFlowConfig(cfg)
+	fc.SSRC = ssrc
+	fc.StartSeq = randomStartSeq()
+	sc := toSessionConfig(cfg, fc, ssrc)
+	sc.Main = mp
+	sess := session.NewMainSender(conn, remote, sc)
+	return &Sender{sess: sess, remote: remote}, nil
 }
 
 // Write submits one media payload for transmission and returns len(p). The

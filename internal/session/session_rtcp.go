@@ -97,13 +97,13 @@ func (s *Session) sendKeepalive(now clock.Timestamp) {
 	}
 	echo := []wire.Feedback{wire.RttEchoRequest{Timestamp: uint64(clock.NTPTimeFromTimestamp(now))}}
 	s.rtcpBuf = s.rtcpBuf[:0]
-	b, err := encodeFeedback(s.rtcpBuf, s.keepaliveLead(now), s.cfg.SSRC, s.cfg.CNAME, echo, s.cfg.Bitmask)
+	b, err := s.encodeCompound(s.rtcpBuf, s.keepaliveLead(now), echo)
 	if err != nil {
 		s.logf("encode keepalive: %v", err)
 		return
 	}
 	s.rtcpBuf = b
-	if err := s.conn.WriteRTCP(b, s.peer.RTCP); err != nil {
+	if err := s.writeFeedback(b); err != nil {
 		s.logf("write keepalive: %v", err)
 	}
 	s.lastTx = now

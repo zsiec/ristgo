@@ -22,9 +22,10 @@ type Receiver struct {
 }
 
 // NewReceiver binds a RIST receiver at addr ("host:port" or a rist:// URL
-// whose query parameters override cfg). The port is the even media port; RTCP
-// is bound on port+1. Only the Simple profile is implemented; other profiles
-// return an error wrapping ErrInvalidConfig.
+// whose query parameters override cfg). For the Simple profile the port is the
+// even media port and RTCP is bound on port+1; for the Main profile a single
+// port carries the GRE-tunnelled flow. The Advanced profile is not yet
+// implemented and returns an error wrapping ErrInvalidConfig.
 func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -33,9 +34,19 @@ func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
-	if cfg.Profile != ProfileSimple {
-		return nil, fmt.Errorf("%w: only the Simple profile is implemented (got %s)", ErrInvalidConfig, cfg.Profile)
+	switch cfg.Profile {
+	case ProfileSimple:
+		return newSimpleReceiver(addr, cfg)
+	case ProfileMain:
+		return newMainReceiver(addr, cfg)
+	default:
+		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
 	}
+}
+
+// newSimpleReceiver binds a Simple-profile receiver: RTP on the even port,
+// RTCP on port+1.
+func newSimpleReceiver(addr string, cfg Config) (*Receiver, error) {
 	host, port, err := resolveMediaPort(addr)
 	if err != nil {
 		return nil, err
@@ -46,6 +57,28 @@ func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 	}
 	fc := toFlowConfig(cfg)
 	sess := session.NewReceiver(conn, toSessionConfig(cfg, fc, randomEvenSSRC()))
+	return &Receiver{sess: sess}, nil
+}
+
+// newMainReceiver binds a Main-profile receiver: the GRE-tunnelled flow (with
+// optional PSK decryption) on the single port at addr.
+func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	mp, err := buildMainParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenSingle(host, port)
+	if err != nil {
+		return nil, err
+	}
+	fc := toFlowConfig(cfg)
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
+	sc.Main = mp
+	sess := session.NewMainReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }
 

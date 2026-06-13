@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/zsiec/ristgo/internal/clock"
+	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/session"
 )
@@ -34,6 +35,47 @@ func resolveMediaPort(addr string) (host string, port int, err error) {
 		return "", 0, fmt.Errorf("%w: media port %d must be even (RTCP uses port+1)", ErrInvalidConfig, port)
 	}
 	return h, port, nil
+}
+
+// resolveSinglePort splits a "host:port" address for the Main profile, which
+// tunnels everything over one port (not the Simple even/odd pair), so any port
+// in 1-65535 is valid.
+func resolveSinglePort(addr string) (host string, port int, err error) {
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	port, err = strconv.Atoi(p)
+	if err != nil || port <= 0 || port > 65535 {
+		return "", 0, fmt.Errorf("%w: port %q out of range", ErrInvalidConfig, p)
+	}
+	return h, port, nil
+}
+
+// buildMainParams derives the session Main-profile parameters from cfg,
+// constructing the PSK keys when a Secret is configured (cfg must already be
+// validated, so AESKeyBits is 128 or 256 — defaulted to 256 when Secret is
+// set). With no Secret the Main flow runs in cleartext.
+func buildMainParams(cfg Config) (*session.MainParams, error) {
+	mp := &session.MainParams{
+		VirtSrcPort: cfg.VirtSrcPort,
+		VirtDstPort: cfg.VirtDstPort,
+	}
+	if cfg.Secret == "" {
+		return mp, nil
+	}
+	sendKey, err := crypto.NewKey([]byte(cfg.Secret), cfg.AESKeyBits, cfg.KeyRotation, false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	recvKey, err := crypto.NewDecryptor([]byte(cfg.Secret), cfg.AESKeyBits)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	mp.SendKey = sendKey
+	mp.RecvKey = recvKey
+	mp.KeySize256 = cfg.AESKeyBits == crypto.KeySize256
+	return mp, nil
 }
 
 // toFlowConfig maps the public Config to the deterministic core's config.
