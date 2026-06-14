@@ -23,7 +23,7 @@ import (
 // # Single-port multiplex
 //
 // Main profile carries media AND compound RTCP over one UDP port, both
-// GRE-tunnelled (rist-common.c:3350, RIST_GRE_PROTOCOL_TYPE_REDUCED). Every
+// GRE-tunnelled (RIST_GRE_PROTOCOL_TYPE_REDUCED). Every
 // outbound datagram is:
 //
 //	GRE base header (seq always; +nonce when encrypting)
@@ -32,7 +32,7 @@ import (
 //
 // When PSK is enabled the reduced header and the inner RTP/RTCP+payload are
 // encrypted together as one AES-CTR region beginning immediately after the GRE
-// sequence number (gre.c:116-131); the GRE base header, nonce, and sequence
+// sequence number; the GRE base header, nonce, and sequence
 // stay in cleartext. The IV is the 32-bit GRE sequence (crypto.BuildIV).
 //
 // # GRE sequence number
@@ -47,23 +47,23 @@ import (
 // reduced header, the codec peeks the second byte of the inner packet (the
 // RTP/RTCP payload-type byte). With pt = byte & 0x7f, 72 <= pt <= 77 means RTCP
 // (PT 200-205) and routes to compound-RTCP feedback decode; anything else is
-// RTP media (rist-common.c:3357-3409). The reduced-header port is not consulted
+// RTP media. The reduced-header port is not consulted
 // for this — the PT byte is authoritative, matching libRIST.
 //
 // At the default and minimum GRE version (1) the GRE protocol type is
-// RIST_GRE_PROTOCOL_TYPE_REDUCED (0x88B6), written directly with no VSF wrapper
-// (gre.c:85-86). This codec always uses version 1.
+// RIST_GRE_PROTOCOL_TYPE_REDUCED (0x88B6), written directly with no VSF wrapper.
+// This codec always uses version 1.
 
 // rtcpPTByteLow is the inner-packet byte index whose low 7 bits hold the
 // payload type for both RTP (marker+PT) and RTCP (version+count / PT depending
 // on layout). For the demux the relevant byte is the SECOND octet of the inner
 // packet: for RTP it is marker|payload_type, for RTCP it is the packet-type
-// octet (rist-common.c:3351, rtp->payload_type read from the same offset).
+// octet (rtp->payload_type read from the same offset).
 const rtcpPTByteLow = 1
 
 // rtcpPTMin and rtcpPTMax bound the RTCP payload-type range after masking the
-// marker bit: PT 200-205 minus 128 is the conflict-avoidance window 72-77
-// (rist-common.c:3358). An inner second-byte whose low 7 bits fall in this
+// marker bit: PT 200-205 minus 128 is the conflict-avoidance window 72-77.
+// An inner second-byte whose low 7 bits fall in this
 // range is decoded as compound RTCP; anything else is RTP media.
 const (
 	rtcpPTMin = 72
@@ -78,7 +78,7 @@ const (
 const npdExtPayloadLen = 4
 
 // hBitKeySize maps the GRE H bit (KeySize256) to the AES key size in bits the
-// receiver derives with: 256 when set, 128 when clear (rist-common.c:2991).
+// receiver derives with: 256 when set, 128 when clear.
 func hBitKeySize(keySize256 bool) int {
 	if keySize256 {
 		return crypto.KeySize256
@@ -108,8 +108,8 @@ type mainCodec struct {
 	// (crypto.Key does not expose its key size).
 	//
 	// The receive path honors the INBOUND H bit independently: decodeMain calls
-	// recvKey.SetKeyBits with the size the peer signalled before decrypting
-	// (rist-common.c:2991), so a peer configured with a different aes-type still
+	// recvKey.SetKeyBits with the size the peer signalled before decrypting,
+	// so a peer configured with a different aes-type still
 	// interoperates. A secret mismatch still fails every decrypt; decodeMain
 	// returns an error and the loop logs it.
 	keySize256 bool
@@ -122,8 +122,8 @@ type mainCodec struct {
 	// received RTP packet, exactly as the Simple codec's mediaDecoder does. The
 	// media sequence always widens by rollover counting: libRIST carries only the
 	// 16-bit RTP sequence on the Main path and never populates the NPD extension's
-	// seq_ext (it reads seq_ext only in the Advanced profile; rist-common.c:3496
-	// widens by &UINT16_MAX), so trusting seq_ext would pin the high bits at zero
+	// seq_ext (it reads seq_ext only in the Advanced profile; widens by
+	// &UINT16_MAX), so trusting seq_ext would pin the high bits at zero
 	// and break across the 16-bit wrap against a real libRIST peer.
 	dec mediaDecoder
 
@@ -206,7 +206,7 @@ func (c *mainCodec) buildMediaRTP(pkt wire.MediaPacket) ([]byte, error) {
 	// reports suppressed==0) when the payload has no nulls; it errors when the
 	// payload is not a whole number of <=7 TS packets. Either way, fall back
 	// to a plain RTP packet — libRIST attaches the extension only when
-	// suppress_null_packets returns > 0 (udp.c:905).
+	// suppress_null_packets returns > 0.
 	reduced, npdBits, suppressed, err := npd.Suppress(nil, pkt.Payload)
 	if err != nil || suppressed == 0 {
 		return encodeMedia(nil, pkt)
@@ -221,8 +221,8 @@ func (c *mainCodec) buildMediaRTP(pkt wire.MediaPacket) ([]byte, error) {
 		Size204:    npdBits&npd.NPDSize204 != 0,
 		NullBitmap: npdBits & npd.NullBitmapMask,
 		// libRIST emits seq_ext=0 on the Simple/Main path (it reads seq_ext only
-		// in the Advanced profile; rist-common.c:3496 widens the media sequence
-		// by 16-bit rollover). Match it — the extension carries only NPD info,
+		// in the Advanced profile; widens the media sequence by 16-bit
+		// rollover). Match it — the extension carries only NPD info,
 		// and the receiver widens by rollover counting, not from seq_ext.
 		SeqExt: 0,
 	}
@@ -364,10 +364,10 @@ func (c *mainCodec) nackPackets(mediaSSRC uint32, missing []uint32, bitmask bool
 // configured, and appends the result to dst. It increments the GRE sequence
 // counter once per call.
 //
-// The layout matches gre.c: the GRE base header (with the sequence always
+// The layout matches libRIST: the GRE base header (with the sequence always
 // present, and the key/nonce present only when encrypting) is cleartext; the
 // AES-CTR region — when encrypting — begins immediately after the GRE sequence
-// and covers the reduced header and inner packet together (gre.c:116-131).
+// and covers the reduced header and inner packet together.
 func (c *mainCodec) frame(dst, inner []byte) ([]byte, error) {
 	seq := c.greSeq
 	c.greSeq++
@@ -414,7 +414,7 @@ func (c *mainCodec) frame(dst, inner []byte) ([]byte, error) {
 
 // encodeEAPOL frames an EAP-over-GRE authentication payload: the GRE header
 // (version 1, sequence present, protocol type EAPOL) followed by the EAP
-// payload, never encrypted (libRIST excludes EAPOL from PSK, gre.c:25). It
+// payload, never encrypted (libRIST excludes EAPOL from PSK). It
 // increments the GRE sequence once per call, like frame.
 func (c *mainCodec) encodeEAPOL(dst, eap []byte) ([]byte, error) {
 	seq := c.greSeq
@@ -448,7 +448,7 @@ func (c *mainCodec) peekEAPOL(b []byte) (eap []byte, ok bool) {
 // decodeMain parses one Main-profile datagram. It returns isMedia true with the
 // reconstructed MediaPacket when the inner packet is RTP media, or isMedia
 // false with the decoded feedback list when it is compound RTCP, demultiplexing
-// on the inner packet's payload-type byte (rist-common.c:3357-3409). Arbitrary,
+// on the inner packet's payload-type byte. Arbitrary,
 // truncated, or short-ciphertext input returns an error and never panics.
 //
 // nackRef is the host's current send position; it widens the 16-bit sequences
@@ -478,7 +478,7 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 		}
 		// Honor the GRE H bit: derive the decryption key at the size the sender
 		// signalled, so a peer configured with a different aes-type still
-		// interoperates (rist-common.c:2991). No-op when unchanged.
+		// interoperates. No-op when unchanged.
 		c.recvKey.SetKeyBits(hBitKeySize(hdr.KeySize256))
 		region, err = c.recvKey.Decrypt(hdr.Nonce, hdr.Seq, nil, region)
 		if err != nil {
@@ -516,7 +516,7 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 // NPD-expanded if the N flag is set. The 32-bit media sequence ALWAYS widens by
 // rollover counting via the embedded mediaDecoder, exactly as the Simple codec
 // does: the extension's seq_ext is ignored because libRIST never populates it
-// on this path (rist-common.c:3496) and a non-zero value would otherwise pin
+// on this path and a non-zero value would otherwise pin
 // the high bits and break across the 16-bit wrap. A retransmit reconstructs to
 // the same (Seq, SourceTime) as its original.
 func (c *mainCodec) decodeMediaMain(b []byte) (wire.MediaPacket, error) {
@@ -531,7 +531,7 @@ func (c *mainCodec) decodeMediaMain(b []byte) (wire.MediaPacket, error) {
 	payload := p.Payload
 	// Honor the RIST NPD extension only at its canonical shape: identifier
 	// 0x5249 and length 1 (a four-byte payload). libRIST gates NPD expansion the
-	// same way (rist-common.c:3390, be16toh(length)==1) and otherwise treats the
+	// same way (be16toh(length)==1) and otherwise treats the
 	// bytes as media rather than rejecting, so a non-canonical extension is
 	// ignored here too. Pinning the payload length to 4 also makes npd.ParseExt's
 	// length validation meaningful (extWireBytes synthesizes the length field).

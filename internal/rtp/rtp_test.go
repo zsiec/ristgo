@@ -44,11 +44,11 @@ var goldenPackets = []struct {
 }{
 	{
 		// Minimal RIST media packet, mirroring how libRIST builds MPEG-TS
-		// data packets (src/udp.c:216-230: flags = RTP_MPEGTS_FLAGS 0x80,
+		// data packets (flags = RTP_MPEGTS_FLAGS 0x80,
 		// payload_type = RTP_PTYPE_MPEGTS 0x21, ssrc = adv_flow_id).
 		//
 		// Byte 0: V=2 (binary 10), P=0, X=0, CC=0 -> 1000_0000 = 0x80
-		//         (== RTP_MPEGTS_FLAGS, librist src/proto/rtp.h:106).
+		//         (== RTP_MPEGTS_FLAGS, librist).
 		// Byte 1: M=0, PT=0x21 (binary 0100001)  -> 0010_0001 = 0x21.
 		// Seq 0x1234, TS 0xDEADBEEF, SSRC 0x4D4F4F56 (even = base flow),
 		// big-endian per RFC 3550 §5.1. Payload starts with the MPEG-TS
@@ -74,7 +74,7 @@ var goldenPackets = []struct {
 	{
 		// RIST retransmission of mpegts-minimal: the ORIGINAL packet —
 		// same seq, timestamp, and payload — with only the SSRC LSB set
-		// (librist src/udp.c:227, ssrc = htobe32(adv_flow_id | 0x01)).
+		// (librist, ssrc = htobe32(adv_flow_id | 0x01)).
 		// 0x4D4F4F56 | 1 = 0x4D4F4F57. NOT RFC 4588.
 		name: "mpegts-retransmit",
 		pkt: Packet{
@@ -96,7 +96,7 @@ var goldenPackets = []struct {
 	},
 	{
 		// Fully loaded header: 2 CSRCs, classic RFC 3550 extension with
-		// the RIST NPD profile 0x5249 "RI" (librist src/proto/rtp.h:132)
+		// the RIST NPD profile 0x5249 "RI" (librist)
 		// and one 32-bit word of payload, plus 2 bytes of padding.
 		//
 		// Byte 0: V=2, P=1, X=1, CC=2 -> 1011_0010 = 0xB2.

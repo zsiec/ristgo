@@ -10,8 +10,7 @@
 // roles: a receiver binds the well-known port pair and learns the sender's
 // source addresses from inbound datagrams, while a sender binds an ephemeral
 // pair and addresses the receiver's well-known ports. Address learning and the
-// even/odd split mirror libRIST (src/rist.c:1081-1108 bind, src/peer.c address
-// matching).
+// even/odd split mirror libRIST (bind, address matching).
 //
 // This package only moves bytes; it never parses RTP/RTCP or touches the flow
 // core. Read/Write are safe for concurrent use across the two sockets (each

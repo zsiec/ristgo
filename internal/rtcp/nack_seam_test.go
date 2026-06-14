@@ -189,8 +189,7 @@ func randomMissing(rng *rand.Rand) []uint32 {
 }
 
 // TestEncodeNACKEmpty pins the no-loss case: no packets at all, mirroring
-// libRIST which only appends a NACK section when array_len > 0
-// (src/udp.c:738).
+// libRIST which only appends a NACK section when array_len > 0.
 func TestEncodeNACKEmpty(t *testing.T) {
 	if got := EncodeRangeNACK(1, 2, nil); got != nil {
 		t.Errorf("EncodeRangeNACK(nil) = %v, want nil", got)

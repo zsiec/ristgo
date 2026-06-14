@@ -21,16 +21,15 @@ const (
 	TimerPlayout TimerID = iota
 
 	// TimerNack paces the receiver's NACK processing pass. libRIST bounds
-	// the receiver loop's jitter at RIST_MAX_JITTER = 5 ms
-	// (src/rist-private.h:54); the core re-arms this timer at that cadence
-	// while missing entries are queued.
+	// the receiver loop's jitter at RIST_MAX_JITTER = 5 ms; the core re-arms
+	// this timer at that cadence while missing entries are queued.
 	TimerNack
 
 	// TimerRttEcho paces a flow's RTT echo requests at libRIST's
-	// RIST_PING_INTERVAL = 100 ms (src/rist-private.h:55). Both roles
-	// originate echo requests to measure their own RTT (the receiver for
-	// NACK retry spacing, the sender for the retransmit gate); each runs on
-	// its own host timer wheel, so the single ID never collides.
+	// RIST_PING_INTERVAL = 100 ms. Both roles originate echo requests to
+	// measure their own RTT (the receiver for NACK retry spacing, the sender
+	// for the retransmit gate); each runs on its own host timer wheel, so the
+	// single ID never collides.
 	TimerRttEcho
 )
 
@@ -122,7 +121,7 @@ func (Deliver) isEvent() {}
 
 // Stats is a snapshot of the flow's counters, returned by value from
 // Flow.Stats. Counter semantics mirror libRIST's receiver flow stats where
-// an analog exists (src/rist-common.c stats_instant fields).
+// an analog exists (stats_instant fields).
 type Stats struct {
 	// Received counts media packets accepted into the receiver ring
 	// (first copies and accepted retransmissions; duplicates and too-late
@@ -140,13 +139,13 @@ type Stats struct {
 
 	// Overwritten counts ring slots that held a stale entry — same slot,
 	// different (seq, sourceTime) — and were overwritten by a newer packet
-	// (libRIST's "Invalid Dupe" path, src/rist-common.c:786-791).
+	// (libRIST's "Invalid Dupe" path).
 	Overwritten uint64
 
 	// TooLate counts media packets dropped because they could no longer be
 	// delivered: either older than the recovery window per libRIST's
-	// now > packetTime + recoveryBuffer*1.1 rule (src/rist-common.c:735)
-	// or already behind the in-order playout cursor.
+	// now > packetTime + recoveryBuffer*1.1 rule, or already behind the
+	// in-order playout cursor.
 	TooLate uint64
 
 	// Missing counts missing entries created by gap detection (each lost
@@ -162,8 +161,7 @@ type Stats struct {
 	Recovered uint64
 
 	// Abandoned counts missing entries given up on, either after
-	// MaxRetries NACKs or after ageing past recoveryBuffer*1.1
-	// (src/rist-common.c:843-861).
+	// MaxRetries NACKs or after ageing past recoveryBuffer*1.1.
 	Abandoned uint64
 
 	// Delivered counts packets handed to the application via Deliver.
@@ -195,17 +193,15 @@ type Stats struct {
 
 	// RetransmitSkipped counts NACKed sequence numbers no longer in the
 	// sender history — aged out of the ring or never sent — and therefore
-	// not resendable (libRIST stats_sender_instant.retrans_skip,
-	// src/udp.c:1086-1103).
+	// not resendable (libRIST stats_sender_instant.retrans_skip).
 	RetransmitSkipped uint64
 
 	// RetransmitSuppressed counts NACKed sequence numbers dropped by the
 	// per-packet retransmit gate because the previous retransmit was less
-	// than one clamped RTT ago (libRIST bloat_skip, src/udp.c:1241-1272).
+	// than one clamped RTT ago (libRIST bloat_skip).
 	RetransmitSuppressed uint64
 
 	// RetransmitExhausted counts NACKed sequence numbers refused because the
-	// packet had already been retransmitted MaxRetries times
-	// (src/udp.c:1168-1174).
+	// packet had already been retransmitted MaxRetries times.
 	RetransmitExhausted uint64
 }

@@ -1,12 +1,11 @@
 // Package adv implements the RIST Advanced Profile (VSF TR-06-3:2024) tunnel
-// packet header codec, byte-exact with libRIST v0.2.18-rc1 (src/proto/adv.h
-// and src/adv.c).
+// packet header codec, byte-exact with libRIST v0.2.18-rc1.
 //
 // An Advanced Profile packet is a standard RTP packet (RFC 3550 §5.1, a fixed
 // 12-byte header with payload type 127 and a 1 MHz timestamp clock),
 // optionally followed by a classic RFC 3550 RTP header extension (present only
 // when the RTP X bit is set), then the ALWAYS-PRESENT four-byte
-// profile-defined extension (librist rist_adv_ext, adv.h:67-72):
+// profile-defined extension (librist rist_adv_ext):
 //
 //	seq_ext (16, big-endian) | flags (8) | params (8)
 //
@@ -15,7 +14,7 @@
 // extension present), and the most-significant bit of the 3-bit PSK field. The
 // params byte carries the low two bits of the PSK field, the 2-bit LPC mode,
 // and the 4-bit encapsulation Type. Optional fixed fields follow the
-// extension in a strict order (adv.c rist_adv_parse / rist_adv_build):
+// extension in a strict order (rist_adv_parse / rist_adv_build):
 //
 //	Flow ID (4 B, if I=1) -> PSK Hash (16 B) -> PSK Nonce (4 B) ->
 //	PSK IV (4 B) [each per the PSK mode] -> Payload Compression (4 B, if
@@ -48,16 +47,16 @@ import (
 var (
 	// ErrShortBuffer is returned by Parse when the input is too short to
 	// hold the fixed RTP+extension header or an optional field the header
-	// announces (adv.c length checks throughout rist_adv_parse).
+	// announces (length checks throughout rist_adv_parse).
 	ErrShortBuffer = errors.New("rist: adv: short buffer")
 
 	// ErrInvalidVersion is returned by Parse when the RTP version field is
-	// not 2 (adv.c:46, "(rtp->flags & 0xC0) != 0x80").
+	// not 2 ("(rtp->flags & 0xC0) != 0x80").
 	ErrInvalidVersion = errors.New("rist: adv: RTP version is not 2")
 
 	// ErrInvalidPayloadType is returned by Parse when the RTP payload type
 	// is neither 127 nor a dynamic type in the SDP range (>= 96); libRIST
-	// drops other payload types (adv.c:50-52).
+	// drops other payload types.
 	ErrInvalidPayloadType = errors.New("rist: adv: RTP payload type not 127 and below 96")
 
 	// ErrFieldRange is returned by Build when enc_type, psk_mode, or
@@ -66,185 +65,184 @@ var (
 	ErrFieldRange = errors.New("rist: adv: field out of range")
 )
 
-// RTP-level constants for the Advanced Profile (adv.h:60-66).
+// RTP-level constants for the Advanced Profile.
 const (
 	// PayloadType is the RTP payload type carried when SDP is not in use:
-	// 127 (adv.h:60, RIST_ADV_PT; TR-06-3 §5.2.1).
+	// 127 (RIST_ADV_PT; TR-06-3 §5.2.1).
 	PayloadType = 127
 
-	// ClockHz is the default RTP timestamp frequency, 1 MHz (adv.h:63,
-	// RIST_ADV_CLOCK_HZ; TR-06-3 §5.2.1).
+	// ClockHz is the default RTP timestamp frequency, 1 MHz
+	// (RIST_ADV_CLOCK_HZ; TR-06-3 §5.2.1).
 	ClockHz = 1000000
 
 	// rtpFlags is the default RTP first byte: V=2, P=0, X=0, CC=0 = 0x80
-	// (adv.h:66, RIST_ADV_RTP_FLAGS). The profile-defined extension is part
+	// (RIST_ADV_RTP_FLAGS). The profile-defined extension is part
 	// of the RTP payload, not an RFC 3550 header extension, so X stays 0
 	// unless a real header extension is present.
 	rtpFlags = 0x80
 
 	// dynamicPTMin is the lowest dynamic RTP payload type accepted when SDP
-	// is in use (adv.c:50, "pt < 96").
+	// is in use ("pt < 96").
 	dynamicPTMin = 96
 )
 
-// Flag bits of the profile-defined extension flags byte (adv.h:76-83). Bit 7
+// Flag bits of the profile-defined extension flags byte. Bit 7
 // is the most significant bit.
 const (
-	// FlagF marks a first fragment (adv.h:76, RIST_ADV_FLAG_F).
+	// FlagF marks a first fragment (RIST_ADV_FLAG_F).
 	FlagF = 0x80
-	// FlagL marks a last fragment (adv.h:77, RIST_ADV_FLAG_L).
+	// FlagL marks a last fragment (RIST_ADV_FLAG_L).
 	FlagL = 0x40
-	// FlagE is the expedite bit (adv.h:78, RIST_ADV_FLAG_E).
+	// FlagE is the expedite bit (RIST_ADV_FLAG_E).
 	FlagE = 0x20
-	// FlagR is the retransmit bit (adv.h:79, RIST_ADV_FLAG_R).
+	// FlagR is the retransmit bit (RIST_ADV_FLAG_R).
 	FlagR = 0x10
-	// FlagI marks a present Flow ID field (adv.h:80, RIST_ADV_FLAG_I).
+	// FlagI marks a present Flow ID field (RIST_ADV_FLAG_I).
 	FlagI = 0x08
-	// FlagP marks a present Payload Format Descriptor (adv.h:81,
-	// RIST_ADV_FLAG_P).
+	// FlagP marks a present Payload Format Descriptor
+	// (RIST_ADV_FLAG_P).
 	FlagP = 0x04
-	// FlagH marks a present RIST Header Extension (adv.h:82,
-	// RIST_ADV_FLAG_H).
+	// FlagH marks a present RIST Header Extension
+	// (RIST_ADV_FLAG_H).
 	FlagH = 0x02
 	// flagPSK2 is the MSB (bit 2) of the 3-bit PSK field, carried in the
-	// flags byte (adv.h:83, RIST_ADV_PSK2_MASK).
+	// flags byte (RIST_ADV_PSK2_MASK).
 	flagPSK2 = 0x01
 )
 
-// Bit-field layout of the profile-defined extension params byte (adv.h:86-91):
+// Bit-field layout of the profile-defined extension params byte:
 // PSK[1:0] in bits 7-6, LPC[1:0] in bits 5-4, Type[3:0] in bits 3-0.
 const (
-	psk10Shift = 6    // PSK[1:0] in bits 7-6 (adv.h:86)
-	psk10Mask  = 0xC0 // adv.h:87
-	lpcShift   = 4    // LPC[1:0] in bits 5-4 (adv.h:88)
-	lpcMask    = 0x30 // adv.h:89
-	typeMask   = 0x0F // Type[3:0] in bits 3-0 (adv.h:90)
+	psk10Shift = 6 // PSK[1:0] in bits 7-6
+	psk10Mask  = 0xC0
+	lpcShift   = 4 // LPC[1:0] in bits 5-4
+	lpcMask    = 0x30
+	typeMask   = 0x0F // Type[3:0] in bits 3-0
 )
 
-// Encapsulation Type values for the Type[3:0] field (adv.h:147-156, TR-06-3
+// Encapsulation Type values for the Type[3:0] field (TR-06-3
 // §5.2.3).
 const (
-	TypeReserved   = 0 // adv.h:147, RIST_ADV_TYPE_RESERVED
-	TypeIPv4       = 1 // adv.h:148, RIST_ADV_TYPE_IPV4
-	TypeIPv6       = 2 // adv.h:149, RIST_ADV_TYPE_IPV6
-	TypeReducedUDP = 3 // adv.h:150, RIST_ADV_TYPE_REDUCED_UDP
-	TypeControl    = 4 // adv.h:151, RIST_ADV_TYPE_CONTROL
-	TypeDirect     = 5 // adv.h:152, RIST_ADV_TYPE_DIRECT
-	TypeLayer2     = 6 // adv.h:153, RIST_ADV_TYPE_LAYER2
-	TypeGRERFC2784 = 7 // adv.h:154, RIST_ADV_TYPE_GRE_RFC2784
-	TypeGREMain    = 8 // adv.h:155, RIST_ADV_TYPE_GRE_MAIN
+	TypeReserved   = 0 // RIST_ADV_TYPE_RESERVED
+	TypeIPv4       = 1 // RIST_ADV_TYPE_IPV4
+	TypeIPv6       = 2 // RIST_ADV_TYPE_IPV6
+	TypeReducedUDP = 3 // RIST_ADV_TYPE_REDUCED_UDP
+	TypeControl    = 4 // RIST_ADV_TYPE_CONTROL
+	TypeDirect     = 5 // RIST_ADV_TYPE_DIRECT
+	TypeLayer2     = 6 // RIST_ADV_TYPE_LAYER2
+	TypeGRERFC2784 = 7 // RIST_ADV_TYPE_GRE_RFC2784
+	TypeGREMain    = 8 // RIST_ADV_TYPE_GRE_MAIN
 )
 
-// Pre-shared-key mode values for the PSK[2:0] field (adv.h:161-168, TR-06-3
+// Pre-shared-key mode values for the PSK[2:0] field (TR-06-3
 // §5.2.3).
 const (
-	PSKNone               = 0 // No encryption (adv.h:161, RIST_ADV_PSK_NONE)
-	PSKAESCTR             = 1 // AES-CTR, Main-profile compatible (adv.h:162)
-	PSKHMACSHA256         = 2 // HMAC-SHA256, no encryption (adv.h:163)
-	PSKAESCTRHMAC         = 3 // AES-CTR-HMAC-SHA256 (adv.h:164)
-	PSKAESGCM             = 4 // AES-GCM (adv.h:165)
-	PSKChaCha20Poly       = 5 // CHACHA20-POLY1305 (adv.h:166)
-	PSKUserNoHash         = 6 // User-defined, no hash (adv.h:167)
-	PSKUserHash           = 7 // User-defined, with hash (adv.h:168)
+	PSKNone               = 0 // No encryption (RIST_ADV_PSK_NONE)
+	PSKAESCTR             = 1 // AES-CTR, Main-profile compatible
+	PSKHMACSHA256         = 2 // HMAC-SHA256, no encryption
+	PSKAESCTRHMAC         = 3 // AES-CTR-HMAC-SHA256
+	PSKAESGCM             = 4 // AES-GCM
+	PSKChaCha20Poly       = 5 // CHACHA20-POLY1305
+	PSKUserNoHash         = 6 // User-defined, no hash
+	PSKUserHash           = 7 // User-defined, with hash
 	pskMaxIncl      uint8 = 7 // PSK is a 3-bit field
 )
 
-// Sizes of the PSK header fields (adv.h:174-176, Table 1).
+// Sizes of the PSK header fields (Table 1).
 const (
-	PSKHashSize  = 16 // adv.h:174, RIST_ADV_PSK_HASH_SIZE
-	PSKNonceSize = 4  // adv.h:175, RIST_ADV_PSK_NONCE_SIZE
-	PSKIVSize    = 4  // adv.h:176, RIST_ADV_PSK_IV_SIZE
+	PSKHashSize  = 16 // RIST_ADV_PSK_HASH_SIZE
+	PSKNonceSize = 4  // RIST_ADV_PSK_NONCE_SIZE
+	PSKIVSize    = 4  // RIST_ADV_PSK_IV_SIZE
 )
 
-// Payload-compression mode values for the LPC[1:0] field (adv.h:209-212,
-// TR-06-3 §5.2.3).
+// Payload-compression mode values for the LPC[1:0] field (TR-06-3 §5.2.3).
 const (
-	LPCNone         = 0 // No compression (adv.h:209, RIST_ADV_LPC_NONE)
-	LPCLZ4          = 1 // LZ4 compression (adv.h:210, RIST_ADV_LPC_LZ4)
-	LPCReserved     = 2 // Reserved (adv.h:211, RIST_ADV_LPC_RESERVED)
-	LPCFieldPresent = 3 // Compression field present (adv.h:212)
+	LPCNone         = 0 // No compression (RIST_ADV_LPC_NONE)
+	LPCLZ4          = 1 // LZ4 compression (RIST_ADV_LPC_LZ4)
+	LPCReserved     = 2 // Reserved (RIST_ADV_LPC_RESERVED)
+	LPCFieldPresent = 3 // Compression field present
 	lpcMaxIncl      = 3 // LPC is a 2-bit field
 )
 
 // Control Index values carried in a Type-Control (Type=4) packet's payload
-// sub-header (adv.h:217-229, Table 2, TR-06-3 §5.3).
+// sub-header (Table 2, TR-06-3 §5.3).
 const (
-	CINackBitmask uint16 = 0x0000 // adv.h:217, RIST_ADV_CI_NACK_BITMASK
-	CINackRange   uint16 = 0x0001 // adv.h:218, RIST_ADV_CI_NACK_RANGE
+	CINackBitmask uint16 = 0x0000 // RIST_ADV_CI_NACK_BITMASK
+	CINackRange   uint16 = 0x0001 // RIST_ADV_CI_NACK_RANGE
 	// CILQMGlobal / CILQMLinkSpecific carry a TR-06-4 Part 1 Link Quality
 	// Message in the Advanced profile (TR-06-4 §5.4, Table 1): the Global report
 	// (combined over all links) and the per-link report. The body is the 44-byte
 	// LQM (internal/adapt).
 	CILQMGlobal       uint16 = 0x0002
 	CILQMLinkSpecific uint16 = 0x0003
-	CIRTTEchoReq      uint16 = 0x0010 // adv.h:219, RIST_ADV_CI_RTT_ECHO_REQ
-	CIRTTEchoResp     uint16 = 0x0011 // adv.h:220, RIST_ADV_CI_RTT_ECHO_RESP
-	CIFEC20225Row     uint16 = 0x0020 // adv.h:221, RIST_ADV_CI_FEC_2022_5_ROW
-	CIFEC20225Col     uint16 = 0x0021 // adv.h:222, RIST_ADV_CI_FEC_2022_5_COL
-	CIFEC20221Row     uint16 = 0x0022 // adv.h:223, RIST_ADV_CI_FEC_2022_1_ROW
-	CIFEC20221Col     uint16 = 0x0023 // adv.h:224, RIST_ADV_CI_FEC_2022_1_COL
-	CIKeepalive       uint16 = 0x8000 // adv.h:225, RIST_ADV_CI_KEEPALIVE
-	CIFlowAttr        uint16 = 0x8001 // adv.h:226, RIST_ADV_CI_FLOW_ATTR
-	CISRPAuth         uint16 = 0x8010 // adv.h:227, RIST_ADV_CI_SRP_AUTH
-	CIPSKNonce        uint16 = 0x8011 // adv.h:228, RIST_ADV_CI_PSK_NONCE
-	CIUnsupported     uint16 = 0x8020 // adv.h:229, RIST_ADV_CI_UNSUPPORTED
+	CIRTTEchoReq      uint16 = 0x0010 // RIST_ADV_CI_RTT_ECHO_REQ
+	CIRTTEchoResp     uint16 = 0x0011 // RIST_ADV_CI_RTT_ECHO_RESP
+	CIFEC20225Row     uint16 = 0x0020 // RIST_ADV_CI_FEC_2022_5_ROW
+	CIFEC20225Col     uint16 = 0x0021 // RIST_ADV_CI_FEC_2022_5_COL
+	CIFEC20221Row     uint16 = 0x0022 // RIST_ADV_CI_FEC_2022_1_ROW
+	CIFEC20221Col     uint16 = 0x0023 // RIST_ADV_CI_FEC_2022_1_COL
+	CIKeepalive       uint16 = 0x8000 // RIST_ADV_CI_KEEPALIVE
+	CIFlowAttr        uint16 = 0x8001 // RIST_ADV_CI_FLOW_ATTR
+	CISRPAuth         uint16 = 0x8010 // RIST_ADV_CI_SRP_AUTH
+	CIPSKNonce        uint16 = 0x8011 // RIST_ADV_CI_PSK_NONCE
+	CIUnsupported     uint16 = 0x8020 // RIST_ADV_CI_UNSUPPORTED
 )
 
-// Header size constants (adv.h:262-280).
+// Header size constants.
 const (
-	// RTPSize is the standard RTP header size (adv.h:262,
-	// RIST_ADV_RTP_SIZE).
+	// RTPSize is the standard RTP header size
+	// (RIST_ADV_RTP_SIZE).
 	RTPSize = 12
-	// ExtSize is the profile-defined extension size (adv.h:263,
-	// RIST_ADV_EXT_SIZE).
+	// ExtSize is the profile-defined extension size
+	// (RIST_ADV_EXT_SIZE).
 	ExtSize = 4
 	// HeaderMin is the minimum Advanced Profile header: RTP (12) + ext (4)
-	// (adv.h:264, RIST_ADV_HEADER_MIN).
+	// (RIST_ADV_HEADER_MIN).
 	HeaderMin = RTPSize + ExtSize
-	// FlowIDSize is the size of the Flow ID field (adv.h:265,
-	// RIST_ADV_FLOW_ID_SIZE).
+	// FlowIDSize is the size of the Flow ID field
+	// (RIST_ADV_FLOW_ID_SIZE).
 	FlowIDSize = 4
 	// CompressionSize is the size of the Payload Compression field
-	// (adv.h:266, RIST_ADV_COMPRESSION_SIZE).
+	// (RIST_ADV_COMPRESSION_SIZE).
 	CompressionSize = 4
-	// PFDSize is the size of the Payload Format Descriptor (adv.h:267,
-	// RIST_ADV_PFD_SIZE).
+	// PFDSize is the size of the Payload Format Descriptor
+	// (RIST_ADV_PFD_SIZE).
 	PFDSize = 4
 	// MaxFixedHeader is the maximum fixed header: RTP(12)+ext(4)+flow(4)+
 	// hash(16)+nonce(4)+iv(4)+comp(4)+pfd(4) = 52, excluding the
-	// variable-length RIST header extension (adv.h:271-273).
+	// variable-length RIST header extension.
 	MaxFixedHeader = 52
 	// CtrlHdrSize is the control-message sub-header size: Control Index (2)
-	// + Length (2) (adv.h:276, RIST_ADV_CTRL_HDR_SIZE).
+	// + Length (2) (RIST_ADV_CTRL_HDR_SIZE).
 	CtrlHdrSize = 4
 
 	// rtpExtHdrSize is the 4-byte header of an RFC 3550 RTP header
 	// extension or RIST header extension: 16-bit profile + 16-bit length in
-	// 32-bit words (adv.c:69-72, adv.c:160-167).
+	// 32-bit words.
 	rtpExtHdrSize = 4
 )
 
 // PSKHasHash reports whether the given PSK mode carries a 16-byte hash field
-// (adv.h:182-185, rist_adv_psk_has_hash): modes 2, 3, 4, 5, 7.
+// (rist_adv_psk_has_hash): modes 2, 3, 4, 5, 7.
 func PSKHasHash(psk uint8) bool {
 	return psk == PSKHMACSHA256 || psk == PSKAESCTRHMAC || psk == PSKAESGCM ||
 		psk == PSKChaCha20Poly || psk == PSKUserHash
 }
 
 // PSKHasNonce reports whether the given PSK mode carries a 4-byte nonce field
-// (adv.h:187-190, rist_adv_psk_has_nonce): any mode >= 1.
+// (rist_adv_psk_has_nonce): any mode >= 1.
 func PSKHasNonce(psk uint8) bool {
 	return psk >= PSKAESCTR
 }
 
 // PSKHasIV reports whether the given PSK mode carries a 4-byte IV field
-// (adv.h:192-195, rist_adv_psk_has_iv): mode 1 (AES-CTR) or any mode >= 3.
+// (rist_adv_psk_has_iv): mode 1 (AES-CTR) or any mode >= 3.
 func PSKHasIV(psk uint8) bool {
 	return psk == PSKAESCTR || psk >= PSKAESCTRHMAC
 }
 
 // PSKHdrSize returns the total number of PSK header bytes (hash + nonce + IV)
-// carried for the given PSK mode (adv.h:197-204, rist_adv_psk_hdr_size). The
+// carried for the given PSK mode (rist_adv_psk_hdr_size). The
 // per-mode totals are: 0->0, 1->8, 2->20, 3->24, 4->24, 5->24, 6->8, 7->24.
 func PSKHdrSize(psk uint8) int {
 	sz := 0
@@ -261,54 +259,53 @@ func PSKHdrSize(psk uint8) int {
 }
 
 // SSRCIsProtected reports whether an SSRC denotes a protected (ARQ-eligible)
-// flow. Even SSRCs are protected, odd are unprotected (adv.h:346-349,
-// rist_adv_ssrc_is_protected; TR-06-3 §5.2.1).
+// flow. Even SSRCs are protected, odd are unprotected
+// (rist_adv_ssrc_is_protected; TR-06-3 §5.2.1).
 func SSRCIsProtected(ssrc uint32) bool {
 	return ssrc&1 == 0
 }
 
 // SSRCProtected returns ssrc with its least-significant bit cleared, yielding
-// the protected (even) form (adv.h:351-354, rist_adv_ssrc_protected).
+// the protected (even) form (rist_adv_ssrc_protected).
 func SSRCProtected(ssrc uint32) uint32 {
 	return ssrc &^ 1
 }
 
 // SSRCUnprotected returns ssrc with its least-significant bit set, yielding
-// the unprotected (odd) form (adv.h:356-359, rist_adv_ssrc_unprotected).
+// the unprotected (odd) form (rist_adv_ssrc_unprotected).
 func SSRCUnprotected(ssrc uint32) uint32 {
 	return ssrc | 1
 }
 
 // SplitSeq returns the low-16 and high-16 halves of a 32-bit sequence number:
-// low becomes the RTP seq, high becomes the seq_ext (adv.h:300-307,
-// rist_adv_set_seq32).
+// low becomes the RTP seq, high becomes the seq_ext (rist_adv_set_seq32).
 func SplitSeq(seq uint32) (low, high uint16) {
 	return uint16(seq & 0xFFFF), uint16(seq >> 16)
 }
 
 // JoinSeq reconstructs a 32-bit sequence number from the seq_ext (high 16) and
-// RTP seq (low 16) (adv.h:295-298, rist_adv_seq32).
+// RTP seq (low 16) (rist_adv_seq32).
 func JoinSeq(high, low uint16) uint32 {
 	return uint32(high)<<16 | uint32(low)
 }
 
-// FlowID is the 4-byte Flow ID field (adv.h:236-241, rist_adv_flow_id;
+// FlowID is the 4-byte Flow ID field (rist_adv_flow_id;
 // TR-06-3 §5.2.4, Figure 4): a 16-bit Outer Flow ID, a 12-bit Inner Flow ID,
 // and a 4-bit Inner Flow Sub-ID (IFSID). On the wire the inner 12 bits split
 // across the third byte (high 8) and the upper nibble of the fourth byte, with
 // the sub-ID in the lower nibble of the fourth byte.
 type FlowID struct {
-	// Outer is the 16-bit Outer Flow ID (adv.h:243-246, rist_adv_flow_outer).
+	// Outer is the 16-bit Outer Flow ID (rist_adv_flow_outer).
 	Outer uint16
-	// Inner is the 12-bit Inner Flow ID (adv.h:248-251, rist_adv_flow_inner).
+	// Inner is the 12-bit Inner Flow ID (rist_adv_flow_inner).
 	// Only the low 12 bits are encoded; higher bits are dropped on Build.
 	Inner uint16
-	// Sub is the 4-bit Inner Flow Sub-ID / IFSID (adv.h:253-256,
-	// rist_adv_flow_sub). Only the low 4 bits are encoded.
+	// Sub is the 4-bit Inner Flow Sub-ID / IFSID
+	// (rist_adv_flow_sub). Only the low 4 bits are encoded.
 	Sub uint8
 }
 
-// appendTo appends the 4-byte Flow ID wire form to dst (adv.h:236-241 packed
+// appendTo appends the 4-byte Flow ID wire form to dst (packed
 // struct: outer big-endian, inner_hi = inner[11:4], inner_lo_sub =
 // inner[3:0]<<4 | sub).
 func (f FlowID) appendTo(dst []byte) []byte {
@@ -319,7 +316,7 @@ func (f FlowID) appendTo(dst []byte) []byte {
 }
 
 // parseFlowID decodes a 4-byte Flow ID from b[:FlowIDSize]; the caller
-// guarantees the length (adv.h:243-256 accessors).
+// guarantees the length (accessors).
 func parseFlowID(b []byte) FlowID {
 	innerHi := b[2]
 	innerLoSub := b[3]
@@ -330,14 +327,14 @@ func parseFlowID(b []byte) FlowID {
 	}
 }
 
-// PFD is the 4-byte Payload Format Descriptor (adv.h:260-272, rist_adv_pfd at
-// 260-262 + its accessors at 264-272; TR-06-3 §5.2.7, Figure 6): a 4-bit ID
+// PFD is the 4-byte Payload Format Descriptor (rist_adv_pfd and its
+// accessors; TR-06-3 §5.2.7, Figure 6): a 4-bit ID
 // Type followed by a
 // 28-bit ID Value, packed big-endian into a single 32-bit word.
 type PFD struct {
-	// IDType is the 4-bit ID Type (adv.h pfd id_type accessor).
+	// IDType is the 4-bit ID Type (pfd id_type accessor).
 	IDType uint8
-	// IDValue is the 28-bit ID Value (adv.h pfd id_value accessor); only
+	// IDValue is the 28-bit ID Value (pfd id_value accessor); only
 	// the low 28 bits are encoded.
 	IDValue uint32
 }
@@ -359,32 +356,31 @@ func parsePFD(b []byte) PFD {
 }
 
 // IsUnfragmented reports whether the fragment flags denote a complete,
-// unfragmented packet: both F and L set (adv.h:316-321,
-// rist_adv_is_unfragmented).
+// unfragmented packet: both F and L set (rist_adv_is_unfragmented).
 func IsUnfragmented(flags uint8) bool {
 	return flags&(FlagF|FlagL) == (FlagF | FlagL)
 }
 
 // IsFragmented reports whether the fragment flags denote a fragment of a
-// larger packet, i.e. not unfragmented (adv.h:323-326).
+// larger packet, i.e. not unfragmented.
 func IsFragmented(flags uint8) bool {
 	return !IsUnfragmented(flags)
 }
 
 // IsFirstFragment reports whether the flags denote a first fragment: F set, L
-// clear (adv.h:328-331, rist_adv_is_first_fragment).
+// clear (rist_adv_is_first_fragment).
 func IsFirstFragment(flags uint8) bool {
 	return flags&FlagF != 0 && flags&FlagL == 0
 }
 
 // IsLastFragment reports whether the flags denote a last fragment: F clear, L
-// set (adv.h:333-336, rist_adv_is_last_fragment).
+// set (rist_adv_is_last_fragment).
 func IsLastFragment(flags uint8) bool {
 	return flags&FlagF == 0 && flags&FlagL != 0
 }
 
-// Params is the input model for Build, mirroring librist rist_adv_params
-// (adv.h:403-431). Optional fields are nil to omit, except the PSK fields,
+// Params is the input model for Build, mirroring librist rist_adv_params.
+// Optional fields are nil to omit, except the PSK fields,
 // whose presence Build derives from PSKMode (a nil PSK slice for a mode that
 // requires one is treated as all-zero bytes, matching libRIST when the field
 // pointer is set but the data is zeroed — see the per-field notes on Build).
@@ -410,14 +406,14 @@ type Params struct {
 	// Retransmit sets the R flag.
 	Retransmit bool
 
-	// FlowID, when non-nil, is encoded and sets the I flag (adv.c:206-209).
+	// FlowID, when non-nil, is encoded and sets the I flag.
 	FlowID *FlowID
 
 	// PSKHash, PSKNonce, PSKIV are opaque pass-through bytes for the PSK
 	// header. Build emits each field only when PSKMode requires it; when
 	// required and the slice is nil, zero bytes are written (libRIST writes
-	// the field only when both the mode requires it and the pointer is set,
-	// adv.c:212-227 — see the deviation note in the package tests). When
+	// the field only when both the mode requires it and the pointer is set
+	// — see the deviation note in the package tests). When
 	// supplied, each must be exactly its field size (PSKHashSize /
 	// PSKNonceSize / PSKIVSize) or Build returns ErrFieldRange.
 	PSKHash  []byte
@@ -425,23 +421,23 @@ type Params struct {
 	PSKIV    []byte
 
 	// Compression is the 4-byte opaque Payload Compression field, encoded
-	// only when LPCMode == LPCFieldPresent (adv.c:238). When required and nil,
+	// only when LPCMode == LPCFieldPresent. When required and nil,
 	// zero bytes are written; when supplied it must be exactly CompressionSize
 	// bytes.
 	Compression []byte
 
-	// PFD, when non-nil, is encoded and sets the P flag (adv.c:236-239).
+	// PFD, when non-nil, is encoded and sets the P flag.
 	PFD *PFD
 
 	// HdrExt, when non-empty, is the RIST Header Extension (an RFC
 	// 3550-style extension: 4-byte header + word-aligned body) copied
-	// verbatim, and sets the H flag (adv.c:242-245). Build does not
+	// verbatim, and sets the H flag. Build does not
 	// validate its internal length field; it copies len(HdrExt) bytes.
 	HdrExt []byte
 }
 
-// Parsed is the output model for Parse, mirroring librist rist_adv_parsed
-// (adv.h:365-401). Optional slice fields alias the input buffer and are nil
+// Parsed is the output model for Parse, mirroring librist rist_adv_parsed.
+// Optional slice fields alias the input buffer and are nil
 // when the corresponding field is absent.
 type Parsed struct {
 	// Seq is the full 32-bit sequence number.
@@ -502,7 +498,7 @@ type Parsed struct {
 }
 
 // HeaderSize returns the number of header bytes Build will write for params,
-// excluding the payload (librist rist_adv_header_size, adv.c:13-33). It
+// excluding the payload (librist rist_adv_header_size). It
 // matches Build's emission rules exactly: the PSK fields count whenever the
 // mode requires them, the Compression field counts only when LPCMode ==
 // LPCFieldPresent, and the RIST header extension counts its full length.
@@ -525,7 +521,7 @@ func HeaderSize(params Params) int {
 }
 
 // Build appends a complete Advanced Profile packet (header + payload) to dst
-// and returns the extended slice (librist rist_adv_build, adv.c:170-261). The
+// and returns the extended slice (librist rist_adv_build). The
 // RTP header always carries V=2, PT=127, the 1 MHz timestamp and SSRC; the
 // profile-defined extension carries the split sequence number, the F/L/E/R
 // flags, and the PSK/LPC/Type fields. Optional fields are emitted in spec
@@ -534,8 +530,8 @@ func HeaderSize(params Params) int {
 //
 // Deviation note: HeaderSize and Build derive PSK/Compression field presence
 // from PSKMode/LPCMode (the wire-truthful rule), whereas libRIST additionally
-// requires the corresponding pointer to be non-NULL before emitting the field
-// (adv.c:212-238: PSK fields at 220-235, Compression at 238). To keep Build and
+// requires the corresponding pointer to be non-NULL before emitting the field.
+// To keep Build and
 // Parse a faithful round trip — Parse
 // always consumes a PSK field whose mode requires it — Build emits zero bytes
 // for a required-but-nil field rather than producing a header Parse cannot
@@ -565,15 +561,13 @@ func Build(dst []byte, params Params, payload []byte) ([]byte, error) {
 
 	low, high := SplitSeq(params.Seq)
 
-	// RTP header (12 bytes): flags, PT, seq(low), timestamp, ssrc
-	// (adv.c:177-185).
+	// RTP header (12 bytes): flags, PT, seq(low), timestamp, ssrc.
 	dst = append(dst, rtpFlags, PayloadType)
 	dst = binary.BigEndian.AppendUint16(dst, low)
 	dst = binary.BigEndian.AppendUint32(dst, params.Timestamp)
 	dst = binary.BigEndian.AppendUint32(dst, params.SSRC)
 
-	// Profile-defined extension (4 bytes): seq_ext, flags, params
-	// (adv.c:188-205).
+	// Profile-defined extension (4 bytes): seq_ext, flags, params.
 	dst = binary.BigEndian.AppendUint16(dst, high)
 
 	var flags uint8
@@ -598,15 +592,15 @@ func Build(dst []byte, params Params, payload []byte) ([]byte, error) {
 	if len(params.HdrExt) > 0 {
 		flags |= FlagH
 	}
-	// PSK bit 2 lives in the flags byte (adv.h:113-117, rist_adv_set_psk).
+	// PSK bit 2 lives in the flags byte (rist_adv_set_psk).
 	flags |= (params.PSKMode >> 2) & flagPSK2
 	dst = append(dst, flags)
 
-	// params byte: PSK[1:0]<<6 | LPC<<4 | Type (adv.h:113-145).
+	// params byte: PSK[1:0]<<6 | LPC<<4 | Type.
 	pb := (params.PSKMode&0x03)<<psk10Shift | (params.LPCMode&0x03)<<lpcShift | (params.EncType & typeMask)
 	dst = append(dst, pb)
 
-	// Optional fields in spec order (adv.c:207-249).
+	// Optional fields in spec order.
 
 	// Flow ID.
 	if params.FlowID != nil {
@@ -666,8 +660,8 @@ func appendOrZero(dst, b []byte, size int) []byte {
 	return append(dst, b...)
 }
 
-// Parse decodes an Advanced Profile packet from buf (librist rist_adv_parse,
-// adv.c:35-168). It validates the RTP version and payload type, skips any CSRC
+// Parse decodes an Advanced Profile packet from buf (librist rist_adv_parse).
+// It validates the RTP version and payload type, skips any CSRC
 // list and RFC 3550 RTP header extension, decodes the profile-defined
 // extension, then consumes the optional fixed fields in spec order, leaving
 // the remainder as Payload. All optional slice fields (PSKHash/Nonce/IV,
@@ -679,12 +673,12 @@ func Parse(buf []byte) (Parsed, error) {
 		return Parsed{}, fmt.Errorf("%w: %d < %d bytes for RTP+ext header", ErrShortBuffer, len(buf), HeaderMin)
 	}
 
-	// RTP header. Validate V=2 (adv.c:45-46).
+	// RTP header. Validate V=2.
 	flags0 := buf[0]
 	if flags0&0xC0 != 0x80 {
 		return Parsed{}, fmt.Errorf("%w: flags byte 0x%02x", ErrInvalidVersion, flags0)
 	}
-	// PT must be 127 or a dynamic type >= 96 (adv.c:49-52).
+	// PT must be 127 or a dynamic type >= 96.
 	pt := buf[1] & 0x7F
 	if pt != PayloadType && pt < dynamicPTMin {
 		return Parsed{}, fmt.Errorf("%w: pt %d", ErrInvalidPayloadType, pt)
@@ -700,13 +694,13 @@ func Parse(buf []byte) (Parsed, error) {
 
 	offset := RTPSize
 
-	// Skip CSRC entries (adv.c:62-64). CC should be 0 but be safe.
+	// Skip CSRC entries. CC should be 0 but be safe.
 	offset += cc * 4
 	if offset > len(buf) {
 		return Parsed{}, fmt.Errorf("%w: %d < %d bytes for %d CSRC entries", ErrShortBuffer, len(buf), offset, cc)
 	}
 
-	// Skip the RFC 3550 RTP header extension if X=1 (adv.c:67-75).
+	// Skip the RFC 3550 RTP header extension if X=1.
 	if out.RTPExtPresent {
 		if offset+rtpExtHdrSize > len(buf) {
 			return Parsed{}, fmt.Errorf("%w: %d < %d bytes for RTP ext header", ErrShortBuffer, len(buf), offset+rtpExtHdrSize)
@@ -718,7 +712,7 @@ func Parse(buf []byte) (Parsed, error) {
 		}
 	}
 
-	// Profile-defined extension (adv.c:77-110).
+	// Profile-defined extension.
 	if offset+ExtSize > len(buf) {
 		return Parsed{}, fmt.Errorf("%w: %d < %d bytes for profile extension", ErrShortBuffer, len(buf), offset+ExtSize)
 	}
@@ -736,7 +730,7 @@ func Parse(buf []byte) (Parsed, error) {
 	out.HasPFD = extFlags&FlagP != 0
 	out.HasHdrExt = extFlags&FlagH != 0
 
-	// PSK = (flags PSK2 << 2) | (params PSK[1:0]) (adv.h:107-111).
+	// PSK = (flags PSK2 << 2) | (params PSK[1:0]).
 	out.PSKMode = (extFlags&flagPSK2)<<2 | (extParams&psk10Mask)>>psk10Shift
 	out.LPCMode = (extParams & lpcMask) >> lpcShift
 	out.EncType = extParams & typeMask
@@ -744,7 +738,7 @@ func Parse(buf []byte) (Parsed, error) {
 	out.HasPSK = out.PSKMode > 0
 	out.HasCompression = out.LPCMode == LPCFieldPresent
 
-	// Optional fields in spec order (adv.c:112-160).
+	// Optional fields in spec order.
 
 	// Flow ID (4 bytes, if I=1).
 	if out.HasFlowID {
@@ -796,7 +790,7 @@ func Parse(buf []byte) (Parsed, error) {
 		offset += PFDSize
 	}
 
-	// RIST Header Extension (if H=1) — RFC 3550 extension format (adv.c:160-167).
+	// RIST Header Extension (if H=1) — RFC 3550 extension format.
 	if out.HasHdrExt {
 		if offset+rtpExtHdrSize > len(buf) {
 			return Parsed{}, fmt.Errorf("%w: %d < %d bytes for hdr ext header", ErrShortBuffer, len(buf), offset+rtpExtHdrSize)

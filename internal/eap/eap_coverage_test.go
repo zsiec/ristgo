@@ -67,8 +67,7 @@ func TestSeedIdentifier(t *testing.T) {
 // TestAuthenticatorDefersSuccessToAck drives a full handshake and asserts the
 // authenticator does NOT reach terminal SUCCESS when it verifies M1 and sends
 // the SERVER_VALIDATOR — only after the client's closing EAP-SUCCESS ack, as
-// libRIST does (eap.c:596 sets authenticated; :617-634 reaches SUCCESS on the
-// ack).
+// libRIST does (sets authenticated; reaches SUCCESS on the ack).
 func TestAuthenticatorDefersSuccessToAck(t *testing.T) {
 	const user, pass = "rist", "mainprofile"
 	salt := bytes.Repeat([]byte{0x42}, 32)
@@ -123,7 +122,7 @@ func TestAuthenticatorDefersSuccessToAck(t *testing.T) {
 
 // TestStaleFailureDropped verifies a FAILURE whose identifier does not match
 // the in-flight request is dropped (not force-failing the session), while a
-// matching-identifier FAILURE does fail it (eap.c:791-796).
+// matching-identifier FAILURE does fail it.
 func TestStaleFailureDropped(t *testing.T) {
 	authee, err := NewAuthenticatee("rist", "mainprofile")
 	if err != nil {

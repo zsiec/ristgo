@@ -24,7 +24,7 @@ type slot struct {
 	payload []byte
 
 	// sourceTime is the sender's NTP-64 media timestamp; together with seq
-	// it forms the duplicate-validation key (src/rist-common.c:778).
+	// it forms the duplicate-validation key.
 	sourceTime uint64
 
 	// arrival is the local instant the first accepted copy was fed.
@@ -35,7 +35,7 @@ type slot struct {
 	packetTime clock.Timestamp
 
 	// outputTime is packetTime + recoveryBuffer: the playout deadline
-	// (src/rist-common.c:530, receiver_insert_queue_packet).
+	// (receiver_insert_queue_packet).
 	outputTime clock.Timestamp
 
 	// pathSeen is a bitset of the paths that delivered a copy of this
@@ -52,8 +52,8 @@ type slot struct {
 }
 
 // missingEntry is one queued retransmission request, libRIST's struct
-// rist_missing_buffer (src/rist-private.h): FIFO-linked, retried on the
-// NACK cadence until recovered or abandoned.
+// rist_missing_buffer: FIFO-linked, retried on the NACK cadence until
+// recovered or abandoned.
 type missingEntry struct {
 	next          *missingEntry
 	seq           uint32
@@ -74,10 +74,10 @@ type receiverState struct {
 	// offset maps source timestamps into the local clock domain:
 	// packetTime = sourceTime(us) + offset. Locked at the first packet,
 	// exactly as libRIST sets time_offset = now - source_time on the
-	// first packet of a flow (src/rist-common.c:656-657).
-	// DEVIATION(librist rist-common.c:600-625, 815-821): libRIST refines
-	// the offset with a median over 2048 in-order samples to counter clock
-	// drift; offset refinement (via RTCP SR) is deferred to WP4.
+	// first packet of a flow.
+	// DEVIATION(librist): libRIST refines the offset with a median over
+	// 2048 in-order samples to counter clock drift; offset refinement (via
+	// RTCP SR) is deferred to WP4.
 	offset clock.Microseconds
 
 	// ssrc is the media stream SSRC learned from the first packet, echoed
@@ -88,8 +88,8 @@ type receiverState struct {
 	// accepted, the anchor of missing-detection walks.
 	lastFound uint32
 	// maxSourceTime and lastPacketTime mirror libRIST's max_source_time /
-	// last_packet_ts pair (src/rist-common.c:508-513): the newest source
-	// timestamp seen and its mapped local packet time.
+	// last_packet_ts pair: the newest source timestamp seen and its mapped
+	// local packet time.
 	maxSourceTime  uint64
 	lastPacketTime clock.Timestamp
 
@@ -107,7 +107,7 @@ type receiverState struct {
 
 	// lastPath is the path of the most recently accepted media packet;
 	// feedback leaves on it.
-	// DEVIATION(librist udp.c rist_nack_peer_preferred): libRIST picks the
+	// DEVIATION(librist rist_nack_peer_preferred): libRIST picks the
 	// NACK peer by priority then lowest RTT; per-path selection lands with
 	// bonding (WP8).
 	lastPath uint8
@@ -140,13 +140,13 @@ func (f *Flow) mapSourceTime(sourceTime uint64) clock.Timestamp {
 }
 
 // feed is the receiver-role body of Feed. It follows receiver_enqueue
-// (src/rist-common.c:626-828) step for step: first-packet initialization,
-// packet-time mapping, too-late shedding, (seq, sourceTime) dedup, insert,
-// missing-detection, then timer scheduling.
+// step for step: first-packet initialization, packet-time mapping, too-late
+// shedding, (seq, sourceTime) dedup, insert, missing-detection, then timer
+// scheduling.
 func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	r := &f.receiver
 	if !r.started {
-		// A flow cannot start on a retransmit (src/rist-common.c:636-637).
+		// A flow cannot start on a retransmit.
 		if pkt.Retransmit {
 			return
 		}
@@ -156,28 +156,28 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 
 	packetTime := f.mapSourceTime(pkt.SourceTime)
 	// Track the newest source timestamp and its packet time, mirroring
-	// calculate_packet_time (src/rist-common.c:508-513). The update runs
-	// before the out-of-order comparison, exactly as in libRIST, so the
-	// packet advancing the clock can never compare against itself.
-	// DEVIATION(librist rist-common.c:481-507): the source-clock-jump and
-	// offset-change heuristics are omitted — the offset is locked at the
-	// first packet until WP4 adds SR-based refinement.
+	// calculate_packet_time. The update runs before the out-of-order
+	// comparison, exactly as in libRIST, so the packet advancing the clock
+	// can never compare against itself.
+	// DEVIATION(librist): the source-clock-jump and offset-change
+	// heuristics are omitted — the offset is locked at the first packet
+	// until WP4 adds SR-based refinement.
 	if pkt.SourceTime > r.maxSourceTime {
 		r.maxSourceTime = pkt.SourceTime
 		r.lastPacketTime = packetTime
 	}
 
-	// Out-of-order / too-late shedding (src/rist-common.c:733-755): only
-	// packets older than the newest packet time and not the immediate
-	// successor of lastFound are candidates.
-	// DEVIATION(librist rist-common.c:733): libRIST computes the expected
-	// successor as (last_seq_found+1) & (UINT16_MAX-1) — the 0xFFFE mask
-	// clears bit 0 and looks like a typo for & UINT16_MAX; we compare
-	// against the true widened successor.
+	// Out-of-order / too-late shedding: only packets older than the newest
+	// packet time and not the immediate successor of lastFound are
+	// candidates.
+	// DEVIATION(librist): libRIST computes the expected successor as
+	// (last_seq_found+1) & (UINT16_MAX-1) — the 0xFFFE mask clears bit 0
+	// and looks like a typo for & UINT16_MAX; we compare against the true
+	// widened successor.
 	outOfOrder := false
 	if packetTime.Before(r.lastPacketTime) && pkt.Seq != r.lastFound+1 {
 		if now.After(packetTime.Add(f.recoveryBuffer110)) {
-			// now > packetTime + recoveryBuffer*1.1 (src/rist-common.c:735).
+			// now > packetTime + recoveryBuffer*1.1.
 			f.stats.TooLate++
 			return
 		}
@@ -188,12 +188,12 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 
 	// Playout-cursor guard: a packet circularly behind deliverNext can
 	// never be delivered in order again.
-	// DEVIATION(librist rist-common.c:726-773): libRIST approximates this
-	// with its reader_idx buffer-full check and lets other late packets
-	// strand in the ring until a wrap overwrites them; comparing against
-	// the playout cursor sheds them deterministically and keeps the
-	// no-late-delivery invariant exact. The full-buffer drop itself is
-	// unnecessary here because the cursor guard subsumes it.
+	// DEVIATION(librist): libRIST approximates this with its reader_idx
+	// buffer-full check and lets other late packets strand in the ring
+	// until a wrap overwrites them; comparing against the playout cursor
+	// sheds them deterministically and keeps the no-late-delivery invariant
+	// exact. The full-buffer drop itself is unnecessary here because the
+	// cursor guard subsumes it.
 	if seq.Num32(pkt.Seq).Less(seq.Num32(r.deliverNext)) {
 		f.stats.TooLate++
 		return
@@ -203,15 +203,13 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	if s.state == slotFilled {
 		if s.seq == pkt.Seq && s.sourceTime == pkt.SourceTime {
 			// Duplicate: an ARQ re-send or another 2022-7 path's copy.
-			// Record the path and drop (src/rist-common.c:778-783). This
-			// is the entire multipath merge.
+			// Record the path and drop. This is the entire multipath merge.
 			s.pathSeen |= pathBit(path)
 			f.stats.Duplicates++
 			return
 		}
 		// Same slot, different (seq, sourceTime): stale entry from a
-		// sequence discontinuity or ring wrap — overwrite
-		// (src/rist-common.c:786-791).
+		// sequence discontinuity or ring wrap — overwrite.
 		f.stats.Overwritten++
 	}
 	s.state = slotFilled
@@ -231,9 +229,9 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	}
 	r.lastPath = path
 
-	// Missing detection and lastFound advance, gated exactly as libRIST's
-	// (src/rist-common.c:803-826): retransmits never trigger either;
-	// out-of-order packets trigger neither but still fill their hole.
+	// Missing detection and lastFound advance, gated exactly as libRIST's:
+	// retransmits never trigger either; out-of-order packets trigger
+	// neither but still fill their hole.
 	if !pkt.Retransmit {
 		if !outOfOrder && pkt.Seq-1 != r.lastFound {
 			f.markMissing(now, path, pkt.Seq, packetTime)
@@ -248,10 +246,9 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 }
 
 // start performs first-packet initialization, mirroring receiver_enqueue's
-// !receiver_queue_has_items branch (src/rist-common.c:638-687): lock the
-// clock offset, seed the cursors, insert the packet, and start the playout
-// and RTT-echo schedules. The first packet never triggers missing
-// detection.
+// !receiver_queue_has_items branch: lock the clock offset, seed the
+// cursors, insert the packet, and start the playout and RTT-echo schedules.
+// The first packet never triggers missing detection.
 func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	r := &f.receiver
 	src := clock.NTPTime(pkt.SourceTime).Timestamp()
@@ -281,29 +278,28 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 }
 
 // markMissing queues missing entries for every sequence in (lastFound,
-// current), following receiver_mark_missing (src/rist-common.c:536-590):
-// the per-entry nack time is interpolated linearly between the two known
-// packet times.
+// current), following receiver_mark_missing: the per-entry nack time is
+// interpolated linearly between the two known packet times.
 func (f *Flow) markMissing(now clock.Timestamp, path uint8, current uint32, packetTimeNow clock.Timestamp) {
 	r := &f.receiver
 	gap := uint64(current - r.lastFound)
 	// Wraparound guard pinned to seq.MaxGap16 (32768) for flows widened
 	// from 16-bit sequences, matching libRIST's
-	// `if (missing_count > 32768) return` (src/rist-common.c:555-557).
+	// `if (missing_count > 32768) return`.
 	// See ORCHESTRATION.md, 2026-06-12 WP3 binding.
 	if gap > seq.MaxGap16 {
 		return
 	}
-	// DEVIATION(librist rist-common.c:566-589): gap == 0 means a re-keyed
-	// packet for lastFound itself; libRIST's walk would loop until its
-	// queue-size guard and mark ~2^16 bogus entries. Return early instead.
+	// DEVIATION(librist): gap == 0 means a re-keyed packet for lastFound
+	// itself; libRIST's walk would loop until its queue-size guard and mark
+	// ~2^16 bogus entries. Return early instead.
 	if gap == 0 {
 		return
 	}
 
-	// Interpolate per-packet time between the anchors, assuming CBR
-	// (src/rist-common.c:544-559). When the anchor slot is gone libRIST
-	// substitutes the current wall clock; `now` is this core's equivalent.
+	// Interpolate per-packet time between the anchors, assuming CBR.
+	// When the anchor slot is gone libRIST substitutes the current wall
+	// clock; `now` is this core's equivalent.
 	packetTimeLast := now
 	if ls := &r.ring[r.lastFound&r.mask]; ls.state == slotFilled && ls.seq == r.lastFound {
 		packetTimeLast = ls.packetTime
@@ -324,23 +320,23 @@ func (f *Flow) markMissing(now clock.Timestamp, path uint8, current uint32, pack
 		count++
 		if count == uint64(len(r.ring)) {
 			// Safety bound, libRIST's `counter == receiver_queue_max`
-			// break (src/rist-common.c:582-583).
+			// break.
 			break
 		}
 	}
 }
 
-// addMissing appends one missing entry, following rist_receiver_missing
-// (src/flow.c:15-47): the insertion time is the interpolated nack time
-// clamped into [now-recoveryBuffer, now] — out-of-range values become now,
-// exactly as the C does (src/flow.c:21-24).
+// addMissing appends one missing entry, following rist_receiver_missing:
+// the insertion time is the interpolated nack time clamped into
+// [now-recoveryBuffer, now] — out-of-range values become now, exactly as
+// the C does.
 //
 // The first NACK attempt is scheduled at insertionTime + smoothedRTT per
 // the WP3 constants binding.
-// DEVIATION(librist flow.c:27, rist-common.c:2125-2138): libRIST schedules
-// next_nack = now + rtt where rtt = max(clamp(smoothed)/2, reorder_buffer);
-// the binding fixes firstNack = insertionTime + smoothed instead (the two
-// agree on cold start whenever the clamp forces insertionTime to now and
+// DEVIATION(librist): libRIST schedules next_nack = now + rtt where
+// rtt = max(clamp(smoothed)/2, reorder_buffer); the binding fixes
+// firstNack = insertionTime + smoothed instead (the two agree on cold
+// start whenever the clamp forces insertionTime to now and
 // reorder_buffer <= rtt_min).
 func (f *Flow) addMissing(now clock.Timestamp, path uint8, missingSeq uint32, nackTime clock.Timestamp) {
 	r := &f.receiver
@@ -368,7 +364,7 @@ func (f *Flow) addMissing(now clock.Timestamp, path uint8, missingSeq uint32, na
 
 // scheduleNack arms the NACK cadence timer when missing entries are queued
 // and the timer is idle. The cadence is libRIST's RIST_MAX_JITTER = 5 ms
-// receiver-loop bound (src/rist-private.h:53-54).
+// receiver-loop bound.
 func (f *Flow) scheduleNack(now clock.Timestamp) {
 	r := &f.receiver
 	if r.missingCount == 0 || r.nackArmed {
@@ -379,16 +375,15 @@ func (f *Flow) scheduleNack(now clock.Timestamp) {
 }
 
 // processNacks walks the missing queue once, mirroring the
-// rist_receiver_nack_output loop (src/rist-common.c:1288-1410) and
-// rist_process_nack (src/rist-common.c:830-900):
+// rist_receiver_nack_output loop and rist_process_nack:
 //
 //   - slot filled with the entry's seq  -> recovered, remove
 //     (count Recovered only when at least one NACK went out);
 //   - slot filled with another seq      -> stale entry, remove;
-//   - nackCount >= MaxRetries           -> abandon (:843-853);
-//   - age > recoveryBuffer*1.1          -> abandon (:855-861);
+//   - nackCount >= MaxRetries           -> abandon;
+//   - age > recoveryBuffer*1.1          -> abandon;
 //   - now >= nextNack                   -> NACK it: nextNack = now +
-//     1.1*clamp(smoothed, RTTMin, RTTMax) (:863-881), nackCount++.
+//     1.1*clamp(smoothed, RTTMin, RTTMax), nackCount++.
 //
 // All sequences NACKed in one pass leave as a single NackRequest, like
 // libRIST's nacks.array group (send_nack_group).
@@ -410,7 +405,7 @@ func (f *Flow) processNacks(now clock.Timestamp) {
 			}
 			remove = true
 		case s.state == slotFilled:
-			// Slot reused by another sequence (src/rist-common.c:1334-1343).
+			// Slot reused by another sequence.
 			remove = true
 		case e.nackCount >= f.cfg.MaxRetries:
 			f.stats.Abandoned++
@@ -451,16 +446,14 @@ func (f *Flow) processNacks(now clock.Timestamp) {
 }
 
 // deliverDue performs time-driven in-order delivery at instant now,
-// following the output-thread loop (src/rist-common.c:962-1100): the slot
-// at the cursor is delivered once now >= outputTime; a hole is skipped only
-// when the next buffered packet is itself due, at which point the skipped
-// sequences are counted lost and the next delivery carries a discontinuity
-// flag.
+// following the output-thread loop: the slot at the cursor is delivered
+// once now >= outputTime; a hole is skipped only when the next buffered
+// packet is itself due, at which point the skipped sequences are counted
+// lost and the next delivery carries a discontinuity flag.
 //
-// DEVIATION(librist rist-common.c:993, 1017-1037): the pathological-delay
-// resets (forced output past 2*recoveryBuffer, flow reset on repeated late
-// output) are host-level recovery policies and are not replicated in the
-// deterministic core.
+// DEVIATION(librist): the pathological-delay resets (forced output past
+// 2*recoveryBuffer, flow reset on repeated late output) are host-level
+// recovery policies and are not replicated in the deterministic core.
 func (f *Flow) deliverDue(now clock.Timestamp) {
 	r := &f.receiver
 	if !r.started {

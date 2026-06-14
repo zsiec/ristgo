@@ -18,7 +18,7 @@
 // bit 7 selects 204- vs 188-byte TS packets and bits 6..0 are the null bitmap;
 // seq_ext carries the high 16 bits of a 32-bit extended sequence number (the
 // Sequence Number Extension, TR-06-2 §8.3; on the wire at
-// rist_rtp_hdr_ext.seq_ext, libRIST src/proto/rtp.h:136). libRIST populates and
+// rist_rtp_hdr_ext.seq_ext). libRIST populates and
 // reads seq_ext only on the Advanced path, never on Simple/Main, so a
 // Main-profile receiver widens the media sequence by 16-bit rollover instead.
 //
@@ -28,12 +28,12 @@
 // selector (T) in the flags byte (bit 0) and defining an E bit (bit 6,
 // "sequence extension in use") and a 3-bit Size field. libRIST instead encodes
 // the size selector in npd_bits bit 7 and emits only flags bit 7 (N), never
-// setting E, Size, or the spec's T bit (src/mpegts.c:18,23,33). This package
+// setting E, Size, or the spec's T bit. This package
 // follows libRIST for interop: NPDSize204 is npd_bits bit 7, the E and Size
 // fields are intentionally unmodeled (libRIST neither emits nor reads them),
 // and the null-bitmap ordering (MSB = first packet) matches both.
 //
-// The suppress/expand algorithm is ported from libRIST src/mpegts.c
+// The suppress/expand algorithm is ported from libRIST
 // (suppress_null_packets / expand_null_packets). This package is pure: it does
 // no I/O, reads no clock, and never panics on malformed input — short buffers,
 // non-multiple lengths, over-long payloads, and bad sync bytes return errors.
@@ -52,56 +52,52 @@ var (
 	ErrShortExt = errors.New("rist: npd: header extension too short")
 
 	// ErrBadIdentifier is returned by ParseExt when the extension profile
-	// identifier is not 0x5249, the RIST "RI" value (librist
-	// src/proto/rtp.h:132).
+	// identifier is not 0x5249, the RIST "RI" value.
 	ErrBadIdentifier = errors.New("rist: npd: header extension identifier is not 0x5249")
 
 	// ErrBadLength is returned by ParseExt when the extension length field
-	// is not 1, the only value RIST emits (librist src/proto/rtp.h:133).
+	// is not 1, the only value RIST emits.
 	ErrBadLength = errors.New("rist: npd: header extension length is not 1")
 
 	// ErrPayloadSize is returned by Suppress when the input is not a whole
-	// number of 188- or 204-byte TS packets (librist src/mpegts.c:13-18).
+	// number of 188- or 204-byte TS packets.
 	ErrPayloadSize = errors.New("rist: npd: payload is not a whole number of 188- or 204-byte TS packets")
 
 	// ErrTooManyPackets is returned by Suppress when the input holds more
-	// than 7 TS packets, the maximum the 7-bit npd bitmap can address
-	// (librist src/mpegts.c:21).
+	// than 7 TS packets, the maximum the 7-bit npd bitmap can address.
 	ErrTooManyPackets = errors.New("rist: npd: more than 7 TS packets")
 
 	// ErrSyncByte is returned by Suppress when a TS packet does not begin
-	// with the 0x47 sync byte (librist src/mpegts.c:28).
+	// with the 0x47 sync byte.
 	ErrSyncByte = errors.New("rist: npd: TS packet missing 0x47 sync byte")
 
 	// ErrTruncated is returned by Expand when the kept-packet input is too
-	// short to satisfy the non-null positions the bitmap describes
-	// (librist src/mpegts.c:82-83).
+	// short to satisfy the non-null positions the bitmap describes.
 	ErrTruncated = errors.New("rist: npd: input too short for npd bitmap")
 )
 
 const (
 	// Identifier is the RFC 3550 profile-specific extension identifier of
-	// the RIST NPD header extension: 0x5249, ASCII "RI" big-endian (librist
-	// src/proto/rtp.h:132, rist_rtp_hdr_ext.identifier).
+	// the RIST NPD header extension: 0x5249, ASCII "RI" big-endian
+	// (rist_rtp_hdr_ext.identifier).
 	Identifier = 0x5249
 
 	// Length is the extension length in 32-bit words, always 1: the four
-	// extension-payload bytes are flags + npd_bits + seq_ext (librist
-	// src/proto/rtp.h:133).
+	// extension-payload bytes are flags + npd_bits + seq_ext.
 	Length = 1
 
 	// ExtSize is the size in bytes of the encoded RIST RTP header
 	// extension: identifier(2) + length(2) + flags(1) + npd_bits(1) +
-	// seq_ext(2) (librist src/proto/rtp.h:131-137).
+	// seq_ext(2).
 	ExtSize = 8
 
 	// FlagNPD is the bit in the flags byte set when NPD is present
-	// (libRIST SET_BIT(header_ext->flags, 7); src/mpegts.c:23).
+	// (libRIST SET_BIT(header_ext->flags, 7)).
 	FlagNPD = 1 << 7
 
 	// NPDSize204 is the bit in the npd_bits byte set when the TS packets
 	// are 204 bytes rather than 188 (libRIST SET_BIT(header_ext->npd_bits,
-	// 7); src/mpegts.c:18, expand CHECK_BIT(npd_bits,7); src/mpegts.c:59).
+	// 7), expand CHECK_BIT(npd_bits,7)).
 	NPDSize204 = 1 << 7
 
 	// NullBitmapMask masks the low 7 bits of npd_bits: the null-position
@@ -109,41 +105,39 @@ const (
 	NullBitmapMask = 0x7F
 
 	// MaxPackets is the maximum number of TS packets a single NPD payload
-	// may hold, bounded by the 7-bit bitmap (librist src/mpegts.c:21,22).
+	// may hold, bounded by the 7-bit bitmap.
 	MaxPackets = 7
 
 	// SizeTS188 is the standard MPEG-TS packet size in bytes.
 	SizeTS188 = 188
 
 	// SizeTS204 is the MPEG-TS packet size in bytes with the 16-byte
-	// Reed-Solomon parity trailer (librist src/mpegts.c:15).
+	// Reed-Solomon parity trailer.
 	SizeTS204 = 204
 
 	// SyncByte is the MPEG-TS packet sync byte, the first byte of every TS
-	// packet (librist src/mpegts.c:28, src/mpegts.h header diagram).
+	// packet.
 	SyncByte = 0x47
 
 	// NullPID is the MPEG-TS null-packet PID, 0x1FFF, occupying the 13-bit
-	// PID field of the 16-bit flags1 word (librist src/mpegts.c:30,
-	// src/mpegts.h).
+	// PID field of the 16-bit flags1 word.
 	NullPID = 0x1FFF
 )
 
 // tsHeaderSize is the size in bytes of the MPEG-TS packet header libRIST
-// reconstructs for a null packet: syncbyte(1) + flags1(2) + flags2(1) (librist
-// struct mpegts_header, src/mpegts.h).
+// reconstructs for a null packet: syncbyte(1) + flags1(2) + flags2(1) (struct
+// mpegts_header).
 const tsHeaderSize = 4
 
 // flags2Bit4 is the bit libRIST sets in the fourth MPEG-TS header byte of a
-// reconstructed null packet: SET_BIT(hdr->flags2, 4) (librist
-// src/mpegts.c:90). flags2 holds TSC|AF|CC; bit 4 is the low bit of the
-// adaptation-field-control field, marking payload present.
+// reconstructed null packet: SET_BIT(hdr->flags2, 4). flags2 holds TSC|AF|CC;
+// bit 4 is the low bit of the adaptation-field-control field, marking payload
+// present.
 const flags2Bit4 = 1 << 4
 
-// Ext models the RIST RTP header extension (rist_rtp_hdr_ext, librist
-// src/proto/rtp.h:131-137). It carries the NPD presence flag, the TS packet
-// size selector, the 7-bit null bitmap, and the high 16 bits of the extended
-// sequence number.
+// Ext models the RIST RTP header extension (rist_rtp_hdr_ext). It carries the
+// NPD presence flag, the TS packet size selector, the 7-bit null bitmap, and
+// the high 16 bits of the extended sequence number.
 type Ext struct {
 	// NPD reports whether the NPD flag (flags bit 7) is set: the payload
 	// has had null packets removed and NullBitmap describes them.
@@ -160,7 +154,7 @@ type Ext struct {
 
 	// SeqExt is the high 16 bits of a 32-bit extended RTP sequence number (the
 	// Sequence Number Extension field, TR-06-2 §8.3; on the wire at
-	// rist_rtp_hdr_ext.seq_ext, librist src/proto/rtp.h:136). NOTE: libRIST
+	// rist_rtp_hdr_ext.seq_ext). NOTE: libRIST
 	// populates and consumes this only in the Advanced profile (its
 	// rist_adv_seq32 helper operates on the separate rist_adv_ext struct, not
 	// this RFC 3550 extension); on the Simple/Main path it is always 0 and the
@@ -169,7 +163,7 @@ type Ext struct {
 }
 
 // AppendTo appends the 8-byte wire encoding of the extension to dst and
-// returns the extended slice (librist src/proto/rtp.h:131-137). The byte order
+// returns the extended slice. The byte order
 // is: identifier(2, big-endian) + length(2, big-endian) + flags(1) +
 // npd_bits(1) + seq_ext(2, big-endian). NullBitmap is masked to 7 bits.
 func (e Ext) AppendTo(dst []byte) []byte {
@@ -226,8 +220,7 @@ func NPDBits(size204 bool, bitmap byte) byte {
 	return b
 }
 
-// packetSize reports the TS packet size encoded by npd_bits bit 7 (librist
-// src/mpegts.c:59).
+// packetSize reports the TS packet size encoded by npd_bits bit 7.
 func packetSize(npdBits byte) int {
 	if npdBits&NPDSize204 != 0 {
 		return SizeTS204
@@ -238,8 +231,7 @@ func packetSize(npdBits byte) int {
 // Suppress removes MPEG-TS null packets (PID 0x1FFF) from in, appending the
 // kept packets to dst, and returns the extended slice, the npd_bits byte to
 // place in an Ext (size flag in bit 7, null bitmap in bits 6..0), the number of
-// suppressed bytes, and an error. It ports libRIST suppress_null_packets
-// (src/mpegts.c:12-56).
+// suppressed bytes, and an error. It ports libRIST suppress_null_packets.
 //
 // in must be a whole number of TS packets, each 188 bytes — or 204 if the
 // length is not a multiple of 188 — and at most 7 packets; otherwise an error
@@ -262,8 +254,8 @@ func Suppress(dst, in []byte) (out []byte, npdBits byte, suppressed int, err err
 	}
 
 	// First pass: validate sync bytes and record the null bitmap. Match
-	// libRIST: a bad sync byte fails the whole payload (src/mpegts.c:28,
-	// the `fail` label clears the NPD flag).
+	// libRIST: a bad sync byte fails the whole payload (the `fail` label
+	// clears the NPD flag).
 	for i := 0; i < count; i++ {
 		off := i * size
 		if in[off] != SyncByte {
@@ -271,7 +263,7 @@ func Suppress(dst, in []byte) (out []byte, npdBits byte, suppressed int, err err
 		}
 		// flags1 is the 2 bytes after the sync byte; a null packet has
 		// PID 0x1FFF, and for a null packet the whole flags1 word reads
-		// 0x1FFF (librist src/mpegts.c:30).
+		// 0x1FFF.
 		if binary.BigEndian.Uint16(in[off+1:off+3]) == NullPID {
 			npdBits |= 1 << (6 - i)
 			suppressed++
@@ -284,8 +276,7 @@ func Suppress(dst, in []byte) (out []byte, npdBits byte, suppressed int, err err
 		return append(out0(dst), in...), npdBits, 0, nil
 	}
 
-	// Second pass: copy only the non-null packets (librist
-	// src/mpegts.c:44-50).
+	// Second pass: copy only the non-null packets.
 	out = out0(dst)
 	for i := 0; i < count; i++ {
 		if npdBits&(1<<(6-i)) == 0 {
@@ -302,12 +293,11 @@ func out0(dst []byte) []byte { return dst }
 
 // Expand reinserts MPEG-TS null packets into the kept-packet payload in,
 // appending the reconstructed full payload to dst, using npdBits (the size flag
-// and 7-bit null bitmap from the Ext). It ports libRIST expand_null_packets
-// (src/mpegts.c:58-97).
+// and 7-bit null bitmap from the Ext). It ports libRIST expand_null_packets.
 //
 // Each reconstructed null packet matches libRIST byte-for-byte: sync byte 0x47,
 // flags1 = 0x1FFF (big-endian), flags2 bit 4 set, and the remaining
-// packet_size-4 bytes filled with 0xFF (src/mpegts.c:88-92). packet_size is 204
+// packet_size-4 bytes filled with 0xFF. packet_size is 204
 // when npd_bits bit 7 is set, else 188. When the bitmap names no nulls, in is
 // copied through unchanged. An error is returned (never a panic) when in is too
 // short for the non-null positions or when the reconstructed packet count would
@@ -321,13 +311,13 @@ func Expand(dst, in []byte, npdBits byte) (out []byte, err error) {
 
 	if nullCount == 0 {
 		// No nulls to reinsert: pass the input through unchanged
-		// (librist returns 0; src/mpegts.c:65).
+		// (librist returns 0).
 		return append(out0(dst), in...), nil
 	}
 
 	// npd_bits only encodes 7 positions, so a reconstructed count over 7 means
 	// malformed/hostile input. libRIST no-ops here — returns 0, delivering the
-	// payload un-expanded (src/mpegts.c:69-71); ristgo instead rejects it
+	// payload un-expanded; ristgo instead rejects it
 	// defensively with the same sentinel Suppress uses for the over-7 case,
 	// rather than delivering a wrongly-expanded payload. A conformant sender
 	// never produces this (Suppress caps the count at MaxPackets).
@@ -340,15 +330,14 @@ func Expand(dst, in []byte, npdBits byte) (out []byte, err error) {
 	inOff := 0
 	for i := 0; i < total; i++ {
 		if bitmap&(1<<(6-i)) == 0 {
-			// A kept (non-null) packet: copy it from the input
-			// (librist src/mpegts.c:80-85).
+			// A kept (non-null) packet: copy it from the input.
 			if inOff+size > len(in) {
 				return dst, ErrTruncated
 			}
 			out = append(out, in[inOff:inOff+size]...)
 			inOff += size
 		} else {
-			// Reconstruct a null packet (librist src/mpegts.c:88-92).
+			// Reconstruct a null packet.
 			out = appendNullPacket(out, size)
 		}
 	}
@@ -356,7 +345,7 @@ func Expand(dst, in []byte, npdBits byte) (out []byte, err error) {
 }
 
 // appendNullPacket appends a single reconstructed null TS packet of size bytes
-// to dst, matching libRIST byte-for-byte (src/mpegts.c:88-92): 0x47 sync byte,
+// to dst, matching libRIST byte-for-byte: 0x47 sync byte,
 // flags1 = 0x1FFF big-endian, flags2 with bit 4 set, then 0xFF fill.
 func appendNullPacket(dst []byte, size int) []byte {
 	dst = append(dst, SyncByte)            // syncbyte
@@ -369,7 +358,7 @@ func appendNullPacket(dst []byte, size int) []byte {
 }
 
 // bitsSet counts the set bits in the low 7 bits of b (librist counts each
-// CHECK_BIT position individually; src/mpegts.c:67).
+// CHECK_BIT position individually).
 func bitsSet(b byte) int {
 	n := 0
 	for b &= NullBitmapMask; b != 0; b &= b - 1 {

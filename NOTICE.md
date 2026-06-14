@@ -69,10 +69,9 @@ compressor and decompressor, ported from the published LZ4 block-format
 specification and the algorithm of the reference implementation,
 [lz4/lz4](https://github.com/lz4/lz4) (Yann Collet's `lz4.c`/`lz4.h`). It is
 used by the RIST Advanced Profile for payload compression (Layer Payload
-Compression, LPC=1 = LZ4; libRIST `src/proto/adv.h:210`). libRIST vendors the
-same reference `contrib/lz4/lz4.c` and uses the raw block format via
-`LZ4_compress_default` (send, `src/udp.c`) and `LZ4_decompress_safe` with an
-external decompressed bound (receive, `src/rist-common.c:2855`); this port
+Compression, LPC=1 = LZ4). libRIST vendors the same reference LZ4 source and
+uses the raw block format via `LZ4_compress_default` (send) and
+`LZ4_decompress_safe` with an external decompressed bound (receive); this port
 mirrors that API shape — `Compress` emits a raw block and `Decompress` decodes
 one against a caller-supplied maximum-output bound. Notable points: no C code
 is copied (the implementation is idiomatic Go that allocates nothing on the

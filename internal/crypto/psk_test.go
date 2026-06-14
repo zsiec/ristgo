@@ -345,7 +345,7 @@ func TestDecryptZeroNonceRejected(t *testing.T) {
 }
 
 // TestNonceBBit asserts the odd/even passphrase marker: odd sets bit 7 of
-// nonce[0], even clears it (psk.c:262-264). We construct many keys and check
+// nonce[0], even clears it. We construct many keys and check
 // every generated nonce.
 func TestNonceBBit(t *testing.T) {
 	for _, odd := range []bool{false, true} {
@@ -367,7 +367,7 @@ func TestNonceBBit(t *testing.T) {
 }
 
 // TestKeyRotationThreshold asserts the nonce rotates after keyRotation
-// encrypted packets and not before (psk.c:306).
+// encrypted packets and not before.
 func TestKeyRotationThreshold(t *testing.T) {
 	const rotation = 4
 	k, err := NewKey([]byte("rotate"), KeySize128, rotation, false)

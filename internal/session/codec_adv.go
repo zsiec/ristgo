@@ -17,17 +17,16 @@ import (
 // wire.Feedback values and Advanced-profile datagrams, framing through
 // internal/adv (the byte-exact header + control-message codec), internal/crypto
 // (AES-CTR payload encryption), and internal/lpc (LZ4 payload compression). It
-// is byte-exact with libRIST v0.2.18-rc1 (src/udp.c advanced send path,
-// src/rist-common.c advanced receive path, src/adv_ctrl.c control plane).
+// is byte-exact with libRIST v0.2.18-rc1.
 //
 // # Single-port multiplex
 //
 // Advanced profile carries media AND control over one UDP port as plain RTP
-// (V=2, PT=127, 1 MHz clock) followed by the 4-byte profile-defined extension
-// (udp.c:82-156). There is no GRE framing. Media packets carry enc_type=DIRECT
+// (V=2, PT=127, 1 MHz clock) followed by the 4-byte profile-defined extension.
+// There is no GRE framing. Media packets carry enc_type=DIRECT
 // (5) on the even (protected) base SSRC; control messages carry enc_type=CONTROL
 // (4) on the odd (unprotected) base SSRC. The receive demux is the encapsulation
-// Type field, not a port (rist-common.c:2792-2912).
+// Type field, not a port.
 //
 // # Sequence numbers
 //
@@ -40,8 +39,8 @@ import (
 //
 // # Encryption and compression (order)
 //
-// On send the payload is compressed THEN encrypted (udp.c:118-150); on receive
-// it is decrypted THEN decompressed (rist-common.c:2808-2864). Encryption is
+// On send the payload is compressed THEN encrypted; on receive
+// it is decrypted THEN decompressed. Encryption is
 // AES-CTR over the PAYLOAD ONLY (not the header) — libRIST's mode-1 deviation
 // from the TR-06-3 after-IV scope — with the IV = the 32-bit sequence as the
 // big-endian counter MSBs followed by 12 zero bytes (crypto.BuildIV, identical
@@ -51,8 +50,8 @@ import (
 //
 // # Receive source-time
 //
-// libRIST discards the wire timestamp on receive and stamps arrival time
-// (rist-common.c:2875). ristgo instead reconstructs SourceTime from the 1 MHz
+// libRIST discards the wire timestamp on receive and stamps arrival time.
+// ristgo instead reconstructs SourceTime from the 1 MHz
 // RTP timestamp (one tick == one microsecond), widened by rollover counting like
 // the Simple/Main codecs, so a retransmit and its original reconstruct to the
 // same (Seq, SourceTime) pair — preserving the flow core's dedup invariant. This
@@ -61,20 +60,20 @@ import (
 
 // advClockShift converts between microseconds and the Advanced-profile RTP
 // timestamp. Although TR-06-3 specifies a 1 MHz clock, libRIST computes the
-// timestamp as (timestampNTP_u64() * 1e6) >> 16 with an NTP-64 (32.32) clock
-// (udp.c:94, adv_ctrl.c), so the field actually advances by 2^16 per microsecond
+// timestamp as (timestampNTP_u64() * 1e6) >> 16 with an NTP-64 (32.32) clock,
+// so the field actually advances by 2^16 per microsecond
 // — a 2^16 MHz effective rate, wrapping the 32-bit field every ~65 ms. ristgo
 // matches that convention byte-for-byte: timestamp = microseconds << 16 on
 // encode, microseconds = timestamp >> 16 on decode. Spacing (the only thing the
 // flow core uses the timestamp for) is preserved; libRIST itself discards the
-// received timestamp and stamps arrival time (rist-common.c:2875), so the exact
+// received timestamp and stamps arrival time, so the exact
 // value never needs to match across the wire — only ristgo's own encode/decode
 // must round-trip, which this does.
 const advClockShift = 16
 
 // maxAdvDecompressed bounds the output of an LZ4 decompression on the receive
 // path, mirroring libRIST's RIST_MAX_PACKET_SIZE decompress bound
-// (rist-common.c:2855) so a hostile compressed payload cannot force an
+// so a hostile compressed payload cannot force an
 // unbounded allocation. Legitimate media payloads are far smaller (LZ4 is
 // applied on send only when it shrinks the payload, so the decompressed size
 // never exceeds the original ~MTU-sized packet).
@@ -107,8 +106,8 @@ type advCodec struct {
 	ssrc uint32
 
 	// srcPort and dstPort are the reduced-overhead virtual ports encoded into
-	// the optional Flow ID field on the media send path (matching libRIST
-	// udp.c:104-109: outer = dst port, inner = src port). Zero on both disables
+	// the optional Flow ID field on the media send path (matching libRIST:
+	// outer = dst port, inner = src port). Zero on both disables
 	// the Flow ID.
 	srcPort uint16
 	dstPort uint16
@@ -166,7 +165,7 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 	payload := pkt.Payload
 	lpcMode := uint8(adv.LPCNone)
 
-	// Compress first (udp.c:118-129): LZ4 raw block, only when it shrinks the
+	// Compress first: LZ4 raw block, only when it shrinks the
 	// payload, no length prefix on the wire.
 	if c.compression && len(payload) > 0 {
 		comp, err := lpc.Compress(nil, payload)
@@ -192,7 +191,7 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 		params.FlowID = &fid
 	}
 
-	// Encrypt the (possibly compressed) payload (udp.c:131-150): AES-CTR mode 1,
+	// Encrypt the (possibly compressed) payload: AES-CTR mode 1,
 	// payload only, IV from the 32-bit sequence, nonce read AFTER Encrypt (the
 	// key may rotate on send). The psk_iv field carries the sequence big-endian.
 	if c.sendKey != nil {
@@ -213,7 +212,7 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 }
 
 // flowIDFromPorts builds the Advanced Flow ID from the reduced-overhead virtual
-// ports, matching libRIST (udp.c:104-109): the outer flow id is the destination
+// ports, matching libRIST: the outer flow id is the destination
 // port and the 12-bit inner flow id is the source port (the IFSID sub-field is
 // zero).
 func flowIDFromPorts(srcPort, dstPort uint16) adv.FlowID {
@@ -221,7 +220,7 @@ func flowIDFromPorts(srcPort, dstPort uint16) adv.FlowID {
 }
 
 // decodeAdv parses one Advanced-profile datagram, demultiplexing on the
-// encapsulation Type field (rist-common.c:2792-2912). A DIRECT packet returns
+// encapsulation Type field. A DIRECT packet returns
 // isMedia true with the reconstructed MediaPacket; a CONTROL packet returns
 // isMedia false with the decoded feedback list (empty for keepalive/flow-attr/
 // psk-nonce, which the host handles via peer liveness and per-packet nonce
@@ -261,7 +260,7 @@ func (c *advCodec) decodeParsed(p adv.Parsed) (isMedia bool, pkt wire.MediaPacke
 // decrypt (AES-CTR mode 1) then decompress (LZ4), then map the native 32-bit
 // sequence and the 1 MHz timestamp (widened by rollover counting) to the
 // normalized fields. A fragmented packet (not both F and L set) is rejected —
-// libRIST never fragments (F=L=1 always; udp.c:99-100), so reassembly is a
+// libRIST never fragments (F=L=1 always), so reassembly is a
 // documented non-goal at this stage. A retransmit reconstructs to the same
 // (Seq, SourceTime) as its original.
 func (c *advCodec) decodeMediaAdv(p adv.Parsed) (wire.MediaPacket, error) {
@@ -271,9 +270,9 @@ func (c *advCodec) decodeMediaAdv(p adv.Parsed) (wire.MediaPacket, error) {
 
 	data := p.Payload
 
-	// Decrypt (rist-common.c:2808-2835). Only AES-CTR (mode 1) is supported, the
+	// Decrypt. Only AES-CTR (mode 1) is supported, the
 	// sole encryption mode libRIST implements for Advanced; modes 2-5 are
-	// rejected exactly as libRIST rejects them (rist-common.c:2836-2843).
+	// rejected exactly as libRIST rejects them.
 	switch p.PSKMode {
 	case adv.PSKNone:
 		if c.recvKey != nil {
@@ -298,7 +297,7 @@ func (c *advCodec) decodeMediaAdv(p adv.Parsed) (wire.MediaPacket, error) {
 		return wire.MediaPacket{}, fmt.Errorf("rist: adv: unsupported PSK mode %d", p.PSKMode)
 	}
 
-	// Decompress (rist-common.c:2854-2864).
+	// Decompress.
 	switch p.LPCMode {
 	case adv.LPCNone:
 	case adv.LPCLZ4:
@@ -428,7 +427,7 @@ func (c *advCodec) ctrlSSRC() uint32 { return adv.SSRCUnprotected(c.ssrc) }
 
 // encodeFeedback encodes the drained feedback effects into complete
 // Advanced-profile control datagrams — one per message, since libRIST sends and
-// reads exactly one entry per control datagram (adv_ctrl.c). A NackRequest
+// reads exactly one entry per control datagram. A NackRequest
 // expands to one datagram per NACK entry (range or bitmask per the bitmask
 // flag); RTT echo requests/responses and keepalives map to one datagram each.
 // ts is the 1 MHz timestamp stamped into each control packet's RTP header
@@ -481,7 +480,7 @@ func (c *advCodec) encodeFeedback(fbs []wire.Feedback, bitmask bool, ts uint32) 
 
 // frameControl wraps a control payload (CI + Length sub-header + body) in a
 // Type=CONTROL Advanced-profile packet on the unprotected (odd) SSRC, appending
-// to dst. It mirrors libRIST's control framing (adv_ctrl.c:36-54): enc_type
+// to dst. It mirrors libRIST's control framing: enc_type
 // CONTROL, no encryption, no compression, F=L=E=1. The control sequence counter
 // advances once per call.
 func (c *advCodec) frameControl(dst, payload []byte, ts uint32) ([]byte, error) {

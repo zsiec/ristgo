@@ -9,8 +9,7 @@ import (
 
 // TestObserveVectors replays libRIST's exact integer arithmetic
 // step-by-step against hand-computed expectations. Every line of the
-// expected columns below was derived by hand from the C statements
-// (src/rist-common.c:374, 2208-2209, 863):
+// expected columns below was derived by hand from the C statements:
 //
 //	init:    etr = rttMin * 8
 //	observe: etr = etr - etr/8 + sample   (each division truncating)
@@ -53,8 +52,7 @@ import (
 //	step 3: etr = 612500 - 76562  + 0 = 535938; smoothed = 66992 (66992.25)
 //
 // Vector "negative-sample-pinned" (rttMin = 1000, etr0 = 8000; a negative
-// sample is pinned to 0 — the calculate_rtt_delay guard,
-// src/proto/rist_time.c:96-103):
+// sample is pinned to 0 — the calculate_rtt_delay guard):
 //
 //	step 1, sample -5: treated as 0: etr = 8000 - 1000 + 0 = 7000
 //	                   smoothed = 7000/8 = 875
@@ -214,7 +212,7 @@ func estimatorWithSmoothed(v clock.Microseconds) Estimator {
 
 // TestClamped covers the boundary behavior of the [rttMin, rttMax] clamp,
 // including libRIST's exact else-if semantics for degenerate (min > max)
-// bounds (src/rist-common.c:863-868).
+// bounds.
 func TestClamped(t *testing.T) {
 	const min, max = 5000, 500000 // libRIST defaults, in microseconds
 	tests := []struct {
@@ -272,7 +270,7 @@ func TestLastSample(t *testing.T) {
 }
 
 // TestLastClamped exercises the sender retransmit-gate value (libRIST
-// peer->last_rtt clamped, src/udp.c:1254-1262): the same clamp branch as
+// peer->last_rtt clamped): the same clamp branch as
 // Clamped, applied to the raw last sample rather than the EWMA.
 func TestLastClamped(t *testing.T) {
 	const min, max = 5000, 500000
@@ -318,8 +316,8 @@ func TestLastVsSmoothedDiverge(t *testing.T) {
 }
 
 // TestRetryInterval verifies the 1.1x retry spacing against hand-computed
-// truncations of the C expression (uint64_t)(rtt * 1.1)
-// (src/rist-common.c:880). Expected values are floor(rtt * 11/10):
+// truncations of the C expression (uint64_t)(rtt * 1.1).
+// Expected values are floor(rtt * 11/10):
 //
 //	clamped 5000   -> 5500    (cold start at the 5ms default: 1.1 * rttMin)
 //	clamped 100000 -> 110000

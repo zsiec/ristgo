@@ -10,20 +10,17 @@
 // semantics included):
 //
 //   - init:    eight_times_rtt = recovery_rtt_min * 8
-//     (src/rist-common.c:374, init_peer_settings)
+//     (init_peer_settings)
 //   - observe: eight_times_rtt -= eight_times_rtt / 8;
 //     eight_times_rtt += sample
-//     (src/rist-common.c:2208-2209; same update at 2260-2261 and
-//     2320-2321)
 //   - read:    rtt = eight_times_rtt / 8, then clamp to
 //     [recovery_rtt_min, recovery_rtt_max]
-//     (src/rist-common.c:863-868, rist_process_nack; also 2126-2132)
+//     (rist_process_nack)
 //   - retry:   next_nack = now + (uint64_t)(rtt * 1.1)
-//     (src/rist-common.c:880)
 //
 // libRIST stores eight_times_rtt as a uint64_t of NTP ticks
-// (src/rist-private.h:585, RIST_CLOCK ticks per millisecond,
-// src/proto/rist_time.h:9); this package uses clock.Microseconds instead.
+// (RIST_CLOCK ticks per millisecond); this package uses clock.Microseconds
+// instead.
 // The estimator arithmetic is unit-agnostic — only truncating division by
 // 8 and the 1.1 multiply touch the values — so results correspond exactly
 // modulo the unit choice. Values stay non-negative by construction, so Go's
@@ -49,11 +46,11 @@ import "github.com/zsiec/ristgo/internal/clock"
 // The zero value behaves like New(0): smoothed RTT 0 and no sample yet, both
 // of which the clamped readers pin to rttMin — the same cold-start reading
 // libRIST gets before the first echo response. Proper construction is
-// New(rttMin), matching libRIST's init_peer_settings (src/rist-common.c:374).
+// New(rttMin), matching libRIST's init_peer_settings.
 type Estimator struct {
-	// eightTimesRTT is libRIST's peer->eight_times_rtt
-	// (src/rist-private.h:585): eight times the smoothed RTT, kept
-	// premultiplied so the 1/8-weight EWMA needs only integer ops.
+	// eightTimesRTT is libRIST's peer->eight_times_rtt: eight times the
+	// smoothed RTT, kept premultiplied so the 1/8-weight EWMA needs only
+	// integer ops.
 	eightTimesRTT clock.Microseconds
 
 	// lastSample is libRIST's peer->last_rtt: the most recent RTT sample,
@@ -65,7 +62,7 @@ type Estimator struct {
 
 // New returns an Estimator seeded for cold start:
 // eight_times_rtt = rttMin * 8, so the first Smoothed() reading is exactly
-// rttMin (src/rist-common.c:374, init_peer_settings).
+// rttMin (init_peer_settings).
 //
 // A negative rttMin is pinned to 0. libRIST cannot express one
 // (recovery_rtt_min is unsigned), and Config validation rejects it before
@@ -78,8 +75,7 @@ func New(rttMin clock.Microseconds) Estimator {
 }
 
 // Observe folds one RTT sample into the EWMA and returns the updated
-// estimator. The arithmetic is exactly libRIST's
-// (src/rist-common.c:2208-2209):
+// estimator. The arithmetic is exactly libRIST's:
 //
 //	eight_times_rtt -= eight_times_rtt / 8;   // truncating division
 //	eight_times_rtt += sample;
@@ -88,8 +84,8 @@ func New(rttMin clock.Microseconds) Estimator {
 //
 // A negative sample is pinned to 0. libRIST cannot produce one: its
 // samples are unsigned, and calculate_rtt_delay returns 0 whenever the
-// echo timestamps would go negative (src/proto/rist_time.c:96-103).
-// Pinning applies the same guard at this boundary.
+// echo timestamps would go negative. Pinning applies the same guard at this
+// boundary.
 func (e Estimator) Observe(sample clock.Microseconds) Estimator {
 	if sample < 0 {
 		sample = 0
@@ -102,13 +98,12 @@ func (e Estimator) Observe(sample clock.Microseconds) Estimator {
 
 // Smoothed returns the current smoothed RTT estimate,
 // eight_times_rtt / 8 with truncating division, exactly as libRIST reads
-// it (src/rist-common.c:863 and 2126).
+// it.
 func (e Estimator) Smoothed() clock.Microseconds {
 	return e.eightTimesRTT / 8
 }
 
-// clamp applies libRIST's exact RTT-clamp branch structure
-// (src/rist-common.c:863-868 and src/udp.c:1255-1258):
+// clamp applies libRIST's exact RTT-clamp branch structure:
 //
 //	if (rtt < rtt_min)      rtt = rtt_min;
 //	else if (rtt > rtt_max) rtt = rtt_max;
@@ -127,7 +122,7 @@ func clamp(rtt, rttMin, rttMax clock.Microseconds) clock.Microseconds {
 }
 
 // Clamped returns Smoothed() clamped to [rttMin, rttMax]. This is the value
-// libRIST's receiver uses for the NACK retry interval (src/rist-common.c:863).
+// libRIST's receiver uses for the NACK retry interval.
 func (e Estimator) Clamped(rttMin, rttMax clock.Microseconds) clock.Microseconds {
 	return clamp(e.Smoothed(), rttMin, rttMax)
 }
@@ -138,16 +133,16 @@ func (e Estimator) Last() clock.Microseconds { return e.lastSample }
 
 // LastClamped returns the most recent raw sample clamped to [rttMin, rttMax].
 // This is the value libRIST's sender uses for the per-packet retransmit gate
-// (src/udp.c:1254-1262, peer->last_rtt clamped): deliberately the freshest
-// sample, not the EWMA, so the gate tracks the current round-trip time. Before
-// the first echo response lastSample is 0, which clamps up to rttMin, matching
-// libRIST's cold-start gate.
+// (peer->last_rtt clamped): deliberately the freshest sample, not the EWMA, so
+// the gate tracks the current round-trip time. Before the first echo response
+// lastSample is 0, which clamps up to rttMin, matching libRIST's cold-start
+// gate.
 func (e Estimator) LastClamped(rttMin, rttMax clock.Microseconds) clock.Microseconds {
 	return clamp(e.lastSample, rttMin, rttMax)
 }
 
 // RetryInterval returns the NACK retry spacing: 1.1 times Clamped(rttMin,
-// rttMax), computed exactly as libRIST does (src/rist-common.c:880):
+// rttMax), computed exactly as libRIST does:
 //
 //	b->next_nack = now + (uint64_t)(rtt * 1.1);
 //

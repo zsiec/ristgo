@@ -12,8 +12,8 @@ import (
 // ParseURL parses a rist:// URL into a dial/listen address ("host:port") and a
 // Config. Query parameters override the corresponding cfg fields, so callers
 // typically pass DefaultConfig() as the base. The accepted parameter names
-// match libRIST's (include/librist/urlparam.h, src/rist-common.c
-// parse_url_options) so the same URL works against ffmpeg/libRIST:
+// match libRIST's (parse_url_options) so the same URL works against
+// ffmpeg/libRIST:
 //
 //	buffer, buffer-min, buffer-max, rtt, rtt-min, rtt-max, reorder-buffer,
 //	session-timeout, keepalive-interval   (all milliseconds)

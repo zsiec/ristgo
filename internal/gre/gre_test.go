@@ -9,7 +9,7 @@ import (
 
 // goldenHeaders carries hand-derived wire bytes for every GRE base-header
 // variant. Each vector cites the libRIST source that fixes the layout; the
-// bytes were written out by hand from gre.c, not produced by the encoder.
+// bytes were written out by hand, not produced by the encoder.
 var goldenHeaders = []struct {
 	name string
 	hdr  Header
@@ -17,18 +17,17 @@ var goldenHeaders = []struct {
 }{
 	{
 		// Unencrypted, seq-only, version 1 (the WP6b default). flags1 has
-		// only S (bit 4) -> 0x10; flags2 = (1 & 0x7) << 3 -> 0x08
-		// (gre.c:48,60). prot_type written directly at version 1
-		// (gre.c:85-86): REDUCED 0x88B6. seq big-endian (gre.c:63-66).
+		// only S (bit 4) -> 0x10; flags2 = (1 & 0x7) << 3 -> 0x08.
+		// prot_type written directly at version 1: REDUCED 0x88B6. seq
+		// big-endian.
 		name: "unencrypted-seq-v1-reduced",
 		hdr:  Header{Version: 1, HasSeq: true, ProtType: ProtoReduced, Seq: 0x01020304},
 		want: []byte{0x10, 0x08, 0x88, 0xB6, 0x01, 0x02, 0x03, 0x04},
 	},
 	{
 		// Encrypted, key+seq, 128-bit (H=0), version 1. flags1 has K (bit 5)
-		// and S (bit 4) -> 0x30 (gre.c:60,133); flags2 = 0x08, H clear
-		// since key is 128-bit (gre.c:52-55). nonce at offset 4
-		// (gre.c:47,135), seq immediately after (gre.c:61-67).
+		// and S (bit 4) -> 0x30; flags2 = 0x08, H clear since key is
+		// 128-bit. nonce at offset 4, seq immediately after.
 		name: "encrypted-key-seq-h0-v1",
 		hdr: Header{
 			Version: 1, HasKey: true, HasSeq: true,
@@ -39,7 +38,7 @@ var goldenHeaders = []struct {
 	},
 	{
 		// Encrypted, key+seq, 256-bit (H=1), version 1. flags2 = 0x08 |
-		// (1<<6) = 0x48 (gre.c:54: H set when gre_version && key_size==256).
+		// (1<<6) = 0x48 (H set when gre_version && key_size==256).
 		name: "encrypted-key-seq-h1-v1",
 		hdr: Header{
 			Version: 1, HasKey: true, HasSeq: true, KeySize256: true,
@@ -50,10 +49,9 @@ var goldenHeaders = []struct {
 	},
 	{
 		// Version 2 VSF wrapper, unencrypted seq-only. flags1 = 0x10;
-		// flags2 = (2 & 0x7) << 3 = 0x10 (gre.c:48); prot_type = VSF 0xCCE0
-		// (gre.c:84). The VSFProto bytes (type/subtype) are appended
-		// separately by VSFProto.AppendTo, so the base header alone is 8
-		// bytes here.
+		// flags2 = (2 & 0x7) << 3 = 0x10; prot_type = VSF 0xCCE0. The
+		// VSFProto bytes (type/subtype) are appended separately by
+		// VSFProto.AppendTo, so the base header alone is 8 bytes here.
 		name: "vsf-base-v2-seq",
 		hdr:  Header{Version: 2, HasSeq: true, ProtType: ProtoVSF, Seq: 0x01020304},
 		want: []byte{0x10, 0x10, 0xCC, 0xE0, 0x01, 0x02, 0x03, 0x04},
@@ -123,8 +121,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 }
 
 // TestReducedGolden freezes the reduced-overhead header bytes for the default
-// virtual ports: src=1971 (0x07B3), dst=1968 (0x07B0), src first on the wire
-// (gre.c:90-93; parse rist-common.c:3071-3072).
+// virtual ports: src=1971 (0x07B3), dst=1968 (0x07B0), src first on the wire.
 func TestReducedGolden(t *testing.T) {
 	r := ReducedHeader{SrcPort: DefaultVirtSrcPort, DstPort: DefaultVirtDstPort}
 	want := []byte{0x07, 0xB3, 0x07, 0xB0}
@@ -146,7 +143,7 @@ func TestReducedGolden(t *testing.T) {
 
 // TestVSFProtoGolden freezes the VSF wrapper bytes for each subtype. type is
 // always 0x0000 (RIST); REDUCED subtype 0x0000, KEEPALIVE 0x8000,
-// BUFFER_NEGOTIATION 0x8002 (gre.c:74-82, big-endian).
+// BUFFER_NEGOTIATION 0x8002 (big-endian).
 func TestVSFProtoGolden(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -179,8 +176,7 @@ func TestVSFProtoGolden(t *testing.T) {
 }
 
 // TestKeepaliveGolden freezes the standard libRIST keep-alive body: MAC, then
-// cap1 with bits 0,2,5 (N|E|B = 0x25) and cap2 with bit 5 (V = 0x20)
-// (gre.c:231-236).
+// cap1 with bits 0,2,5 (N|E|B = 0x25) and cap2 with bit 5 (V = 0x20).
 func TestKeepaliveGolden(t *testing.T) {
 	mac := [6]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
 	k := Keepalive{MAC: mac, Caps: StandardCapabilities()}
@@ -209,7 +205,7 @@ func TestKeepaliveGolden(t *testing.T) {
 }
 
 // TestKeepaliveAdvExtAndJSON exercises the optional Advanced extended block
-// (I bit = 0x80, gre.c:242) followed by a JSON payload, and round-trips it.
+// (I bit = 0x80) followed by a JSON payload, and round-trips it.
 func TestKeepaliveAdvExtAndJSON(t *testing.T) {
 	json := []byte(`{"cname":"ristgo"}`)
 	k := Keepalive{
@@ -246,7 +242,7 @@ func TestParseReservedBitRejection(t *testing.T) {
 		name  string
 		flags [2]byte
 	}{
-		// flags1 bit 6 reserved must be zero (rist-common.c:2927).
+		// flags1 bit 6 reserved must be zero.
 		{"flags1-bit6", [2]byte{1 << 6, 0x08}},
 		// flags2 low three bits must be zero: GRE version bit 0...
 		{"flags2-bit0", [2]byte{0x10, 0x08 | 0x01}},

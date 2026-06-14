@@ -73,9 +73,8 @@ func FuzzExpand(f *testing.F) {
 		}
 		if npdBits&NullBitmapMask == 0 {
 			// No nulls named: Expand is a pure pass-through (it mirrors
-			// libRIST returning 0 without inspecting the payload;
-			// src/mpegts.c:64-65), so the output equals the input
-			// verbatim and need not be TS-aligned.
+			// libRIST returning 0 without inspecting the payload), so the
+			// output equals the input verbatim and need not be TS-aligned.
 			if !bytes.Equal(out, data) {
 				t.Fatalf("no-null Expand altered input: % x", out)
 			}

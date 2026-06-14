@@ -8,7 +8,7 @@ import (
 )
 
 // goldenPackets carries hand-derived wire bytes for full Advanced Profile
-// packets. The bytes were written out by hand from adv.c, not produced by the
+// packets. The bytes were written out by hand, not produced by the
 // encoder, so they pin the framing independent of the round-trip tests.
 var goldenPackets = []struct {
 	name    string
@@ -17,12 +17,12 @@ var goldenPackets = []struct {
 	want    []byte
 }{
 	{
-		// Basic DIRECT, no PSK (mirrors test_adv_roundtrip.c
+		// Basic DIRECT, no PSK (mirrors
 		// test_basic_roundtrip). seq=0x12345678 -> rtp seq 0x5678, seq_ext
-		// 0x1234 (adv.h:300-307). ts=1000000=0x000F4240. ssrc=0xAABBCC00
-		// (even = protected). flags = F|L = 0xC0 (adv.c:191-192). params:
-		// PSK=0, LPC=0, Type=DIRECT(5) -> 0x05 (adv.h:113-145). RTP first
-		// byte 0x80, PT 0x7F=127 (adv.c:178-179).
+		// 0x1234. ts=1000000=0x000F4240. ssrc=0xAABBCC00
+		// (even = protected). flags = F|L = 0xC0. params:
+		// PSK=0, LPC=0, Type=DIRECT(5) -> 0x05. RTP first
+		// byte 0x80, PT 0x7F=127.
 		name: "basic-direct-no-psk",
 		params: Params{
 			Seq:       0x12345678,
@@ -45,11 +45,11 @@ var goldenPackets = []struct {
 		}, append([]byte("Hello RIST Advanced Profile!"), 0)...),
 	},
 	{
-		// AES-CTR PSK (mode 1): nonce + IV, no hash (adv.h:187-204).
+		// AES-CTR PSK (mode 1): nonce + IV, no hash.
 		// seq=1 -> rtp seq 0x0001, seq_ext 0x0000. ssrc=0x10 (even). flags
-		// = F|L|PSK2; PSK mode 1 has bit2=0 so PSK2 stays clear -> 0xC0
-		// (adv.h:113-117). params: PSK[1:0]=01<<6=0x40 | Type=DIRECT(5) ->
-		// 0x45. Then nonce (4B) + IV (4B) per adv.c:218-227. payload 0x42.
+		// = F|L|PSK2; PSK mode 1 has bit2=0 so PSK2 stays clear -> 0xC0.
+		// params: PSK[1:0]=01<<6=0x40 | Type=DIRECT(5) ->
+		// 0x45. Then nonce (4B) + IV (4B). payload 0x42.
 		name: "psk-aes-ctr-nonce-iv",
 		params: Params{
 			Seq:       0x00000001,
@@ -95,7 +95,7 @@ func TestGoldenBytes(t *testing.T) {
 	}
 }
 
-// TestBasicRoundTrip mirrors test_adv_roundtrip.c test_basic_roundtrip.
+// TestBasicRoundTrip mirrors test_basic_roundtrip.
 func TestBasicRoundTrip(t *testing.T) {
 	payload := append([]byte("Hello RIST Advanced Profile!"), 0)
 	params := Params{
@@ -153,7 +153,7 @@ func TestBasicRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFlagsRoundTrip mirrors test_adv_roundtrip.c test_flags_roundtrip
+// TestFlagsRoundTrip mirrors test_flags_roundtrip
 // (E+R flags, Control type, 32-bit seq wrap).
 func TestFlagsRoundTrip(t *testing.T) {
 	params := Params{
@@ -188,7 +188,7 @@ func TestFlagsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFlowIDRoundTrip mirrors test_adv_roundtrip.c test_flow_id_roundtrip:
+// TestFlowIDRoundTrip mirrors test_flow_id_roundtrip:
 // outer 0x1234, inner 0xABC, sub 0x5.
 func TestFlowIDRoundTrip(t *testing.T) {
 	params := Params{
@@ -222,7 +222,7 @@ func TestFlowIDRoundTrip(t *testing.T) {
 	}
 }
 
-// TestPFDRoundTrip mirrors test_adv_roundtrip.c test_pfd_roundtrip:
+// TestPFDRoundTrip mirrors test_pfd_roundtrip:
 // id_type=1, id_value=0x0ABCDEF.
 func TestPFDRoundTrip(t *testing.T) {
 	params := Params{
@@ -253,7 +253,7 @@ func TestPFDRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAllPSKModes mirrors test_adv_roundtrip.c test_all_psk_modes: builds and
+// TestAllPSKModes mirrors test_all_psk_modes: builds and
 // parses each of the eight PSK modes, asserting hash/nonce/iv presence and
 // byte content per the mode's Table-1 layout.
 func TestAllPSKModes(t *testing.T) {
@@ -319,7 +319,7 @@ func TestAllPSKModes(t *testing.T) {
 	}
 }
 
-// TestSeq32Wraparound mirrors test_adv_roundtrip.c test_seq32_wraparound.
+// TestSeq32Wraparound mirrors test_seq32_wraparound.
 func TestSeq32Wraparound(t *testing.T) {
 	seqs := []uint32{0, 1, 0xFFFF, 0x10000, 0xFFFFFFFE, 0xFFFFFFFF}
 	for _, seq := range seqs {
@@ -344,7 +344,7 @@ func TestSeq32Wraparound(t *testing.T) {
 	}
 }
 
-// TestType8RoundTrip mirrors test_adv_roundtrip.c test_type8_roundtrip: a
+// TestType8RoundTrip mirrors test_type8_roundtrip: a
 // GRE-Main (Type=8) payload carried verbatim.
 func TestType8RoundTrip(t *testing.T) {
 	gre := []byte{0x00, 0x00, 0x08, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE}
@@ -441,7 +441,7 @@ func TestLPCRoundTrip(t *testing.T) {
 }
 
 // TestHdrExtRoundTrip exercises the RIST Header Extension (H flag): an RFC
-// 3550-style extension carried verbatim (adv.c:160-167).
+// 3550-style extension carried verbatim.
 func TestHdrExtRoundTrip(t *testing.T) {
 	// 4-byte extension header (profile 0x5249, length 1 word) + 4-byte body.
 	ext := []byte{0x52, 0x49, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD}
@@ -472,9 +472,9 @@ func TestHdrExtRoundTrip(t *testing.T) {
 	}
 }
 
-// TestControlPayload mirrors test_adv_roundtrip.c test_flow_attr_control_
-// roundtrip: a Type-Control packet carrying a CI+Len+body control message in
-// its payload (the codec treats the control body as opaque payload).
+// TestControlPayload mirrors test_flow_attr_control_roundtrip: a Type-Control
+// packet carrying a CI+Len+body control message in its payload (the codec
+// treats the control body as opaque payload).
 func TestControlPayload(t *testing.T) {
 	json := []byte(`{"session":"test","flow_id":5000}`)
 	ctrl := make([]byte, 0, 4+len(json))
@@ -521,7 +521,7 @@ func TestControlPayload(t *testing.T) {
 	}
 }
 
-// TestSSRCParity mirrors test_adv_roundtrip.c test_ssrc_parity.
+// TestSSRCParity mirrors test_ssrc_parity.
 func TestSSRCParity(t *testing.T) {
 	cases := []struct {
 		ssrc      uint32
@@ -545,7 +545,7 @@ func TestSSRCParity(t *testing.T) {
 	}
 }
 
-// TestPSKHdrSizes mirrors test_adv_roundtrip.c test_psk_hdr_sizes.
+// TestPSKHdrSizes mirrors test_psk_hdr_sizes.
 func TestPSKHdrSizes(t *testing.T) {
 	want := map[uint8]int{0: 0, 1: 8, 2: 20, 3: 24, 4: 24, 5: 24, 6: 8, 7: 24}
 	for psk := uint8(0); psk <= 7; psk++ {
@@ -555,8 +555,7 @@ func TestPSKHdrSizes(t *testing.T) {
 	}
 }
 
-// TestPSKHelperTables freezes the per-mode hash/nonce/iv presence flags
-// (adv.h:182-204).
+// TestPSKHelperTables freezes the per-mode hash/nonce/iv presence flags.
 func TestPSKHelperTables(t *testing.T) {
 	cases := []struct {
 		psk             uint8
@@ -584,7 +583,7 @@ func TestPSKHelperTables(t *testing.T) {
 	}
 }
 
-// TestMalformedPackets mirrors test_adv_roundtrip.c test_malformed_packets.
+// TestMalformedPackets mirrors test_malformed_packets.
 func TestMalformedPackets(t *testing.T) {
 	if _, err := Parse(nil); !errors.Is(err, ErrShortBuffer) {
 		t.Errorf("nil buf: err = %v, want ErrShortBuffer", err)
@@ -694,7 +693,7 @@ func paramsFromParsed(p Parsed) Params {
 	return params
 }
 
-// TestFragmentHelpers freezes the F/L predicate truth table (adv.h:316-336).
+// TestFragmentHelpers freezes the F/L predicate truth table.
 func TestFragmentHelpers(t *testing.T) {
 	cases := []struct {
 		flags                     uint8

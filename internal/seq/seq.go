@@ -18,9 +18,9 @@
 // When two values are exact antipodes (their circular distance is exactly
 // half the ring: 0x8000 for Num16, 0x80000000 for Num32), "ahead" and
 // "behind" are genuinely ambiguous. This package pins the ambiguity the same
-// way libRIST does (src/rist-common.c:536, receiver_mark_missing: a forward
-// gap is rejected as wraparound only when strictly greater than half the
-// space): a gap of exactly half is treated as forward in both directions.
+// way libRIST does (receiver_mark_missing: a forward gap is rejected as
+// wraparound only when strictly greater than half the space): a gap of
+// exactly half is treated as forward in both directions.
 // (libRIST applies that rule with a 16-bit mask and 32768 threshold for all
 // widths; this package's 32-bit half-space variant is a deliberate
 // generalization — see MaxGap32.) Consequently, for exact antipodes a and b:
@@ -59,7 +59,7 @@ const (
 
 // MaxGap16 is the largest forward gap, in packets, that may be interpreted as
 // loss for 16-bit sequence numbers. It encodes libRIST's wraparound guard in
-// receiver_mark_missing (src/rist-common.c:555-557):
+// receiver_mark_missing:
 //
 //	uint32_t missing_count = (current_seq - f->last_seq_found) & UINT16_MAX;
 //	if (missing_count > 32768)
@@ -74,14 +74,14 @@ const MaxGap16 uint64 = 1 << 15
 // strictly-greater-than-half-range rule to half the 32-bit space.
 //
 // This is a deliberate generalization that deviates from libRIST's literal
-// code: receiver_mark_missing (src/rist-common.c:555-557) masks the gap to 16
-// bits and compares it against 32768 unconditionally, even for 32-bit
-// (non-short_seq, i.e. Advanced) flows, so libRIST rejects any gap above
-// 32768 as wraparound regardless of sequence width. Callers that must match
-// libRIST's reference behavior — in particular internal/flow's
-// missing-packet detection on Simple/Main sequences widened from 16 bits —
-// must pin their loss threshold to MaxGap16, not MaxGap32. See the
-// 2026-06-12 entry in ORCHESTRATION.md's decisions log.
+// code: receiver_mark_missing masks the gap to 16 bits and compares it
+// against 32768 unconditionally, even for 32-bit (non-short_seq, i.e.
+// Advanced) flows, so libRIST rejects any gap above 32768 as wraparound
+// regardless of sequence width. Callers that must match libRIST's reference
+// behavior — in particular internal/flow's missing-packet detection on
+// Simple/Main sequences widened from 16 bits — must pin their loss threshold
+// to MaxGap16, not MaxGap32. See the 2026-06-12 entry in ORCHESTRATION.md's
+// decisions log.
 const MaxGap32 uint64 = 1 << 31
 
 // Num16 is a wrapping 16-bit RTP sequence number (Simple/Main profile media
@@ -183,11 +183,10 @@ func (a Num16) Compare(b Num16) int { return compare(uint16(a), uint16(b)) }
 // ForwardGap returns the raw forward gap (b - a) modulo 2^16 from a to b,
 // and whether that gap may be interpreted as forward progress (genuine loss)
 // rather than wraparound/reorder. It encodes libRIST's receiver_mark_missing
-// guard (src/rist-common.c:555-557): forward is true iff gap <= MaxGap16
-// (32768); strictly larger gaps mean b is a reordered or wrapped packet and
-// the intervening sequence numbers must NOT be marked missing. When forward
-// is true the number of missing packets between a and b is gap-1 (for
-// gap >= 1).
+// guard: forward is true iff gap <= MaxGap16 (32768); strictly larger gaps
+// mean b is a reordered or wrapped packet and the intervening sequence
+// numbers must NOT be marked missing. When forward is true the number of
+// missing packets between a and b is gap-1 (for gap >= 1).
 func (a Num16) ForwardGap(b Num16) (gap uint64, forward bool) {
 	return forwardGap(uint16(a), uint16(b))
 }
@@ -234,8 +233,8 @@ func (a Num32) Compare(b Num32) int { return compare(uint32(a), uint32(b)) }
 //
 // Scaling Num16.ForwardGap's half-range rule to 32 bits is a deliberate
 // generalization that deviates from libRIST's literal code:
-// receiver_mark_missing (src/rist-common.c:555-557) masks the gap to 16 bits
-// and compares it against 32768 unconditionally, even for 32-bit flows.
+// receiver_mark_missing masks the gap to 16 bits and compares it against
+// 32768 unconditionally, even for 32-bit flows.
 // Callers that must match libRIST's reference behavior on sequences widened
 // from 16 bits must cap the loss threshold at MaxGap16 themselves; see
 // MaxGap32.

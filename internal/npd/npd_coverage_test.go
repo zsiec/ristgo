@@ -100,7 +100,7 @@ func TestParseExtConsumesExactly(t *testing.T) {
 }
 
 // TestSuppressBadSyncMidStream confirms a bad sync byte on a later packet
-// fails the whole payload (libRIST `fail` clears NPD; src/mpegts.c:52-54).
+// fails the whole payload (libRIST `fail` clears NPD).
 func TestSuppressBadSyncMidStream(t *testing.T) {
 	orig := append(nullPacket(SizeTS188), tsPacket(SizeTS188, 0x100, 0x00)...)
 	orig[SizeTS188] = 0x00 // corrupt second packet's sync byte

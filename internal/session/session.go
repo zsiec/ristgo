@@ -179,10 +179,10 @@ type Session struct {
 
 	// advGRE is the Main-profile GRE control substrate used in Advanced mode.
 	// libRIST's Advanced profile begins with the Main-profile GRE handshake —
-	// it authenticates a peer ONLY via a GRE-framed RTCP SDES packet
-	// (rist-common.c:2455, the gate at :1932 that lets data flow) — and gates
-	// media transmission on that authentication (udp.c:960). So an Advanced
-	// session sends the same GRE RTCP (SR/RR + SDES) handshake the Main profile
+	// it authenticates a peer ONLY via a GRE-framed RTCP SDES packet (the gate
+	// that lets data flow) — and gates media transmission on that
+	// authentication. So an Advanced session sends the same GRE RTCP (SR/RR +
+	// SDES) handshake the Main profile
 	// does (which WP6 proved interoperates byte-exactly), advertises Advanced
 	// capability via the adv keepalive I-bit, and then carries media as adv
 	// Type=5 and NACK/RTT as adv Type=4. advGRE also decodes inbound raw-GRE
@@ -732,7 +732,7 @@ func (s *Session) writeFeedback(b []byte) error {
 // advCtrlTS is the Advanced RTP timestamp stamped into an outbound control
 // packet's header, encoded at the same effective 2^16 MHz rate as media
 // (microseconds << advClockShift) so both paths and libRIST agree on the field's
-// units. It is informational — the peer ignores it (adv_ctrl.c does not read the
+// units. It is informational — the peer ignores it (libRIST does not read the
 // control timestamp).
 func advCtrlTS(now clock.Timestamp) uint32 { return uint32(uint64(int64(now)) << advClockShift) }
 
@@ -780,9 +780,8 @@ func (s *Session) sendAdvKeepalive(now clock.Timestamp) {
 // sendAdvGREHandshake sends the Main-profile GRE RTCP (SR/RR + SDES) datagram
 // that authenticates this peer to libRIST's Advanced receiver/sender — the
 // handshake libRIST requires before it accepts data or ungates media
-// transmission (rist-common.c:1932/2455, udp.c:960). It reuses the same GRE+RTCP
-// encoding WP6 proved interoperable; advGRE encrypts it under the PSK when one
-// is configured.
+// transmission. It reuses the same GRE+RTCP encoding WP6 proved interoperable;
+// advGRE encrypts it under the PSK when one is configured.
 func (s *Session) sendAdvGREHandshake(now clock.Timestamp) {
 	if s.peer.RTCP == nil {
 		return
@@ -893,7 +892,7 @@ func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 }
 
 // sendEAP frames an EAP frame as a GRE EAPOL datagram and sends it to the peer
-// over the single Main socket. EAPOL is never encrypted (gre.c:25).
+// over the single Main socket. EAPOL is never encrypted.
 func (s *Session) sendEAP(f eap.Frame, now clock.Timestamp) {
 	if s.main == nil || s.peer.Media == nil {
 		return

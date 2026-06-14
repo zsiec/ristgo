@@ -7,8 +7,8 @@
 //
 //   - The header extension is carried as opaque bytes only. RIST NPD (the
 //     Simple/Main-profile null-packet-deletion extension, TR-06-2) uses
-//     profile 0x5249 ("RI", librist src/proto/rtp.h:131-138); its semantics
-//     are decoded by a later package (internal/npd), never here.
+//     profile 0x5249 ("RI"); its semantics are decoded by a later package
+//     (internal/npd), never here.
 //   - Retransmissions are NOT RFC 4588: a RIST retransmission is the
 //     original RTP packet — same sequence number, same timestamp, same
 //     payload — with only the SSRC least-significant bit set. See
@@ -93,20 +93,17 @@ const (
 	MaxCSRC = 15
 
 	// ExtensionProfileRIST is the "defined by profile" value of the RIST
-	// NPD header extension: 0x5249, ASCII "RI" (librist
-	// src/proto/rtp.h:132, rist_rtp_hdr_ext.identifier; TR-06-2). This
-	// package only carries the extension bytes; NPD semantics live in a
-	// separate package.
+	// NPD header extension: 0x5249, ASCII "RI"
+	// (rist_rtp_hdr_ext.identifier; TR-06-2). This package only carries
+	// the extension bytes; NPD semantics live in a separate package.
 	ExtensionProfileRIST = 0x5249
 
 	// PayloadTypeMPEGTS is the RTP payload type RIST uses for MPEG
-	// transport stream media: 33 (librist src/proto/rtp.h:118,
-	// RTP_PTYPE_MPEGTS).
+	// transport stream media: 33 (RTP_PTYPE_MPEGTS).
 	PayloadTypeMPEGTS = 0x21
 
 	// ClockRateMPEGTS is the RTP timestamp clock rate, in Hz, of the
-	// MPEG-TS payload type (librist src/proto/rtp.h:119,
-	// RTP_PTYPE_MPEGTS_CLOCKHZ).
+	// MPEG-TS payload type (RTP_PTYPE_MPEGTS_CLOCKHZ).
 	ClockRateMPEGTS = 90000
 )
 
@@ -138,8 +135,8 @@ const (
 )
 
 // Header is a parsed RTP packet header (RFC 3550 §5.1). librist's
-// rist_rtp_hdr (src/proto/rtp.h:123-129) is the same fixed 12 bytes with the
-// first two octets collapsed into flags/payload_type.
+// rist_rtp_hdr is the same fixed 12 bytes with the first two octets
+// collapsed into flags/payload_type.
 type Header struct {
 	// Version is the 2-bit V field; always 2 on a valid RIST wire.
 	// Unmarshal does not reject other values (matching pion and librist,
@@ -160,8 +157,8 @@ type Header struct {
 	// hand need not maintain it.
 	CSRCCount uint8
 
-	// Marker is the M bit. RIST MPEG-TS media never sets it (librist
-	// src/proto/rtp.h:106, RTP_MPEGTS_FLAGS 0x80 = version 2 only).
+	// Marker is the M bit. RIST MPEG-TS media never sets it
+	// (RTP_MPEGTS_FLAGS 0x80 = version 2 only).
 	Marker bool
 
 	// PayloadType is the 7-bit PT field. RIST media uses

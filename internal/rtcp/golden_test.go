@@ -17,8 +17,8 @@ var goldenVectors = []struct {
 }{
 	{
 		// TR-06-1 §5.2.2: V=2,P=0,RC=0 -> 0x80; PT=200 (0xC8); length=6.
-		// libRIST rist_rtcp_write_sr (src/proto/rtp.c:42-66) emits the same
-		// header (RTCP_SR_FLAGS=0x80, rtp.h:107) then NTP msw/lsw, RTP ts,
+		// libRIST rist_rtcp_write_sr emits the same
+		// header (RTCP_SR_FLAGS=0x80) then NTP msw/lsw, RTP ts,
 		// packet count, octet count, all big-endian.
 		name: "SenderReport",
 		pkt: SenderReport{
@@ -40,8 +40,7 @@ var goldenVectors = []struct {
 	},
 	{
 		// TR-06-1 §5.2.3: V=2,P=0,RC=0 -> 0x80; PT=201 (0xC9); length=1;
-		// header + SSRC only. libRIST rist_rtcp_write_empty_rr
-		// (src/proto/rtp.c:9-19).
+		// header + SSRC only. libRIST rist_rtcp_write_empty_rr.
 		name: "EmptyReceiverReport",
 		pkt:  EmptyReceiverReport{SSRC: 0xDEADBEEF},
 		want: []byte{
@@ -50,9 +49,8 @@ var goldenVectors = []struct {
 		},
 	},
 	{
-		// TR-06-1 §5.2.4: V=2,P=0,RC=1 -> 0x81 (RTCP_RR_FULL_FLAGS,
-		// libRIST rtp.h:108); PT=201; length=7; one report block
-		// (struct rist_rtcp_rr_pkt, rtp.h:193-203).
+		// TR-06-1 §5.2.4: V=2,P=0,RC=1 -> 0x81 (RTCP_RR_FULL_FLAGS);
+		// PT=201; length=7; one report block (struct rist_rtcp_rr_pkt).
 		name: "ReceiverReport",
 		pkt: ReceiverReport{
 			SenderSSRC:     0x00000001,
@@ -76,11 +74,10 @@ var goldenVectors = []struct {
 		},
 	},
 	{
-		// TR-06-1 §5.2.5: V=2,P=0,SC=1 -> 0x81 (RTCP_SDES_FLAGS, libRIST
-		// rtp.h:109); PT=202 (0xCA); CNAME item type 1; 6-byte name
+		// TR-06-1 §5.2.5: V=2,P=0,SC=1 -> 0x81 (RTCP_SDES_FLAGS);
+		// PT=202 (0xCA); CNAME item type 1; 6-byte name
 		// "ristgo"; packet size ((10+6+1)+3)&~3 = 20 so length=4 and four
-		// zero terminator/pad bytes (libRIST rist_rtcp_write_sdes,
-		// src/proto/rtp.c:67-87).
+		// zero terminator/pad bytes (libRIST rist_rtcp_write_sdes).
 		name: "SDES",
 		pkt:  SDES{SSRC: 0x11223344, CNAME: "ristgo"},
 		want: []byte{
@@ -105,10 +102,10 @@ var goldenVectors = []struct {
 	},
 	{
 		// TR-06-1 §5.3.2.2: V=2,P=0,subtype=0 -> 0x80
-		// (RTCP_NACK_RANGE_FLAGS, libRIST rtp.h:110); PT=204 (0xCC);
+		// (RTCP_NACK_RANGE_FLAGS); PT=204 (0xCC);
 		// length=n+2 with n=2 records; media SSRC; name "RIST"
 		// (0x52495354); records {start,extra} big-endian (libRIST
-		// rist_receiver_send_nacks, src/udp.c:776-808). extra=4 requests
+		// rist_receiver_send_nacks). extra=4 requests
 		// 200..204 inclusive.
 		name: "RangeNACK",
 		pkt: RangeNACK{
@@ -125,9 +122,9 @@ var goldenVectors = []struct {
 	},
 	{
 		// TR-06-1 §5.3.2.1 / RFC 4585 §6.2.1: V=2,P=0,FMT=1 -> 0x81
-		// (RTCP_NACK_BITMASK_FLAGS, libRIST rtp.h:111); PT=205 (0xCD);
-		// length=n+2 with n=1 FCI; sender SSRC (libRIST transmits 0,
-		// src/udp.c:747) then media SSRC; FCI {PID,BLP}. BLP=0x0005 sets
+		// (RTCP_NACK_BITMASK_FLAGS); PT=205 (0xCD);
+		// length=n+2 with n=1 FCI; sender SSRC (libRIST transmits 0)
+		// then media SSRC; FCI {PID,BLP}. BLP=0x0005 sets
 		// bits 0 and 2: packets 1001 and 1003 lost in addition to PID 1000.
 		name: "BitmaskNACK",
 		pkt: BitmaskNACK{
@@ -143,10 +140,10 @@ var goldenVectors = []struct {
 		},
 	},
 	{
-		// TR-06-1 §5.2.6: subtype=2 -> flags 0x82 (RTCP_ECHOEXT_REQ_FLAGS,
-		// libRIST rtp.h:112); PT=204; length=5 (no padding); 64-bit
+		// TR-06-1 §5.2.6: subtype=2 -> flags 0x82 (RTCP_ECHOEXT_REQ_FLAGS);
+		// PT=204; length=5 (no padding); 64-bit
 		// timestamp; processing delay zero-filled in requests (libRIST
-		// rist_rtcp_write_echoreq, src/proto/rtp.c:88-101).
+		// rist_rtcp_write_echoreq).
 		name: "EchoRequest",
 		pkt:  EchoRequest{SSRC: 0x0000BEEF, Timestamp: 0xE3D15C00_80000000},
 		want: []byte{
@@ -177,9 +174,9 @@ var goldenVectors = []struct {
 		},
 	},
 	{
-		// TR-06-1 §5.2.6: subtype=3 -> flags 0x83 (RTCP_ECHOEXT_RESP_FLAGS,
-		// libRIST rtp.h:113); timestamp echoed verbatim; processing delay
-		// 1500us (libRIST rist_rtcp_write_echoresp, src/proto/rtp.c:103-117).
+		// TR-06-1 §5.2.6: subtype=3 -> flags 0x83 (RTCP_ECHOEXT_RESP_FLAGS);
+		// timestamp echoed verbatim; processing delay
+		// 1500us (libRIST rist_rtcp_write_echoresp).
 		name: "EchoResponse",
 		pkt: EchoResponse{
 			SSRC:            0x0000BEEF,
@@ -264,7 +261,7 @@ func TestGoldenAppendPreservesPrefix(t *testing.T) {
 }
 
 // TestGoldenCompound mirrors the libRIST receiver NACK compound assembly
-// (rist_receiver_send_nacks, src/udp.c:736-815): empty RR, SDES, then the
+// (rist_receiver_send_nacks): empty RR, SDES, then the
 // NACK — the TR-06-1 §5.2.1 receiver stack.
 func TestGoldenCompound(t *testing.T) {
 	pkts := []Packet{

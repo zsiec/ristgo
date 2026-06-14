@@ -11,10 +11,10 @@ const (
 
 // SenderReport is the RIST RTCP Sender Report (TR-06-1 §5.2.2): PT=200,
 // RC=0, length=6, with no reception report blocks. libRIST builds it in
-// rist_rtcp_write_sr (src/proto/rtp.c:42-66).
+// rist_rtcp_write_sr.
 type SenderReport struct {
 	// SSRC identifies the originator of the report (libRIST sends the
-	// flow ID, src/proto/rtp.c:50).
+	// flow ID).
 	SSRC uint32
 
 	// NTP is the sender wallclock at report generation in NTP-64 format:
@@ -72,8 +72,7 @@ func decodeSenderReport(h header, body []byte) (Packet, bool) {
 // EmptyReceiverReport is the empty RR of TR-06-1 §5.2.3: PT=201, RC=0,
 // length=1 — just the header and the reporter SSRC. RIST senders may use it
 // in place of an SR purely to keep NAT state alive, and libRIST leads every
-// receiver NACK compound with one (rist_rtcp_write_empty_rr,
-// src/proto/rtp.c:9-19; src/udp.c:736).
+// receiver NACK compound with one (rist_rtcp_write_empty_rr).
 type EmptyReceiverReport struct {
 	// SSRC identifies the originator of the report.
 	SSRC uint32
@@ -95,7 +94,7 @@ func (EmptyReceiverReport) isPacket() {}
 
 // ReceiverReport is the full RR of TR-06-1 §5.2.4: PT=201, RC=1, length=7,
 // with exactly one reception report block describing the RIST sender's
-// stream. libRIST builds it in rist_rtcp_write_rr (src/proto/rtp.c:21-40).
+// stream. libRIST builds it in rist_rtcp_write_rr.
 type ReceiverReport struct {
 	// SenderSSRC identifies the originator of this report (the RIST
 	// receiver).
@@ -122,11 +121,11 @@ type ReceiverReport struct {
 	Jitter uint32
 
 	// LSR is the middle 32 bits of the NTP timestamp of the last SR
-	// received (libRIST src/proto/rtp.c:36).
+	// received.
 	LSR uint32
 
 	// DLSR is the delay since that SR was received, in 1/65536-second
-	// units (libRIST src/proto/rtp.c:38-39).
+	// units.
 	DLSR uint32
 }
 

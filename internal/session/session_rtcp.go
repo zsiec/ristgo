@@ -52,9 +52,9 @@ func (s *Session) observeRx(now clock.Timestamp, pkt wire.MediaPacket) {
 
 // receiverReport builds a full RFC 3550 Receiver Report from the accumulated
 // reception statistics (libRIST sends a full RR, len=7, in periodic RTCP;
-// rist_rtcp_write_rr, src/proto/rtp.c:21-39). Cumulative loss is expected
-// minus the flow's accepted count; LSR/DLSR stay zero because ristgo measures
-// RTT via the echo mechanism, not the SR/RR loop.
+// rist_rtcp_write_rr). Cumulative loss is expected minus the flow's accepted
+// count; LSR/DLSR stay zero because ristgo measures RTT via the echo
+// mechanism, not the SR/RR loop.
 func (s *Session) receiverReport() rtcp.ReceiverReport {
 	r := &s.rx
 	received := s.flow.Stats().Received
@@ -86,11 +86,11 @@ func (s *Session) receiverReport() rtcp.ReceiverReport {
 
 // sendKeepalive emits one periodic RTCP compound — a Sender Report (sender) or
 // full Receiver Report (receiver) plus SDES and an RTT echo request — to the
-// peer's RTCP address. It matches libRIST's unconditional periodic RTCP
-// (src/udp.c:671-682, 822-833) and keeps the session alive while idle; the
-// echo request also lets RTT track even with no media in flight. The ticker
-// only calls it when the flow has not transmitted for a full interval, so it
-// does not double the flow's own echo cadence.
+// peer's RTCP address. It matches libRIST's unconditional periodic RTCP and
+// keeps the session alive while idle; the echo request also lets RTT track
+// even with no media in flight. The ticker only calls it when the flow has not
+// transmitted for a full interval, so it does not double the flow's own echo
+// cadence.
 func (s *Session) sendKeepalive(now clock.Timestamp) {
 	if s.bond != nil {
 		s.sendBondKeepalive(now)

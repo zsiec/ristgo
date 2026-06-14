@@ -3,12 +3,12 @@
 // INTEROP STATUS — READ THIS FIRST.
 //
 // libRIST v0.2.18-rc1 implements ONLY the Main-compatible AES-CTR mode for the
-// Advanced Profile (PSK mode 1, RIST_ADV_PSK_AES_CTR; adv.h:172). The three
+// Advanced Profile (PSK mode 1, RIST_ADV_PSK_AES_CTR). The three
 // authenticated modes added here —
 //
-//   - mode 3 RIST_ADV_PSK_AES_CTR_HMAC      (AES-CTR + HMAC-SHA256, adv.h:174)
-//   - mode 4 RIST_ADV_PSK_AES_GCM           (AES-GCM,               adv.h:175)
-//   - mode 5 RIST_ADV_PSK_CHACHA20_POLY1305 (ChaCha20-Poly1305,     adv.h:176)
+//   - mode 3 RIST_ADV_PSK_AES_CTR_HMAC      (AES-CTR + HMAC-SHA256)
+//   - mode 4 RIST_ADV_PSK_AES_GCM           (AES-GCM)
+//   - mode 5 RIST_ADV_PSK_CHACHA20_POLY1305 (ChaCha20-Poly1305)
 //
 // — have NO byte-exact reference: libRIST does not implement them, so there is
 // no captured-on-the-wire interop oracle to validate against. This file is a
@@ -111,21 +111,21 @@ var (
 
 // PSKMode identifies one of the RIST Advanced Profile PSK encryption modes.
 // The values mirror the 3-bit PSK field of the profile-defined header
-// (adv.h:170-177, RIST_ADV_PSK_*); only the authenticated modes handled by this
+// (RIST_ADV_PSK_*); only the authenticated modes handled by this
 // file are named here.
 type PSKMode uint8
 
 const (
-	// PSKModeAESCTRHMAC is RIST_ADV_PSK_AES_CTR_HMAC (adv.h:174): AES-CTR
+	// PSKModeAESCTRHMAC is RIST_ADV_PSK_AES_CTR_HMAC: AES-CTR
 	// encryption followed by HMAC-SHA256 authentication, the 32-byte HMAC
 	// truncated to the 16-byte Hash field.
 	PSKModeAESCTRHMAC PSKMode = 3
 
-	// PSKModeAESGCM is RIST_ADV_PSK_AES_GCM (adv.h:175): AES-GCM, the 16-byte
+	// PSKModeAESGCM is RIST_ADV_PSK_AES_GCM: AES-GCM, the 16-byte
 	// GCM tag carried in the Hash field (not appended to the wire ciphertext).
 	PSKModeAESGCM PSKMode = 4
 
-	// PSKModeChaCha20Poly1305 is RIST_ADV_PSK_CHACHA20_POLY1305 (adv.h:176):
+	// PSKModeChaCha20Poly1305 is RIST_ADV_PSK_CHACHA20_POLY1305:
 	// ChaCha20-Poly1305 with a 256-bit key, the 16-byte Poly1305 tag carried in
 	// the Hash field.
 	PSKModeChaCha20Poly1305 PSKMode = 5
@@ -133,7 +133,7 @@ const (
 
 const (
 	// HashSize is the length of the Advanced PSK Hash field in bytes
-	// (adv.h:RIST_ADV_PSK_HASH_SIZE = 16). It holds the GCM tag, the Poly1305
+	// (RIST_ADV_PSK_HASH_SIZE = 16). It holds the GCM tag, the Poly1305
 	// tag, or the truncated HMAC depending on the mode.
 	HashSize = 16
 

@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// TestServerUZeroAbort drives the u==0 safety abort on the server side
-// (srp.c:435-447). u = H(PAD(A)|PAD(B)) cannot be forced to zero through the
+// TestServerUZeroAbort drives the u==0 safety abort on the server side.
+// u = H(PAD(A)|PAD(B)) cannot be forced to zero through the
 // public API, so we white-box it: pin A and B so that the SHA-256 of their
 // padded concatenation, reduced mod N, lands on zero is infeasible — instead
 // we substitute a group whose modulus N divides every possible u, i.e. N == 1
@@ -51,8 +51,8 @@ func TestServerComputeBZeroAbort(t *testing.T) {
 
 // Note on the "wrong hashing" vectors in srp_examples.c: those reproduce
 // libRIST's correct_hashing_init=false path, an mbedtls-only artifact where the
-// SHA-256 streaming context is left uninitialised (srp.c:111-115); nettle
-// ignores the flag entirely (srp.c:157). That is a preserved build-specific bug,
+// SHA-256 streaming context is left uninitialised; nettle
+// ignores the flag entirely. That is a preserved build-specific bug,
 // distinct from the legacy_pad (srp-compat=1, unpadded k/u) mode this package
 // implements, and is intentionally not reproduced. The legacy_pad path has no
 // published byte KAT; it is covered by TestLegacyRoundTrip and TestModeMismatch.

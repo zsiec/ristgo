@@ -1,6 +1,6 @@
 // Package srp implements SRP-6a (Secure Remote Password) over SHA-256, the
-// RFC 5054 PAD-compliant variant, byte-exact with libRIST v0.2.18-rc1
-// (src/crypto/srp.c, src/crypto/srp_constants.c). It is the cryptographic
+// RFC 5054 PAD-compliant variant, byte-exact with libRIST v0.2.18-rc1.
+// It is the cryptographic
 // engine behind RIST Main-profile EAP-SRP authentication: the eap package
 // drives a Client (authenticatee) and Server (authenticator) through the
 // SRP-6a message exchange and derives the shared session key K.
@@ -9,29 +9,29 @@
 // on the wire, and PAD(x) = x left-zero-padded to len(N) bytes (256 for the
 // 2048-bit group):
 //
-//   - x  = H( salt | H( username | ":" | password ) )   (calc_x; srp.c:226-269)
-//   - k  = H( PAD(N) | PAD(g) )                          (srp.c:303-313, srp.c:485-495)
-//   - v  = g^x mod N                                     (the verifier; srp.c:712-714)
-//   - A  = g^a mod N                                     (client; srp.c:792-794)
-//   - B  = (k*v + g^b) mod N                             (server; srp.c:316-336)
-//   - u  = H( PAD(A) | PAD(B) )                          (srp.c:351-356, srp.c:466-481)
-//   - client S = (B - k*(g^x mod N)) ^ (a + u*x) mod N   (srp.c:497-540)
-//   - server S = (A * (v^u mod N)) ^ b mod N             (srp.c:360-380)
+//   - x  = H( salt | H( username | ":" | password ) )   (calc_x)
+//   - k  = H( PAD(N) | PAD(g) )
+//   - v  = g^x mod N                                     (the verifier)
+//   - A  = g^a mod N                                     (client)
+//   - B  = (k*v + g^b) mod N                             (server)
+//   - u  = H( PAD(A) | PAD(B) )
+//   - client S = (B - k*(g^x mod N)) ^ (a + u*x) mod N
+//   - server S = (A * (v^u mod N)) ^ b mod N
 //   - K  = H( S )   (S at its NATURAL minimal byte length, NOT PADded;
-//     hash_bignum, srp.c:382 / srp.c:542)
+//     hash_bignum)
 //   - M1 = H( (H(N) XOR H(g)) | H(I) | salt | A | B | K )
-//     (calculate_m, srp.c:107-185: N,g via hash_bignum and salt,A,B via
+//     (calculate_m: N,g via hash_bignum and salt,A,B via
 //     hash_update_bignum — all at MINIMAL length, NOT PADded; only k and
 //     u use PAD)
-//   - M2 = H( A | M1 | K )   (A minimal/unpadded; calculate_m2, srp.c:187-216)
+//   - M2 = H( A | M1 | K )   (A minimal/unpadded; calculate_m2)
 //
 // PAD scope is the one subtlety: libRIST's PAD-compliant mode (the 0.2.16+
 // default, hashversion=1) pads only the operands of k and u to len(N). In the
 // M1/M2 component hashes N, g, salt, A, B are written at their minimal
 // big-endian length, and K hashes S at its minimal length too. This package
-// matches that exactly; the libRIST KAT in srp_examples.c is reproduced
-// byte-for-byte by the tests. A legacy pre-0.2.16 unpadded k/u mode (srp.c's
-// legacy_pad / srp-compat=1) is exposed via NewClientLegacy / NewServerLegacy
+// matches that exactly; the libRIST KAT is reproduced
+// byte-for-byte by the tests. A legacy pre-0.2.16 unpadded k/u mode (the
+// legacy_pad / srp-compat=1 mode) is exposed via NewClientLegacy / NewServerLegacy
 // for interop with old peers, but the default and required path is
 // PAD-compliant.
 //
@@ -60,20 +60,20 @@ var (
 	ErrInvalidGroup = errors.New("rist: srp: invalid group")
 
 	// ErrInvalidSalt is returned by NewClient/NewServer when the salt is empty.
-	// libRIST bounds the salt at 1..64 bytes (srp.c:556); we accept any
+	// libRIST bounds the salt at 1..64 bytes; we accept any
 	// non-empty salt and never reject on the upper bound, since the salt is the
 	// caller's to choose.
 	ErrInvalidSalt = errors.New("rist: srp: empty salt")
 
 	// ErrInvalidVerifier is returned by NewServer when the verifier is empty or
-	// is congruent to zero modulo N (RFC 5054 rejects v == 0; srp.c:550-551).
+	// is congruent to zero modulo N (RFC 5054 rejects v == 0).
 	ErrInvalidVerifier = errors.New("rist: srp: invalid verifier")
 
 	// ErrBadParameter is returned by HandleA/ComputeKey when a peer-supplied
 	// public value is malformed (empty, longer than len(N), or congruent to
 	// zero modulo N), or when the derived scrambling parameter u is zero. These
-	// are the SRP-6a safety aborts (RFC 5054 §2.6; srp.c:565-575, srp.c:435-447,
-	// srp.c:586-621). They never panic on arbitrary input.
+	// are the SRP-6a safety aborts (RFC 5054 §2.6). They never panic on
+	// arbitrary input.
 	ErrBadParameter = errors.New("rist: srp: bad SRP parameter")
 
 	// ErrCSPRNG wraps a failure to read from the random source while generating
@@ -86,7 +86,7 @@ var (
 const hashLen = sha256.Size
 
 // Hash returns SHA-256 over the concatenation of parts. It is the SRP hash
-// (libRIST's librist_crypto_srp_hash, srp.c:218-224) and is exported because
+// (libRIST's librist_crypto_srp_hash) and is exported because
 // the EAP layer hashes the same way over message transcripts.
 func Hash(parts ...[]byte) [hashLen]byte {
 	h := sha256.New()
@@ -100,7 +100,7 @@ func Hash(parts ...[]byte) [hashLen]byte {
 
 // Group is an SRP-6a group: a safe-prime modulus N and a generator g. The
 // 2048-bit RFC 5054 Appendix A group returned by DefaultGroup is libRIST's
-// LIBRIST_SRP_NG_DEFAULT (srp_constants.c, the second table entry).
+// LIBRIST_SRP_NG_DEFAULT (the second table entry).
 type Group struct {
 	// N is the group modulus (a safe prime). len is the byte length of N, the
 	// PAD target for k and u and the size of an exported A or B.
@@ -112,7 +112,7 @@ type Group struct {
 }
 
 // defaultNHex is the 2048-bit RFC 5054 Appendix A modulus, libRIST's
-// NG_DEFAULT (srp_constants.c, second {n_hex,g_hex} entry). g = 2.
+// NG_DEFAULT (second {n_hex,g_hex} entry). g = 2.
 const defaultNHex = "AC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC3192943DB56050" +
 	"A37329CBB4A099ED8193E0757767A13DD52312AB4B03310DCD7F48A9DA04FD50" +
 	"E8083969EDB767B0CF6095179A163AB3661A05FBD5FAAAE82918A9962F0B93B8" +
@@ -166,22 +166,22 @@ func minimalBytes(x *big.Int) []byte {
 
 // hashPadded computes H(PAD(a) | PAD(b)) for the group's len(N), the
 // RFC 5054 PAD-compliant hash used for k = H(PAD(N)|PAD(g)) and
-// u = H(PAD(A)|PAD(B)) (srp.c:285-301, srp_hash_uk padded branch).
+// u = H(PAD(A)|PAD(B)) (srp_hash_uk padded branch).
 func (gr *Group) hashPadded(a, b *big.Int) [hashLen]byte {
 	return Hash(gr.pad(a), gr.pad(b))
 }
 
 // hashUnpadded computes H(min(a) | min(b)), the legacy pre-0.2.16 unpadded
-// k/u hash (srp.c:303-313, srp_hash_uk unpadded branch).
+// k/u hash (srp_hash_uk unpadded branch).
 func hashUnpadded(a, b *big.Int) [hashLen]byte {
 	return Hash(minimalBytes(a), minimalBytes(b))
 }
 
 // canonSalt strips leading zero bytes from the salt, matching libRIST, which
 // holds the salt as a BIGNUM and re-exports it at its minimal big-endian length
-// (BIGNUM_GET_BINARY_SIZE, srp.c:233) wherever it is hashed — in calc_x and in
+// (BIGNUM_GET_BINARY_SIZE) wherever it is hashed — in calc_x and in
 // calculate_m. The wire salt keeps its leading zeros (create_verifier preserves
-// the raw 32 bytes, srp.c:1033), but the HASHED form must not, or x/v/M1/K
+// the raw 32 bytes), but the HASHED form must not, or x/v/M1/K
 // diverge from a libRIST peer for any salt whose first byte is 0x00 (~1/256 of
 // random salts). An all-zero salt yields an empty slice, as the bignum export
 // does.
@@ -190,8 +190,8 @@ func canonSalt(salt []byte) []byte {
 }
 
 // calcX computes x = H( PAD-stripped salt | H( username | ":" | password ) ),
-// libRIST's librist_crypto_srp_calc_x (srp.c:220-260). The salt is hashed at
-// its MINIMAL big-endian length (srp.c:233, BIGNUM_GET_BINARY_SIZE), not its
+// libRIST's librist_crypto_srp_calc_x. The salt is hashed at
+// its MINIMAL big-endian length (BIGNUM_GET_BINARY_SIZE), not its
 // supplied wire length; the inner hash H("user:pass") is unpadded.
 func calcX(salt []byte, username, password string) *big.Int {
 	inner := Hash([]byte(username), []byte(":"), []byte(password))
@@ -224,14 +224,14 @@ func (gr *Group) uValue(a, b *big.Int, legacyPad bool) *big.Int {
 }
 
 // sessionKey computes K = H(S) with S exported at its natural minimal length,
-// matching libRIST's hash_bignum (srp.c:382 server, srp.c:542 client). S is
+// matching libRIST's hash_bignum (server and client). S is
 // already reduced mod N by the caller.
 func sessionKey(s *big.Int) [hashLen]byte {
 	return Hash(minimalBytes(s))
 }
 
 // calcM1 computes M1 = H( (H(N) XOR H(g)) | H(I) | salt | A | B | K ), libRIST's
-// librist_crypto_srp_calculate_m (srp.c:107-185). N, g, salt, A, B are all
+// librist_crypto_srp_calculate_m. N, g, salt, A, B are all
 // hashed at their MINIMAL big-endian length (hash_bignum / hash_update_bignum),
 // NOT PADded — only k and u use PAD in the PAD-compliant variant. The salt, like
 // libRIST's BIGNUM ctx->s, is canonicalized to minimal length (canonSalt).
@@ -247,7 +247,7 @@ func (gr *Group) calcM1(username string, salt []byte, a, b *big.Int, key [hashLe
 }
 
 // calcM2 computes M2 = H( A | M1 | K ), libRIST's
-// librist_crypto_srp_calculate_m2 (srp.c:187-216). A is hashed at its minimal
+// librist_crypto_srp_calculate_m2. A is hashed at its minimal
 // big-endian length.
 func calcM2(a *big.Int, m1, key [hashLen]byte) [hashLen]byte {
 	return Hash(minimalBytes(a), m1[:], key[:])
@@ -256,8 +256,8 @@ func calcM2(a *big.Int, m1, key [hashLen]byte) [hashLen]byte {
 // MakeVerifier returns the SRP-6a verifier v = g^x mod N for the given
 // credentials and salt, where x = H(salt | H(username | ":" | password)). The
 // result is the big-endian verifier at its natural minimal length, matching
-// libRIST's librist_crypto_srp_create_verifier (srp.c:660-740,
-// BIGNUM_WRITE_BYTES_ALLOC at the verifier's mpi_size). It uses the
+// libRIST's librist_crypto_srp_create_verifier
+// (BIGNUM_WRITE_BYTES_ALLOC at the verifier's mpi_size). It uses the
 // PAD-compliant ("correct hashing") path. A nil or invalid group yields nil.
 func MakeVerifier(g *Group, username, password string, salt []byte) []byte {
 	if !g.valid() || len(salt) == 0 {
@@ -269,8 +269,8 @@ func MakeVerifier(g *Group, username, password string, salt []byte) []byte {
 }
 
 // readSecret draws a per-handshake secret in [0, N) from src. libRIST uses
-// BIGNUM_RANDOM(num, &N) (an integer uniformly in [0, N); srp.c:786,
-// srp.c:321). We draw len(N) random bytes and reduce mod N, which is
+// BIGNUM_RANDOM(num, &N) (an integer uniformly in [0, N)). We draw len(N)
+// random bytes and reduce mod N, which is
 // indistinguishable in practice for a 2048-bit N and never produces a value
 // outside [0, N).
 func readSecret(src io.Reader, n *big.Int) (*big.Int, error) {
@@ -336,8 +336,8 @@ func newClient(g *Group, salt []byte, legacyPad bool, src io.Reader) (*Client, e
 // allocated.
 //
 // libRIST's librist_crypto_srp_client_write_A_bytes returns the MINIMAL
-// mpi_size(A) bytes (srp.c:745-752), and EAP transmits A at that minimal length
-// with an explicit length field (eap.c:274-281) — it does not pad to len(N).
+// mpi_size(A) bytes, and EAP transmits A at that minimal length
+// with an explicit length field — it does not pad to len(N).
 // ristgo deliberately pads instead, which is value-preserving and interop-safe:
 // the peer reconstructs the identical bignum via SetBytes regardless of leading
 // zeros, and u = H(PAD(A)|PAD(B)) re-pads both operands on each side.
@@ -347,7 +347,7 @@ func (c *Client) A() []byte {
 
 // ComputeKey processes the server public value B and derives x, u, the premaster
 // secret S, the session key K = H(S), and the client proof M1, following
-// librist_crypto_srp_client_handle_B (srp.c:553-643). It returns ErrBadParameter
+// librist_crypto_srp_client_handle_B. It returns ErrBadParameter
 // if B is empty, longer than len(N), congruent to zero mod N, or if the derived
 // u is zero (the SRP-6a safety aborts). The base (B - k*(g^x mod N)) is reduced
 // mod N before exponentiation, adding N if it is negative.
@@ -358,12 +358,12 @@ func (c *Client) ComputeKey(serverB []byte, username, password string) error {
 	}
 	bPub := new(big.Int).SetBytes(serverB)
 
-	// RFC 5054: client aborts if B mod N == 0 (srp.c:586-593).
+	// RFC 5054: client aborts if B mod N == 0.
 	if new(big.Int).Mod(bPub, gr.N).Sign() == 0 {
 		return ErrBadParameter
 	}
 
-	// u = H(PAD(A)|PAD(B)); abort if u mod N == 0 (srp.c:595-617).
+	// u = H(PAD(A)|PAD(B)); abort if u mod N == 0.
 	u := gr.uValue(c.pubA, bPub, c.legacyPad)
 	if new(big.Int).Mod(u, gr.N).Sign() == 0 {
 		return ErrBadParameter
@@ -372,21 +372,21 @@ func (c *Client) ComputeKey(serverB []byte, username, password string) error {
 	k := gr.kValue(c.legacyPad)
 	x := calcX(c.salt, username, password)
 
-	// gx = g^x mod N (this is v) (srp.c:626).
+	// gx = g^x mod N (this is v).
 	gx := new(big.Int).Exp(gr.G, x, gr.N)
 
 	// base = (B - k*gx) mod N, normalised to [0, N) — the subtraction can be
-	// negative before reduction (srp.c:629-635; Go's Mod already returns a
+	// negative before reduction (Go's Mod already returns a
 	// non-negative result for a positive modulus, matching the +N fixup).
 	kgx := new(big.Int).Mul(k, gx)
 	base := new(big.Int).Sub(bPub, kgx)
 	base.Mod(base, gr.N)
 
-	// exp = a + u*x (srp.c:637-642).
+	// exp = a + u*x.
 	ux := new(big.Int).Mul(u, x)
 	exp := new(big.Int).Add(c.a, ux)
 
-	// S = base^exp mod N (srp.c:644).
+	// S = base^exp mod N.
 	s := new(big.Int).Exp(base, exp, gr.N)
 
 	c.key = sessionKey(s)
@@ -448,7 +448,7 @@ type Server struct {
 // NewServer creates an SRP-6a server for the group, verifier, and salt, drawing
 // a random secret b from crypto/rand and computing B = (k*v + g^b) mod N,
 // following librist_crypto_srp_authenticator_handle_A's B computation (which
-// libRIST defers to handle_A but is deterministic given b; srp.c:289-336). It
+// libRIST defers to handle_A but is deterministic given b). It
 // returns an error for an invalid group, empty salt, empty or zero-mod-N
 // verifier, a CSPRNG failure, or if the computed B is congruent to zero mod N.
 func NewServer(g *Group, verifier, salt []byte) (*Server, error) {
@@ -472,7 +472,7 @@ func newServer(g *Group, verifier, salt []byte, legacyPad bool, src io.Reader) (
 		return nil, ErrInvalidVerifier
 	}
 	v := new(big.Int).SetBytes(verifier)
-	// RFC 5054: reject v == 0 (srp.c:550-551). We test v mod N == 0 so a
+	// RFC 5054: reject v == 0. We test v mod N == 0 so a
 	// verifier supplied as a multiple of N is also rejected.
 	if new(big.Int).Mod(v, g.N).Sign() == 0 {
 		return nil, ErrInvalidVerifier
@@ -494,8 +494,7 @@ func newServer(g *Group, verifier, salt []byte, legacyPad bool, src io.Reader) (
 	return s, nil
 }
 
-// computeB sets B = (k*v + g^b) mod N, rejecting B == 0 mod N
-// (srp.c:303-336).
+// computeB sets B = (k*v + g^b) mod N, rejecting B == 0 mod N.
 func (s *Server) computeB() error {
 	gr := s.group
 	k := gr.kValue(s.legacyPad)
@@ -513,8 +512,8 @@ func (s *Server) computeB() error {
 // PADded to len(N) bytes. The returned slice is freshly allocated.
 //
 // As with A, libRIST's write_B_bytes returns the MINIMAL mpi_size(B)
-// (srp.c:523-530) and EAP sends B at minimal length with an explicit length
-// field (eap.c:548-556), not padded to len(N); ristgo's deliberate PAD is
+// and EAP sends B at minimal length with an explicit length
+// field, not padded to len(N); ristgo's deliberate PAD is
 // value-preserving and interop-safe (the peer parses via SetBytes and
 // u = H(PAD(A)|PAD(B)) re-pads).
 func (s *Server) B() []byte {
@@ -522,7 +521,7 @@ func (s *Server) B() []byte {
 }
 
 // HandleA stores the client public value A and validates it, following
-// librist_crypto_srp_authenticator_handle_A's A handling (srp.c:565-580). It
+// librist_crypto_srp_authenticator_handle_A's A handling. It
 // returns ErrBadParameter if A is empty, longer than len(N), or congruent to
 // zero modulo N (the SRP-6a safety abort). It never panics on arbitrary input.
 func (s *Server) HandleA(clientA []byte) error {
@@ -531,7 +530,7 @@ func (s *Server) HandleA(clientA []byte) error {
 		return ErrBadParameter
 	}
 	a := new(big.Int).SetBytes(clientA)
-	// RFC 5054 / SRP-6a: abort if A mod N == 0 (srp.c:573-577).
+	// RFC 5054 / SRP-6a: abort if A mod N == 0.
 	if new(big.Int).Mod(a, gr.N).Sign() == 0 {
 		return ErrBadParameter
 	}
@@ -542,7 +541,7 @@ func (s *Server) HandleA(clientA []byte) error {
 // VerifyM1 derives u, the premaster secret S = (A * v^u)^b mod N, the session
 // key K = H(S), and the server-side M1, then compares M1 against the client's
 // proof in constant time; on a match it computes M2 and returns true. It
-// follows librist_crypto_srp_authenticator_verify_m1 (srp.c:427-518). It
+// follows librist_crypto_srp_authenticator_verify_m1. It
 // returns false if HandleA has not run, if m1 is not 32 bytes, if u is zero, or
 // if the proof does not match.
 func (s *Server) VerifyM1(username string, m1 []byte) bool {
@@ -551,13 +550,13 @@ func (s *Server) VerifyM1(username string, m1 []byte) bool {
 		return false
 	}
 
-	// u = H(PAD(A)|PAD(B)); abort if u mod N == 0 (srp.c:435-447).
+	// u = H(PAD(A)|PAD(B)); abort if u mod N == 0.
 	u := gr.uValue(s.pubA, s.pubB, s.legacyPad)
 	if new(big.Int).Mod(u, gr.N).Sign() == 0 {
 		return false
 	}
 
-	// S = (A * (v^u mod N))^b mod N (srp.c:449-461).
+	// S = (A * (v^u mod N))^b mod N.
 	vu := new(big.Int).Exp(s.v, u, gr.N)
 	avu := new(big.Int).Mul(s.pubA, vu)
 	sShared := new(big.Int).Exp(avu, s.b, gr.N)
@@ -565,7 +564,7 @@ func (s *Server) VerifyM1(username string, m1 []byte) bool {
 	s.key = sessionKey(sShared)
 	want := gr.calcM1(username, s.salt, s.pubA, s.pubB, s.key)
 
-	// Constant-time M1 comparison (srp.c:505-507).
+	// Constant-time M1 comparison.
 	if subtle.ConstantTimeCompare(want[:], m1) != 1 {
 		return false
 	}

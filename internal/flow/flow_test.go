@@ -99,7 +99,7 @@ func TestNewRingSizing(t *testing.T) {
 }
 
 func TestRecoveryBufferFormula(t *testing.T) {
-	// buffer_time = (max-min)/2 + min (librist rist-common.c:378-380).
+	// buffer_time = (max-min)/2 + min (librist).
 	tests := []struct {
 		name     string
 		min, max clock.Microseconds
@@ -157,7 +157,7 @@ func TestFirstPacketRetransmitIgnored(t *testing.T) {
 	f := New(RoleReceiver, testConfig())
 	pkt := mkPkt(100, 0, []byte("a"))
 	pkt.Retransmit = true
-	f.Feed(10_000, 0, pkt) // librist rist-common.c:636-637
+	f.Feed(10_000, 0, pkt) // librist
 	if f.receiver.started {
 		t.Fatal("flow must not start on a retransmit")
 	}
@@ -254,7 +254,7 @@ func TestMissingDetectInterpolationExact(t *testing.T) {
 
 	// Gap 101 -> 105: missing 102..104. packetTimeLast = pt(101) = 17000,
 	// delta = 45000-17000 = 28000, interpacket = 28000/(4+1) = 5600
-	// (librist rist-common.c:555-565: divisor is gap+1).
+	// (librist: divisor is gap+1).
 	f.Feed(45_000, 3, mkPkt(105, 35_000, nil))
 
 	type entry struct {
@@ -293,7 +293,7 @@ func TestMissingDetectInterpolationExact(t *testing.T) {
 
 func TestMissingInsertionTimeClamped(t *testing.T) {
 	// An interpolated nack time older than now-recoveryBuffer becomes now
-	// (librist flow.c:21-24 sets out-of-range values to now, both sides).
+	// (librist sets out-of-range values to now, both sides).
 	f := New(RoleReceiver, testConfig())
 	f.Feed(10_000, 0, mkPkt(100, 0, nil))
 	// Next in-order packet arrives 2s later (source stalled then jumped):
@@ -322,7 +322,7 @@ func TestMissingGapGuards(t *testing.T) {
 		// Gap of exactly MaxGap16 is still loss (gap-1 entries).
 		{"gap at MaxGap16 marks", 100, 100 + 32768, 32767},
 		// Strictly greater means wraparound/reorder: mark nothing
-		// (librist rist-common.c:555-557; ORCHESTRATION.md WP3 binding).
+		// (librist; ORCHESTRATION.md WP3 binding).
 		{"gap above MaxGap16 ignored", 100, 100 + 32769, 0},
 	}
 	for _, tt := range tests {
@@ -346,7 +346,7 @@ func TestMissingSkippedForRetransmitAndOutOfOrder(t *testing.T) {
 	}
 
 	// A retransmit filling a hole must not re-run detection or move
-	// lastFound (librist rist-common.c:804 `if (!retry)`).
+	// lastFound (librist `if (!retry)`).
 	rt := mkPkt(102, 14_000, nil)
 	rt.Retransmit = true
 	f.Feed(40_000, 0, rt)
@@ -397,7 +397,7 @@ func TestNackPassBatchAndRetryTiming(t *testing.T) {
 	}
 	for e := f.receiver.missingHead; e != nil; e = e.next {
 		// next_nack = now + (uint64)(rtt*1.1) = 50000 + 5500
-		// (librist rist-common.c:880).
+		// (librist).
 		if e.nextNack != 55_500 || e.nackCount != 1 {
 			t.Fatalf("entry %d nextNack/count = %d/%d, want 55500/1", e.seq, e.nextNack, e.nackCount)
 		}
@@ -440,7 +440,7 @@ func TestNackAbandonMaxRetries(t *testing.T) {
 		t.Fatalf("NacksSent = %d, want 2", got)
 	}
 	// Third pass: nackCount(2) >= MaxRetries(2) -> abandon
-	// (librist rist-common.c:843-853).
+	// (librist).
 	f.processNacks(50_000)
 	st := f.Stats()
 	if st.Abandoned != 1 || st.NacksSent != 2 || f.receiver.missingCount != 0 {
@@ -462,7 +462,7 @@ func TestNackAbandonAgeExact(t *testing.T) {
 		t.Fatalf("insertionTime = %d, want 14666", e.insertionTime)
 	}
 	// Abandon strictly after insertion + recoveryBuffer*1.1
-	// (librist rist-common.c:855: `>` comparison).
+	// (librist `>` comparison).
 	deadline := e.insertionTime.Add(1_100_000)
 	f.processNacks(deadline) // age == threshold: NOT abandoned (sends a nack)
 	if got := f.Stats().Abandoned; got != 0 {
@@ -482,7 +482,7 @@ func TestNackRecoveredRemoval(t *testing.T) {
 	drainOutputs(f)
 
 	// Recovered before any NACK went out: removed silently
-	// (librist rist-common.c:1305-1310: recovered only counts nack_count>0).
+	// (librist: recovered only counts nack_count>0).
 	f.Feed(25_000, 0, mkPkt(101, 7_000, nil))
 	f.processNacks(26_000)
 	st := f.Stats()
@@ -513,7 +513,7 @@ func TestTooLateDropOnFeed(t *testing.T) {
 
 	// packetTime 510000 < lastPacketTime, seq != successor, and
 	// now > packetTime + 1.1*recoveryBuffer (= 1610000) -> shed
-	// (librist rist-common.c:733-748).
+	// (librist).
 	f.Feed(2_011_000, 0, mkPkt(150, 500_000, nil))
 	st := f.Stats()
 	if st.TooLate != base.TooLate+1 || st.Received != base.Received {
@@ -658,7 +658,7 @@ func TestRttEchoTimerCadence(t *testing.T) {
 	f.Feed(10_000, 1, mkPkt(100, 0, nil))
 	drainOutputs(f)
 
-	// RIST_PING_INTERVAL = 100ms (librist rist-private.h:55).
+	// RIST_PING_INTERVAL = 100ms (librist).
 	f.HandleTimer(110_000, TimerRttEcho)
 	outs := drainOutputs(f)
 	want := []Output{

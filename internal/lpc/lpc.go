@@ -1,16 +1,15 @@
 // Package lpc implements the LZ4 block-format codec used by the RIST Advanced
 // Profile for payload compression (Layer Payload Compression, LPC=1 = LZ4;
-// libRIST src/proto/adv.h:210, RIST_ADV_LPC_LZ4).
+// RIST_ADV_LPC_LZ4).
 //
 // libRIST compresses and decompresses Advanced-Profile payloads with the raw
 // LZ4 *block* format (NOT the LZ4 frame format): the send path calls
-// LZ4_compress_default (src/udp.c) and the receive path calls
-// LZ4_decompress_safe with an external, known decompressed bound
-// (src/rist-common.c:2855, bound RIST_MAX_PACKET_SIZE). The block carries no
-// length header, no magic number, and no checksum — the decompressor relies on
-// the caller-supplied output bound to detect overruns. This package mirrors
-// that: Compress emits a raw LZ4 block and Decompress decodes one against a
-// maximum-output bound.
+// LZ4_compress_default and the receive path calls LZ4_decompress_safe with an
+// external, known decompressed bound (bound RIST_MAX_PACKET_SIZE). The block
+// carries no length header, no magic number, and no checksum — the decompressor
+// relies on the caller-supplied output bound to detect overruns. This package
+// mirrors that: Compress emits a raw LZ4 block and Decompress decodes one
+// against a maximum-output bound.
 //
 // # LZ4 block format
 //
@@ -64,7 +63,7 @@ var (
 	// ErrOutputTooLarge is returned by Decompress when the decoded output
 	// would exceed the caller-supplied maxOut bound. Because the LZ4 block
 	// format carries no decompressed length, the caller must supply the
-	// bound (libRIST uses RIST_MAX_PACKET_SIZE; src/rist-common.c:2857).
+	// bound (libRIST uses RIST_MAX_PACKET_SIZE).
 	ErrOutputTooLarge = errors.New("rist: lpc: decompressed output exceeds maximum")
 )
 
@@ -270,7 +269,7 @@ func appendLength(dst []byte, n int) []byte {
 // block would decode to more than maxOut bytes, Decompress returns
 // ErrOutputTooLarge. Because the LZ4 block format carries no length, the caller
 // supplies maxOut as the decompressed bound — mirroring libRIST, which passes
-// RIST_MAX_PACKET_SIZE to LZ4_decompress_safe (src/rist-common.c:2857).
+// RIST_MAX_PACKET_SIZE to LZ4_decompress_safe.
 //
 // Decompress never panics and never reads or writes out of bounds. Any
 // malformed block — a truncated length or literal run, an offset that points
@@ -370,7 +369,7 @@ func Decompress(dst, src []byte, maxOut int) ([]byte, error) {
 		// (handled by the sp==n break after the literals above). Reaching the
 		// end of the input immediately after a match means the block has no
 		// literals terminator — it is malformed, and libRIST's
-		// LZ4_decompress_safe rejects it (lz4.c: ip+length != iend). Without
+		// LZ4_decompress_safe rejects it (ip+length != iend). Without
 		// this check the loop would fall out cleanly and wrongly accept it.
 		if sp == n {
 			return dst[:outStart], ErrCorrupt

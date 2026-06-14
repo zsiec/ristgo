@@ -258,8 +258,7 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 }
 
 // randomEvenSSRC returns a random even 32-bit flow SSRC. The LSB is reserved
-// as the retransmit marker, so the base SSRC must be even (libRIST
-// src/rist.c:570).
+// as the retransmit marker, so the base SSRC must be even (libRIST).
 func randomEvenSSRC() uint32 { return rand.Uint32() &^ 1 }
 
 // randomStartSeq returns a random initial RTP sequence number (RFC 3550

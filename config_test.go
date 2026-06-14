@@ -8,7 +8,7 @@ import (
 )
 
 // TestDefaultConfig asserts every DefaultConfig field against hand-written
-// values taken from libRIST include/librist/peer.h. If any of these drift,
+// values taken from libRIST. If any of these drift,
 // interoperability with libRIST is at risk.
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
@@ -26,7 +26,7 @@ func TestDefaultConfig(t *testing.T) {
 		{"ReorderBuffer", cfg.ReorderBuffer, 15 * time.Millisecond},           // RIST_DEFAULT_RECOVERY_REORDER_BUFFER (15)
 		{"RTTMin", cfg.RTTMin, 5 * time.Millisecond},                          // RIST_DEFAULT_RECOVERY_RTT_MIN (5)
 		{"RTTMax", cfg.RTTMax, 500 * time.Millisecond},                        // RIST_DEFAULT_RECOVERY_RTT_MAX (500)
-		{"RTTMultiplier", cfg.RTTMultiplier, 7},                               // libRIST src/rist.c: recovery_rtt_multiplier = 7
+		{"RTTMultiplier", cfg.RTTMultiplier, 7},                               // libRIST recovery_rtt_multiplier = 7
 		{"MinRetries", cfg.MinRetries, 6},                                     // RIST_DEFAULT_MIN_RETRIES (6)
 		{"MaxRetries", cfg.MaxRetries, 20},                                    // RIST_DEFAULT_MAX_RETRIES (20)
 		{"SessionTimeout", cfg.SessionTimeout, 2000 * time.Millisecond},       // RIST_DEFAULT_SESSION_TIMEOUT (2000)
@@ -55,7 +55,7 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 // TestDefaultConstants pins the exported Default* constants to the
-// hand-written peer.h values, independently of DefaultConfig.
+// hand-written values, independently of DefaultConfig.
 func TestDefaultConstants(t *testing.T) {
 	tests := []struct {
 		name string

@@ -56,10 +56,9 @@ const (
 //     immediately followed by the NACK packet it extends (TR-06-2 §8.4
 //     compound stack: RR, CNAME, EXTSEQ, NACK[, EXTSEQ, NACK]). Raw
 //     packets (e.g. an XR block, as libRIST inserts in
-//     rist_receiver_periodic_rtcp, src/udp.c:678-679) are permitted in
-//     this zone.
+//     rist_receiver_periodic_rtcp) are permitted in this zone.
 //  4. Echo Request/Response packets, if any, come last (matching every
-//     libRIST compound assembly in src/udp.c:671-857).
+//     libRIST compound assembly).
 //
 // On a violation it returns buf unmodified together with an error wrapping
 // ErrCompoundOrder. It does not allocate when buf has spare capacity of at

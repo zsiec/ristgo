@@ -7,8 +7,7 @@ import (
 	"testing"
 )
 
-// TestSeqSplitJoin exercises SplitSeq/JoinSeq across the wrap boundaries
-// (adv.h:295-307).
+// TestSeqSplitJoin exercises SplitSeq/JoinSeq across the wrap boundaries.
 func TestSeqSplitJoin(t *testing.T) {
 	cases := []struct {
 		seq       uint32
@@ -35,7 +34,7 @@ func TestSeqSplitJoin(t *testing.T) {
 }
 
 // TestFlowIDWire verifies the exact 4-byte Flow ID wire packing mirrors
-// libRIST (test_adv_roundtrip.c test_flow_id_roundtrip: inner_hi=0xAB,
+// libRIST (test_flow_id_roundtrip: inner_hi=0xAB,
 // inner_lo_sub=0xC5 -> inner=0xABC, sub=0x5).
 func TestFlowIDWire(t *testing.T) {
 	f := FlowID{Outer: 0x1234, Inner: 0xABC, Sub: 0x5}
@@ -50,7 +49,7 @@ func TestFlowIDWire(t *testing.T) {
 	}
 }
 
-// TestFlowIDVirtPortMapping mirrors test_adv_roundtrip.c
+// TestFlowIDVirtPortMapping mirrors
 // test_flow_id_virt_port_mapping: the inner 12-bit field truncates source
 // ports above 0xFFF.
 func TestFlowIDVirtPortMapping(t *testing.T) {
@@ -92,7 +91,7 @@ func TestFlowIDInnerTruncation(t *testing.T) {
 }
 
 // TestPFDWire verifies the 4-bit type / 28-bit value packing
-// (test_adv_roundtrip.c test_pfd_roundtrip).
+// (test_pfd_roundtrip).
 func TestPFDWire(t *testing.T) {
 	p := PFD{IDType: 1, IDValue: 0x0ABCDEF}
 	wire := p.appendTo(nil)
@@ -116,7 +115,7 @@ func TestPFDWire(t *testing.T) {
 }
 
 // TestParseDynamicPayloadType verifies a dynamic RTP PT (>=96) is accepted and
-// a PT below 96 (other than 127) is rejected (adv.c:49-52).
+// a PT below 96 (other than 127) is rejected.
 func TestParseDynamicPayloadType(t *testing.T) {
 	params := Params{Seq: 1, EncType: TypeDirect, FirstFrag: true, LastFrag: true}
 	wire, err := Build(nil, params, []byte{0x01})
@@ -144,7 +143,7 @@ func TestParseDynamicPayloadType(t *testing.T) {
 }
 
 // TestParseRTPExtensionSkip verifies the parser skips an RFC 3550 RTP header
-// extension when X=1 (adv.c:67-75), reaching the profile-defined extension
+// extension when X=1, reaching the profile-defined extension
 // after it.
 func TestParseRTPExtensionSkip(t *testing.T) {
 	// Build a packet by hand: RTP with X=1, a 1-word RTP header extension,
@@ -216,7 +215,7 @@ func TestParseTruncationBoundaries(t *testing.T) {
 }
 
 // TestParseHdrExtTruncation verifies a RIST header extension whose announced
-// length runs past the buffer is rejected (adv.c:163-166).
+// length runs past the buffer is rejected.
 func TestParseHdrExtTruncation(t *testing.T) {
 	var b []byte
 	b = append(b, 0x80, PayloadType)
@@ -232,7 +231,7 @@ func TestParseHdrExtTruncation(t *testing.T) {
 }
 
 // TestParseRTPExtTruncation verifies an RTP header extension whose announced
-// length runs past the buffer is rejected (adv.c:71-74).
+// length runs past the buffer is rejected.
 func TestParseRTPExtTruncation(t *testing.T) {
 	var b []byte
 	b = append(b, 0x90, PayloadType) // X=1
@@ -349,8 +348,8 @@ func TestParseEmptyPayload(t *testing.T) {
 	}
 }
 
-// TestParseCSRCSkip verifies the parser skips a CSRC list when CC>0
-// (adv.c:62-64), even though RIST never emits one.
+// TestParseCSRCSkip verifies the parser skips a CSRC list when CC>0,
+// even though RIST never emits one.
 func TestParseCSRCSkip(t *testing.T) {
 	var b []byte
 	b = append(b, 0x82, PayloadType) // V=2, CC=2

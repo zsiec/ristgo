@@ -13,8 +13,8 @@ const extSeqSize = 16
 // follow it in the compound. NACK entries with different upper halves must
 // be split into separate NACK packets, each preceded by its own EXTSEQ.
 //
-// libRIST does not define this packet in src/proto/rtp.h; the layout here is
-// taken directly from TR-06-2 Figure 16 (fields in network byte order).
+// libRIST does not define this packet; the layout here is taken directly from
+// TR-06-2 Figure 16 (fields in network byte order).
 type ExtSeq struct {
 	// SSRC is the "SSRC of media source" the following retransmission
 	// request relates to, used exactly as in the NACK packets themselves.

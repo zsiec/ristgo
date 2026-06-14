@@ -20,7 +20,7 @@ func mustHex(t *testing.T, s string) []byte {
 }
 
 // TestControlGolden pins each control message's wire bytes against the layouts
-// verified directly from libRIST src/adv_ctrl.c. The sub-header is CI(2) +
+// verified directly from libRIST. The sub-header is CI(2) +
 // Length(2), big-endian, followed by the per-index body.
 func TestControlGolden(t *testing.T) {
 	tests := []struct {
@@ -29,37 +29,37 @@ func TestControlGolden(t *testing.T) {
 		want string
 	}{
 		{
-			// adv_ctrl.c:56-112: CI 0x0000, len 12, SSRC|PSS|BLP.
+			// CI 0x0000, len 12, SSRC|PSS|BLP.
 			name: "nack-bitmask",
 			got:  BuildNackBitmask(nil, NackBitmask{MediaSSRC: 0x11223344, PSS: 0x00000064, BLP: 0x00000005}),
 			want: "0000000c11223344000000640000 0005",
 		},
 		{
-			// adv_ctrl.c:114-166: CI 0x0001, len 12, SSRC|PSS|NALP.
+			// CI 0x0001, len 12, SSRC|PSS|NALP.
 			name: "nack-range",
 			got:  BuildNackRange(nil, NackRange{MediaSSRC: 0x11223344, PSS: 0x00010002, NALP: 5}),
 			want: "0001000c1122334400010002 00000005",
 		},
 		{
-			// adv_ctrl.c:168-227: CI 0x0010, len 16, ReqSSRC|MSW|LSW|ProcDelay.
+			// CI 0x0010, len 16, ReqSSRC|MSW|LSW|ProcDelay.
 			name: "rtt-echo-request",
 			got:  BuildRTTEchoRequest(nil, RTTEchoFromTimestamp(0xAABBCCDD, 0x1122334455667788, 0)),
 			want: "00100010aabbccdd1122334455667788 00000000",
 		},
 		{
-			// adv_ctrl.c:229-285: CI 0x0011, len 16, with processing delay.
+			// CI 0x0011, len 16, with processing delay.
 			name: "rtt-echo-response",
 			got:  BuildRTTEchoResponse(nil, RTTEchoFromTimestamp(0xAABBCCDD, 0x1122334455667788, 0x00000190)),
 			want: "00110010aabbccdd1122334455667788 00000190",
 		},
 		{
-			// adv_ctrl.c:287-349: CI 0x8000, len 10, MAC(6)|Caps(4); I bit set.
+			// CI 0x8000, len 10, MAC(6)|Caps(4); I bit set.
 			name: "keepalive",
 			got:  BuildKeepalive(nil, Keepalive{MAC: [6]byte{1, 2, 3, 4, 5, 6}, Caps: KeepaliveCapI}),
 			want: "8000000a01020304050680000000",
 		},
 		{
-			// adv_ctrl.c:455-503: CI 0x8011, len 8, Nonce(4)|KeyBits(2)|Rsvd(2).
+			// CI 0x8011, len 8, Nonce(4)|KeyBits(2)|Rsvd(2).
 			name: "psk-nonce",
 			got:  BuildPSKNonce(nil, PSKNonce{Nonce: [4]byte{0xAA, 0xBB, 0xCC, 0xDD}, KeyBits: 256}),
 			want: "80110008aabbccdd01000000",

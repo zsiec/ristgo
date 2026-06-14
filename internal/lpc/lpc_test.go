@@ -19,12 +19,12 @@ func mustHex(t *testing.T, s string) []byte {
 }
 
 // foreignKATs holds LZ4 blocks produced by an independent LZ4 implementation —
-// libRIST's vendored contrib/lz4/lz4.c (Yann Collet's reference lz4) via
+// libRIST's vendored lz4 (Yann Collet's reference lz4) via
 // LZ4_compress_default, the exact call libRIST's Advanced-Profile send path
-// uses (src/udp.c). Decompressing each block must yield the recorded plaintext,
+// uses. Decompressing each block must yield the recorded plaintext,
 // proving this package decodes foreign blocks (and therefore libRIST's), not
 // only its own output. These bytes were captured by compiling a small driver
-// against ~/dev/librist/contrib/lz4/lz4.c.
+// against libRIST's vendored lz4.
 var foreignKATs = []struct {
 	name  string
 	block string // raw LZ4 block, hex
@@ -92,7 +92,7 @@ func TestDecompressForeignKAT(t *testing.T) {
 // genuinely different framing — proving the decoder handles foreign blocks, not
 // only its own output.
 func TestDecompressForeignDivergentBlock(t *testing.T) {
-	// lz4hc level 12 block (from ~/dev/librist/contrib/lz4) for a 300-byte
+	// lz4hc level 12 block for a 300-byte
 	// "abcdefgh..." pattern (p[i] = 'a'+i%8) with bytes [100]=0x5a, [101]=0x59,
 	// [200]=0x51 overridden.
 	hc := mustHex(t, "8f61626364656667680800494f5a59676868004d1f5160004b506861626364")

@@ -5,9 +5,8 @@
 // bitmask and the RIST APP range NACK), and the EXTSEQ APP packet of
 // VSF TR-06-2 §8.4 that widens NACK sequence numbers to 32 bits.
 //
-// libRIST (src/proto/rtp.h, src/proto/rtp.c, src/udp.c) is the authoritative
-// interop reference; where the spec is ambiguous the byte layout here matches
-// libRIST and the relevant file:line is cited in a comment.
+// libRIST is the authoritative interop reference; where the spec is ambiguous
+// the byte layout here matches libRIST.
 //
 // # Decoding policy
 //
@@ -42,7 +41,7 @@ import (
 	"slices"
 )
 
-// RTCP packet types used by RIST (libRIST src/proto/rtp.h:92-96).
+// RTCP packet types used by RIST (libRIST).
 const (
 	// PTSenderReport is the RTCP Sender Report packet type
 	// (PTYPE_SR = 200, TR-06-1 §5.2.2).
@@ -67,8 +66,7 @@ const (
 	PTTransportFeedback = 205
 )
 
-// APP packet subtypes under the "RIST" name (libRIST src/proto/rtp.h:100-103
-// and TR-06-2 §8.4).
+// APP packet subtypes under the "RIST" name (libRIST and TR-06-2 §8.4).
 const (
 	// AppSubtypeRangeNACK identifies a range-based retransmission request
 	// (NACK_FMT_RANGE = 0, TR-06-1 §5.3.2.2).
@@ -90,7 +88,7 @@ const (
 
 // FMTGenericNACK is the RFC 4585 feedback message type for the Generic NACK,
 // carried in the 5-bit count field of a PT=205 packet
-// (NACK_FMT_BITMASK = 1, libRIST src/proto/rtp.h:100).
+// (NACK_FMT_BITMASK = 1, libRIST).
 const FMTGenericNACK = 1
 
 // NameRIST is the 32-bit ASCII name "RIST" carried by every RIST APP packet
@@ -102,12 +100,11 @@ const NameRIST uint32 = 0x52495354
 const headerSize = 4
 
 // appFixedSize is the fixed prefix of every RIST APP packet: header, media
-// SSRC, and the 4-byte "RIST" name (RTCP_FB_HEADER_SIZE, libRIST
-// src/proto/rtp.h:83).
+// SSRC, and the 4-byte "RIST" name (RTCP_FB_HEADER_SIZE, libRIST).
 const appFixedSize = 12
 
 // versionFlag is the V=2, P=0, count=0 flags byte; type-specific subtype/
-// count bits are OR-ed in (RTCP_SR_FLAGS = 0x80, libRIST src/proto/rtp.h:107).
+// count bits are OR-ed in (RTCP_SR_FLAGS = 0x80, libRIST).
 const versionFlag = 0x80
 
 // Sentinel errors. Returned errors may wrap these with positional context;

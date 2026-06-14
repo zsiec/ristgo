@@ -17,8 +17,8 @@ func TestSSRCHelpers(t *testing.T) {
 		{"max-even", 0xFFFFFFFE, 0xFFFFFFFE, 0xFFFFFFFF, false},
 		{"max-odd", 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFF, true},
 		// Only the LSB is the retransmit marker; high bits are
-		// untouched (librist src/udp.c:226 shows the rejected
-		// alternative ssrc |= 1<<31 commented out).
+		// untouched (librist shows the rejected alternative
+		// ssrc |= 1<<31 commented out).
 		{"high-bit-set", 0x80000002, 0x80000002, 0x80000003, false},
 	}
 
@@ -39,8 +39,8 @@ func TestSSRCHelpers(t *testing.T) {
 
 func TestSSRCHelperProperties(t *testing.T) {
 	// Algebraic properties over a spread of values, mirroring the
-	// libRIST TX/RX pair: TX sets the LSB on the even flow id
-	// (src/udp.c:227), RX tests and clears it (src/rist-common.c:3364-3370).
+	// libRIST TX/RX pair: TX sets the LSB on the even flow id,
+	// RX tests and clears it.
 	ssrcs := []uint32{0, 1, 2, 3, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF, 0x12345678}
 	for _, s := range ssrcs {
 		base := NormalizeSSRC(s)

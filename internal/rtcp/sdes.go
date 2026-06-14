@@ -3,8 +3,7 @@ package rtcp
 import "encoding/binary"
 
 // sdesFixedSize is the SDES bytes before the CNAME string: header, SSRC,
-// CNAME item type, and item length (RTCP_SDES_SIZE, libRIST
-// src/proto/rtp.h:105).
+// CNAME item type, and item length (RTCP_SDES_SIZE).
 const sdesFixedSize = 10
 
 // sdesItemCNAME is the SDES item type for CNAME (RFC 3550 §6.5.1).
@@ -16,8 +15,7 @@ const maxCNAMELen = 255
 // SDES is the RIST Source Description packet of TR-06-1 §5.2.5: PT=202,
 // SC=1, a single chunk holding one CNAME item. The chunk is closed by 1-4
 // zero bytes that both terminate the item list and pad the packet to a
-// 32-bit boundary. libRIST builds it in rist_rtcp_write_sdes
-// (src/proto/rtp.c:67-87).
+// 32-bit boundary. libRIST builds it in rist_rtcp_write_sdes.
 type SDES struct {
 	// SSRC identifies the originator of the packet (the RIST sender or
 	// receiver).
@@ -33,8 +31,8 @@ type SDES struct {
 // sdesSize returns the canonical whole-packet size for an n-byte CNAME:
 // the 10 fixed bytes plus the name plus at least one zero terminator,
 // rounded up to a multiple of 4 — between 1 and 4 zero bytes total, exactly
-// as TR-06-1 §5.2.5 requires. The expression matches libRIST
-// src/proto/rtp.c:74: ((10 + namelen + 1) + 3) & ~3.
+// as TR-06-1 §5.2.5 requires. The expression matches libRIST:
+// ((10 + namelen + 1) + 3) & ~3.
 func sdesSize(n int) int { return (sdesFixedSize + n + 1 + 3) &^ 3 }
 
 // MarshalSize returns the encoded size: 12 to 268 bytes depending on the

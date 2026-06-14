@@ -58,9 +58,8 @@ func (p *Peer) Seen() bool { return p.seen }
 
 // Expired reports whether the peer was once seen but has now been silent for
 // longer than the session timeout — the condition for tearing the session
-// down (libRIST checks now - last_pkt_received > session_timeout,
-// src/rist-common.c:3989-4001). A peer that has never been seen does not
-// expire (the session is still forming).
+// down (libRIST checks now - last_pkt_received > session_timeout). A peer
+// that has never been seen does not expire (the session is still forming).
 func (p *Peer) Expired(now clock.Timestamp) bool {
 	return p.seen && now.Sub(p.lastSeen) > p.timeout
 }

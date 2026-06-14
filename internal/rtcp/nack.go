@@ -12,15 +12,15 @@ import "encoding/binary"
 // single NACK packet. TR-06-1 §5.3.2.2 mandates at most 16 range requests
 // per range NACK; §5.3.2.3 recommends the same bound for bitmask FCIs, and
 // the seam applies it to both encodings. libRIST does not split on the send
-// side — rist_receiver_send_nacks packs the whole seq array into one packet
-// (src/udp.c:755-772 bitmask, 786-808 range) — so the decoders here
-// intentionally accept arbitrarily long NACK packets (record count is driven
-// by the length field); only the encoders apply this bound.
+// side — rist_receiver_send_nacks packs the whole seq array into one packet —
+// so the decoders here intentionally accept arbitrarily long NACK packets
+// (record count is driven by the length field); only the encoders apply this
+// bound.
 const MaxNackRecordsPerPacket = 16
 
 // NackRange is one Packet Range Request of TR-06-1 §5.3.2.2 (struct
-// rist_rtp_nack_record, libRIST src/proto/rtp.h:145-148): packets Start
-// through Start+Extra inclusive (mod 2^16) are being requested.
+// rist_rtp_nack_record, libRIST): packets Start through Start+Extra inclusive
+// (mod 2^16) are being requested.
 type NackRange struct {
 	// Start is the RTP sequence number of the first packet in the missing
 	// block.
@@ -34,7 +34,7 @@ type NackRange struct {
 // RangeNACK is the RIST range-based retransmission request of TR-06-1
 // §5.3.2.2: an APP packet (PT=204, subtype 0, name "RIST") whose body is a
 // list of NackRange records. libRIST builds it in rist_receiver_send_nacks
-// (src/udp.c:776-808) with flags RTCP_NACK_RANGE_FLAGS (0x80).
+// with flags RTCP_NACK_RANGE_FLAGS (0x80).
 type RangeNACK struct {
 	// MediaSSRC is the "SSRC of media source" of the stream the request
 	// relates to — the packet's only SSRC field (TR-06-1 re-defines the
@@ -134,11 +134,10 @@ func (n NackPair) AppendSeqs(dst []uint32) []uint32 {
 // §5.3.2.1: the RFC 4585 Generic NACK, PT=205, FMT=1, with sender and media
 // SSRCs followed by Generic NACK FCIs. It is the same wire format as pion
 // rtcp's TransportLayerNack. libRIST builds it in rist_receiver_send_nacks
-// (src/udp.c:744-773) with flags RTCP_NACK_BITMASK_FLAGS (0x81).
+// with flags RTCP_NACK_BITMASK_FLAGS (0x81).
 type BitmaskNACK struct {
 	// SenderSSRC identifies the originator of this packet. TR-06-1
-	// §5.3.2.1 has the RIST sender ignore it, and libRIST transmits zero
-	// (src/udp.c:747).
+	// §5.3.2.1 has the RIST sender ignore it, and libRIST transmits zero.
 	SenderSSRC uint32
 
 	// MediaSSRC is the SSRC of the media stream the request relates to.
@@ -213,7 +212,7 @@ func decodeBitmaskNACK(h header, body []byte) (Packet, bool) {
 // the minimal list of range records, split into packets of at most
 // MaxNackRecordsPerPacket records. A run of consecutive (mod 2^16) numbers
 // becomes a single {start, extra} record, exactly like libRIST's range
-// encoder (src/udp.c:783-807), including across the 65535->0 wrap.
+// encoder, including across the 65535->0 wrap.
 //
 // senderSSRC is accepted for signature symmetry with EncodeBitmaskNACK
 // (mirroring libRIST's seq-array dispatch seam in rist_receiver_send_nacks)
@@ -240,7 +239,7 @@ func EncodeRangeNACK(senderSSRC, mediaSSRC uint32, missing []uint32) []RangeNACK
 	for _, m := range missing[1:] {
 		s := uint16(m)
 		// cur.Extra == 65535 would mean the record already spans the whole
-		// ring; libRIST splits there too (src/udp.c:790-795).
+		// ring; libRIST splits there too.
 		if s == last+1 && cur.Extra < 0xFFFF {
 			cur.Extra++
 		} else {

@@ -73,10 +73,10 @@ func TestDecryptorSetKeyBits(t *testing.T) {
 }
 
 // TestDeriveKeyPasswordBounding pins ristgo's PBKDF2 passphrase to libRIST's
-// effective bound: the bytes up to the first NUL, capped at 127 (psk.c:38,327;
-// psk.h:48). A passphrase longer than 127 bytes must derive identically to its
-// 127-byte prefix, and a passphrase with an embedded NUL must derive identically
-// to its pre-NUL prefix — otherwise PSK interop would silently key-mismatch.
+// effective bound: the bytes up to the first NUL, capped at 127. A passphrase
+// longer than 127 bytes must derive identically to its 127-byte prefix, and a
+// passphrase with an embedded NUL must derive identically to its pre-NUL prefix
+// — otherwise PSK interop would silently key-mismatch.
 func TestDeriveKeyPasswordBounding(t *testing.T) {
 	nonce := []byte{0x01, 0x02, 0x03, 0x04}
 

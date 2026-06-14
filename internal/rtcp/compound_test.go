@@ -33,7 +33,7 @@ func TestBuildCompoundOrdering(t *testing.T) {
 		{"RR+SDES+range NACK", []Packet{rr, sdes, rnack}, true},
 		{"emptyRR+SDES+bitmask NACK+echo", []Packet{emptyRR, sdes, bnack, echoReq}, true},
 		{"both NACK encodings", []Packet{emptyRR, sdes, rnack, bnack}, true},
-		{"raw XR before echo, like libRIST udp.c:678-680", []Packet{rr, sdes, xr, echoReq}, true},
+		{"raw XR before echo, like libRIST", []Packet{rr, sdes, xr, echoReq}, true},
 		{"multiple echoes at tail", []Packet{sr, sdes, echoReq, echoResp}, true},
 		// TR-06-2 §8.4 stack: RR, CNAME, EXTSEQ, NACK, EXTSEQ, NACK.
 		{"extseq+nack", []Packet{rr, sdes, ext, rnack}, true},
@@ -148,13 +148,13 @@ func TestParseCompoundForeignPacket(t *testing.T) {
 // shapes:
 //
 //   - receiver periodic: full RR + SDES + echo request
-//     (rist_receiver_periodic_rtcp, src/udp.c:671-682)
+//     (rist_receiver_periodic_rtcp)
 //   - receiver NACK: empty RR + SDES + NACK
-//     (rist_receiver_send_nacks, src/udp.c:720-816)
+//     (rist_receiver_send_nacks)
 //   - sender periodic: SR + SDES + echo request
-//     (rist_sender_periodic_rtcp, src/udp.c:822-832)
+//     (rist_sender_periodic_rtcp)
 //   - echo response: empty RR + SDES + echo response
-//     (rist_respond_echoreq, src/udp.c:834-847)
+//     (rist_respond_echoreq)
 func TestLibristCompoundShapes(t *testing.T) {
 	const flowID = 0x1234ABCC
 	shapes := []struct {

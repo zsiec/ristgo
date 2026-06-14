@@ -8,7 +8,7 @@ import (
 // senderSlot is one entry of the sender history ring: a transmitted packet
 // retained so it can be re-sent on NACK. It mirrors the libRIST
 // struct rist_buffer fields the retransmit path reads (seq_rtp, source_time,
-// transmit_count, last_retry_request — src/rist-private.h:85-112).
+// transmit_count, last_retry_request).
 type senderSlot struct {
 	// payload is the retained media payload, re-sent verbatim on retransmit
 	// (the producer must not mutate it after PushApp; see the package
@@ -27,19 +27,16 @@ type senderSlot struct {
 
 	// transmitCount is the number of retransmissions so far (the first
 	// transmission is not counted). The packet is abandoned once it reaches
-	// MaxRetries (libRIST buffer->transmit_count vs max_retries,
-	// src/udp.c:1168-1174).
+	// MaxRetries (libRIST buffer->transmit_count vs max_retries).
 	transmitCount int
 
 	// lastRetry is the instant of the most recent retransmission; the gate
 	// suppresses another within one clamped RTT (libRIST
-	// buffer->last_retry_request, src/udp.c:1241-1272). Meaningful only when
-	// retried is true.
+	// buffer->last_retry_request). Meaningful only when retried is true.
 	lastRetry clock.Timestamp
 
 	// retried reports whether lastRetry has been set, mirroring libRIST's
-	// `last_retry_request != 0` guard (src/udp.c:1241): the first retransmit
-	// is never gated.
+	// `last_retry_request != 0` guard: the first retransmit is never gated.
 	retried bool
 
 	// state is slotEmpty or slotFilled.
@@ -57,7 +54,7 @@ type senderState struct {
 
 	// ssrc is the base (even) flow SSRC stamped into every outgoing
 	// MediaPacket; the codec sets its LSB on retransmissions, never the core
-	// (src/udp.c:227, hdr->rtp.ssrc = adv_flow_id | 0x01).
+	// (hdr->rtp.ssrc = adv_flow_id | 0x01).
 	ssrc uint32
 
 	// nextSeq is the 32-bit sequence assigned to the next PushApp packet,
@@ -73,19 +70,18 @@ type senderState struct {
 
 // pushApp is the sender-role body of PushApp: assign the next sequence, store
 // the packet in the history ring, and emit its first transmission. It mirrors
-// rist_sender_enqueue (src/udp.c:869-929) followed by the data send.
+// rist_sender_enqueue followed by the data send.
 func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 	s := &f.sender
 	if !s.started {
 		s.started = true
 		// Originate RTT echo requests so the retransmit gate has a real RTT.
-		// libRIST's sender gates origination on peer->echo_enabled
-		// (src/udp.c:828), which flips true only after an inbound echo
-		// req/resp (src/rist-common.c:2194-2195, :2202); the deterministic
+		// libRIST's sender gates origination on peer->echo_enabled, which
+		// flips true only after an inbound echo req/resp; the deterministic
 		// core has no inbound-echo precondition to track, so origination is
 		// intentionally ungated. This matches libRIST end-to-end because its
-		// receiver originates echo requests unconditionally (src/udp.c:678),
-		// flipping the peer sender's echo_enabled within one cadence.
+		// receiver originates echo requests unconditionally, flipping the
+		// peer sender's echo_enabled within one cadence.
 		f.outputs.push(SetTimer{ID: TimerRttEcho, Deadline: now.Add(rttEchoInterval)})
 	}
 
@@ -126,11 +122,10 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 // (rist_retry_dequeue), because enqueue runs before dequeue:
 //
 //   - slot empty or holding a different seq -> aged out, unserviceable
-//     (RetransmitSkipped, src/udp.c:1086-1103);
+//     (RetransmitSkipped);
 //   - last retransmit < one clamped RTT ago -> suppressed
-//     (RetransmitSuppressed, src/udp.c:1241-1272);
-//   - transmitCount >= MaxRetries           -> abandoned (RetransmitExhausted,
-//     src/udp.c:1168-1174);
+//     (RetransmitSuppressed);
+//   - transmitCount >= MaxRetries           -> abandoned (RetransmitExhausted);
 //   - otherwise                             -> re-send with Retransmit set.
 //
 // Evaluating suppression before exhaustion matches libRIST's counter
@@ -139,19 +134,18 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 // reaches the dequeue cap), not exhausted. The outcome (no re-send) is the
 // same either way; only the stat differs.
 //
-// The gate clamps the most recent raw RTT sample (libRIST peer->last_rtt,
-// src/udp.c:1254-1262), deliberately the freshest sample rather than the EWMA
-// the receiver uses for its retry interval — libRIST splits the two and so do
-// we (see internal/rtt).
+// The gate clamps the most recent raw RTT sample (libRIST peer->last_rtt),
+// deliberately the freshest sample rather than the EWMA the receiver uses for
+// its retry interval — libRIST splits the two and so do we (see internal/rtt).
 //
 // Two libRIST gates have no analog here because this core services NACKs
-// synchronously (no asynchronous retry queue): retry_queued (src/udp.c:1242)
-// guards a request already sitting in the queue, and the retry-age gate
-// (retry_age > recovery_length_max, src/udp.c:1147-1155) measures queue dwell
-// time. Both would read ~0 when the retransmit is emitted within the same
-// call, so last_retry_request alone is the gate.
+// synchronously (no asynchronous retry queue): retry_queued guards a request
+// already sitting in the queue, and the retry-age gate (retry_age >
+// recovery_length_max) measures queue dwell time. Both would read ~0 when the
+// retransmit is emitted within the same call, so last_retry_request alone is
+// the gate.
 //
-// DEVIATION(librist src/udp.c:1110-1141): the recovery_maxbitrate bandwidth
+// DEVIATION(librist): the recovery_maxbitrate bandwidth
 // gate is not replicated. It requires a time-windowed bitrate estimator and
 // is a rate-limit refinement, not an ARQ-correctness property; it is deferred
 // (host-level, with the rest of congestion control) just as the receiver

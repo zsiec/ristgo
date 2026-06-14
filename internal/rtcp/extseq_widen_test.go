@@ -164,7 +164,7 @@ func TestEchoPaddingEchoContract(t *testing.T) {
 
 // ExampleBuildCompound shows the receiver-side compound a session emits
 // when it has retransmission requests pending: the TR-06-1 §5.2.1 receiver
-// stack with the libRIST packet order (src/udp.c:736-815).
+// stack with the libRIST packet order.
 func ExampleBuildCompound() {
 	const flowID = 0x0F0F0F02
 	missing := []uint32{100, 101, 102, 250} // 16-bit seqs already narrowed

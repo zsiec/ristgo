@@ -8,9 +8,8 @@ import (
 )
 
 // TestHeaderChecksumSkip verifies the parser honors the C (checksum) bit by
-// skipping four bytes even though libRIST never emits a checksum
-// (rist-common.c:2945-2947). The encoder never sets the C bit, so this is a
-// parse-only edge case constructed by hand.
+// skipping four bytes even though libRIST never emits a checksum. The encoder
+// never sets the C bit, so this is a parse-only edge case constructed by hand.
 func TestHeaderChecksumSkip(t *testing.T) {
 	// flags1 = C(bit7)|S(bit4) = 0x90; flags2 = 0x08 (version 1).
 	// Layout: base(4) + checksum(4) + seq(4).
@@ -35,8 +34,7 @@ func TestHeaderChecksumSkip(t *testing.T) {
 }
 
 // TestHeaderChecksumKeySeq verifies the full optional-field stack: checksum,
-// key/nonce, and sequence (rist-common.c:2945-2960 accumulates payload_offset
-// in that order).
+// key/nonce, and sequence (libRIST accumulates payload_offset in that order).
 func TestHeaderChecksumKeySeq(t *testing.T) {
 	// flags1 = C(7)|K(5)|S(4) = 0xB0; flags2 = 0x08.
 	b := []byte{
@@ -167,8 +165,7 @@ func TestAppendToErrorUnchanged(t *testing.T) {
 	}
 }
 
-// TestParseVSFRejectNonRIST verifies a non-RIST VSF type is rejected
-// (rist-common.c:3037-3040).
+// TestParseVSFRejectNonRIST verifies a non-RIST VSF type is rejected.
 func TestParseVSFRejectNonRIST(t *testing.T) {
 	b := []byte{0x00, 0x01, 0x00, 0x00} // type = 1
 	if _, _, err := ParseVSFProto(b); !errors.Is(err, ErrUnsupportedVSFProto) {
@@ -195,7 +192,7 @@ func TestParseKeepaliveShort(t *testing.T) {
 }
 
 // TestKeepaliveAllCaps round-trips a fully populated capability set, checking
-// every bit maps to the libRIST position (gre.c:259-271).
+// every bit maps to the libRIST position.
 func TestKeepaliveAllCaps(t *testing.T) {
 	caps := Capabilities{
 		N: true, L: true, E: true, P: true, A: true, B: true, R: true, X: true,
@@ -244,7 +241,7 @@ func TestKeepaliveAdvExtNoJSON(t *testing.T) {
 }
 
 // TestKeepaliveJSONNoAdvExt covers fewer than AdvExtSize trailing bytes, which
-// libRIST treats as JSON, not an extended block (gre.c:280-284).
+// libRIST treats as JSON, not an extended block.
 func TestKeepaliveJSONNoAdvExt(t *testing.T) {
 	// 3 trailing bytes -> JSON, since < AdvExtSize (4).
 	k := Keepalive{MAC: [6]byte{1, 2, 3, 4, 5, 6}, Caps: StandardCapabilities(), JSON: []byte("xyz")}

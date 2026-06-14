@@ -433,9 +433,9 @@ func TestCompare32(t *testing.T) {
 	}
 }
 
-// TestForwardGap16 pins the libRIST receiver_mark_missing wraparound guard
-// (src/rist-common.c:555-557): missing_count = (current - last) & UINT16_MAX,
-// and missing_count > 32768 means wraparound/reorder, not loss.
+// TestForwardGap16 pins the libRIST receiver_mark_missing wraparound guard:
+// missing_count = (current - last) & UINT16_MAX, and missing_count > 32768
+// means wraparound/reorder, not loss.
 func TestForwardGap16(t *testing.T) {
 	tests := []struct {
 		last, current Num16
@@ -498,7 +498,7 @@ func TestForwardGap32(t *testing.T) {
 // TestMaxGapConstants pins the guard thresholds to the libRIST values.
 func TestMaxGapConstants(t *testing.T) {
 	if MaxGap16 != 32768 {
-		t.Errorf("MaxGap16 = %d, want 32768 (rist-common.c:557)", MaxGap16)
+		t.Errorf("MaxGap16 = %d, want 32768", MaxGap16)
 	}
 	if MaxGap32 != 2147483648 {
 		t.Errorf("MaxGap32 = %d, want 2147483648", MaxGap32)

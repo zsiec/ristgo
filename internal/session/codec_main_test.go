@@ -179,7 +179,7 @@ func TestMainMediaRoundTrip(t *testing.T) {
 
 // TestMainMediaSeqWrapRollover checks that the 32-bit media sequence is
 // reconstructed by 16-bit rollover counting — NOT from the NPD extension's
-// seq_ext, which libRIST never populates on the Main path (rist-common.c:3496).
+// seq_ext, which libRIST never populates on the Main path.
 // A stream crossing the 0xFFFF->0 boundary must widen monotonically, the high
 // bits are anchored at 0 on the first packet (receiver-relative, exactly like
 // the Simple codec), and the bogus high bits placed in pkt.Seq must be ignored

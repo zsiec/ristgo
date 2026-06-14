@@ -36,7 +36,7 @@ func rtpTSFromSource(src uint64) uint32 {
 // encodeMedia encodes a normalized MediaPacket as a Simple-profile RTP packet,
 // appending to dst and returning the extended slice. The base (even) SSRC gets
 // its LSB set on a retransmission (the only wire difference for a re-send;
-// librist src/udp.c:227); the sequence is narrowed to 16 bits and the source
+// librist); the sequence is narrowed to 16 bits and the source
 // time to the 32-bit 90 kHz RTP timestamp.
 func encodeMedia(dst []byte, pkt wire.MediaPacket) ([]byte, error) {
 	ssrc := pkt.SSRC

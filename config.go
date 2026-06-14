@@ -6,7 +6,7 @@ import (
 )
 
 // Default configuration values. Each mirrors the corresponding
-// RIST_DEFAULT_* macro in libRIST's include/librist/peer.h; matching them
+// RIST_DEFAULT_* macro in libRIST; matching them
 // exactly is required for interoperability.
 const (
 	DefaultBufferMin         = 1000 * time.Millisecond // RIST_DEFAULT_RECOVERY_LENGTH_MIN (ms)
@@ -14,7 +14,7 @@ const (
 	DefaultReorderBuffer     = 15 * time.Millisecond   // RIST_DEFAULT_RECOVERY_REORDER_BUFFER (ms)
 	DefaultRTTMin            = 5 * time.Millisecond    // RIST_DEFAULT_RECOVERY_RTT_MIN (ms)
 	DefaultRTTMax            = 500 * time.Millisecond  // RIST_DEFAULT_RECOVERY_RTT_MAX (ms)
-	DefaultRTTMultiplier     = 7                       // libRIST src/rist.c recovery_rtt_multiplier
+	DefaultRTTMultiplier     = 7                       // libRIST recovery_rtt_multiplier
 	DefaultMinRetries        = 6                       // RIST_DEFAULT_MIN_RETRIES
 	DefaultMaxRetries        = 20                      // RIST_DEFAULT_MAX_RETRIES
 	DefaultSessionTimeout    = 2000 * time.Millisecond // RIST_DEFAULT_SESSION_TIMEOUT (ms)
@@ -144,8 +144,8 @@ type Config struct {
 	// AESKeyBits is the AES key size in bits: 128 or 256.
 	// Only meaningful when Secret is set; when Secret is set and
 	// AESKeyBits is 0, it defaults to 256 (matching libRIST, which
-	// assumes the maximum security level when aes-type is omitted;
-	// src/rist-common.c). Setting AESKeyBits without Secret is an error.
+	// assumes the maximum security level when aes-type is omitted).
+	// Setting AESKeyBits without Secret is an error.
 	AESKeyBits int
 
 	// KeyRotation is the number of packets encrypted with one key before
@@ -232,7 +232,7 @@ type DTLSConfig struct {
 }
 
 // DefaultConfig returns a Config with default values matching libRIST's
-// RIST_DEFAULT_* macros (include/librist/peer.h), except Profile: libRIST
+// RIST_DEFAULT_* macros, except Profile: libRIST
 // defaults to the Main profile, while ristgo defaults to ProfileSimple
 // until Main is implemented (see Config.Profile).
 func DefaultConfig() Config {

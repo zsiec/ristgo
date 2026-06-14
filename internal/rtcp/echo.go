@@ -7,7 +7,7 @@ import (
 
 // echoFixedSize is the RTT echo packet without padding: header, SSRC,
 // "RIST" name, 64-bit timestamp, and 32-bit processing delay — length=5
-// (struct rist_rtcp_echoext, libRIST src/proto/rtp.h:173-182).
+// (struct rist_rtcp_echoext, libRIST).
 const echoFixedSize = 24
 
 // padTo4 rounds n up to the next multiple of 4.
@@ -16,8 +16,8 @@ func padTo4(n int) int { return (n + 3) &^ 3 }
 // EchoRequest is the RIST RTT Echo Request of TR-06-1 §5.2.6: an APP packet
 // (PT=204, name "RIST") with subtype 2, carrying an arbitrary 64-bit
 // timestamp the peer echoes back verbatim. libRIST builds it in
-// rist_rtcp_write_echoreq (src/proto/rtp.c:88-101) with flags
-// RTCP_ECHOEXT_REQ_FLAGS (0x82, src/proto/rtp.h:112).
+// rist_rtcp_write_echoreq with flags
+// RTCP_ECHOEXT_REQ_FLAGS (0x82).
 //
 // The wire format also carries a 32-bit Processing Delay field, but in
 // requests TR-06-1 requires the sender to zero-fill it and the receiver to
@@ -54,8 +54,8 @@ func (EchoRequest) isPacket() {}
 
 // EchoResponse is the RIST RTT Echo Response of TR-06-1 §5.2.6: subtype 3,
 // echoing the request's timestamp verbatim plus the responder's processing
-// delay. libRIST builds it in rist_rtcp_write_echoresp
-// (src/proto/rtp.c:103-117) with flags RTCP_ECHOEXT_RESP_FLAGS (0x83).
+// delay. libRIST builds it in rist_rtcp_write_echoresp with flags
+// RTCP_ECHOEXT_RESP_FLAGS (0x83).
 type EchoResponse struct {
 	// SSRC is the "SSRC of media source" the measurement relates to.
 	SSRC uint32

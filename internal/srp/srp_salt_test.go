@@ -8,7 +8,7 @@ import (
 // TestSaltLeadingZeroCanonicalized is the regression guard for the interop bug
 // where the salt was hashed at its raw wire length instead of being
 // canonicalized through a bignum. libRIST holds the salt as a BIGNUM and hashes
-// it at MINIMAL length (srp.c:233) in both calc_x and calculate_m, so leading
+// it at MINIMAL length in both calc_x and calculate_m, so leading
 // zero bytes must not affect x, the verifier, M1, or the session key. The KAT
 // salt (72F9..) has no leading zero and cannot catch a regression here; ~1/256
 // of random 32-byte salts do.

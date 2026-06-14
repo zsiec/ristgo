@@ -19,7 +19,7 @@
 // Every inbound media packet — first transmission, ARQ retransmit, or a
 // duplicate copy from another 2022-7 path — lands in one power-of-two ring
 // indexed by seq&mask and validated by (seq, sourceTime), exactly as libRIST
-// does in receiver_enqueue (src/rist-common.c:775-793). A filled slot with
+// does in receiver_enqueue. A filled slot with
 // the same (seq, sourceTime) is a duplicate and is dropped; that single test
 // is the entire multipath merge. A filled slot with a different
 // (seq, sourceTime) is stale and is overwritten.
@@ -64,11 +64,10 @@ const (
 )
 
 // DefaultRingSize is the default receiver ring capacity in slots, matching
-// libRIST's receiver_queue_max of 2^16 entries (UINT16_SIZE,
-// src/rist-private.h:43).
+// libRIST's receiver_queue_max of 2^16 entries (UINT16_SIZE).
 const DefaultRingSize = 1 << 16
 
-// Receiver pacing constants from libRIST (src/rist-private.h:54-55).
+// Receiver pacing constants from libRIST.
 const (
 	// nackCadence bounds how long NACK processing may lag: libRIST's
 	// receiver loop wakes at least every RIST_MAX_JITTER = 5 ms.
@@ -93,9 +92,9 @@ type Config struct {
 
 	// ReorderBuffer is libRIST's recovery_reorder_buffer. The receiver
 	// half does not consume it directly this stage (libRIST folds it into
-	// the rtt value used for the first NACK, src/rist-common.c:2134-2138 —
-	// see the DEVIATION note at addMissing); it is carried here so the
-	// sender half and later stages share one Config.
+	// the rtt value used for the first NACK — see the DEVIATION note at
+	// addMissing); it is carried here so the sender half and later stages
+	// share one Config.
 	ReorderBuffer clock.Microseconds
 
 	// RTTMin and RTTMax clamp the smoothed RTT whenever it is read for
@@ -108,7 +107,7 @@ type Config struct {
 	MinRetries int
 
 	// MaxRetries is libRIST's max_retries: a missing entry is abandoned
-	// once it has been NACKed this many times (src/rist-common.c:843).
+	// once it has been NACKed this many times.
 	MaxRetries int
 
 	// RingSize is the ring capacity in slots — the receiver history ring and
@@ -119,7 +118,7 @@ type Config struct {
 
 	// SSRC is the base flow SSRC the sender half stamps into every outgoing
 	// MediaPacket. It must be even — the codec reserves the LSB as the
-	// retransmit marker (librist src/rist.c:570, flow_id &= ~1UL) — but the
+	// retransmit marker (librist, flow_id &= ~1UL) — but the
 	// core does not enforce that; the public Config layer validates it.
 	// Sender-only; the receiver learns the SSRC from the first packet.
 	SSRC uint32
@@ -130,7 +129,7 @@ type Config struct {
 	StartSeq uint32
 }
 
-// DefaultConfig returns the libRIST defaults (include/librist/peer.h):
+// DefaultConfig returns the libRIST defaults:
 // recovery_length_min/max = 1000 ms, reorder_buffer = 15 ms, rtt_min = 5 ms,
 // rtt_max = 500 ms, min_retries = 6, max_retries = 20, and the 2^16 ring.
 func DefaultConfig() Config {
@@ -148,9 +147,8 @@ func DefaultConfig() Config {
 
 // RecoveryBuffer returns the derived recovery (playout) buffer duration:
 // (RecoveryBufferMax-RecoveryBufferMin)/2 + RecoveryBufferMin, exactly as
-// libRIST computes recovery_buffer_ticks in init_peer_settings
-// (src/rist-common.c:378-381). With the default 1000/1000 ms window this is
-// 1000 ms.
+// libRIST computes recovery_buffer_ticks in init_peer_settings. With the
+// default 1000/1000 ms window this is 1000 ms.
 func (c Config) RecoveryBuffer() clock.Microseconds {
 	return (c.RecoveryBufferMax-c.RecoveryBufferMin)/2 + c.RecoveryBufferMin
 }
@@ -165,7 +163,7 @@ type Flow struct {
 	recoveryBuffer clock.Microseconds
 	// recoveryBuffer110 is recoveryBuffer*1.1 computed with the same
 	// double multiply-and-truncate libRIST uses for its too-late and
-	// NACK-abandon thresholds (src/rist-common.c:735 and :855).
+	// NACK-abandon thresholds.
 	recoveryBuffer110 clock.Microseconds
 
 	// est is the libRIST eight_times_rtt estimator. One per flow this
@@ -198,7 +196,7 @@ func New(role Role, cfg Config) *Flow {
 		est:            rtt.New(cfg.RTTMin),
 	}
 	// Same arithmetic as libRIST's (recovery_buffer_ticks * 1.1) double
-	// multiply with truncation (src/rist-common.c:735, :855).
+	// multiply with truncation.
 	f.recoveryBuffer110 = clock.Microseconds(float64(f.recoveryBuffer) * 1.1)
 	size := cfg.RingSize
 	if size <= 0 {
@@ -254,10 +252,10 @@ func (f *Flow) Feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 // wire.Feedback variants must never break the core.
 //
 // SSRC/flow-id demultiplexing is the host's job (PLAN.md: internal/socket
-// demuxes by addr/flow-id; cf. libRIST's per-peer SSRC guard in
-// rist-common.c:2202). Feedback handed here is trusted to belong to this flow:
-// the RTT estimator update and serviceNack apply no additive SSRC check, and
-// wire.RttEchoResponse intentionally carries no SSRC field.
+// demuxes by addr/flow-id; cf. libRIST's per-peer SSRC guard). Feedback
+// handed here is trusted to belong to this flow: the RTT estimator update and
+// serviceNack apply no additive SSRC check, and wire.RttEchoResponse
+// intentionally carries no SSRC field.
 func (f *Flow) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	switch fb := fb.(type) {
 	case wire.RttEchoRequest:
@@ -267,9 +265,8 @@ func (f *Flow) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 		})
 	case wire.RttEchoResponse:
 		// sample = (now - echoed timestamp) - processing delay. libRIST's
-		// calculate_rtt_delay floors a would-be-negative sample at 0
-		// (src/proto/rist_time.c:96-103); rtt.Estimator.Observe applies
-		// the same pin.
+		// calculate_rtt_delay floors a would-be-negative sample at 0;
+		// rtt.Estimator.Observe applies the same pin.
 		sent := clock.NTPTime(fb.Timestamp).Timestamp()
 		sample := now.Sub(sent) - clock.Microseconds(fb.ProcessingDelay)
 		f.est = f.est.Observe(sample)

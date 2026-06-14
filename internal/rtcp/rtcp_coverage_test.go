@@ -134,7 +134,7 @@ func TestParseConsumesOnlyDeclaredLength(t *testing.T) {
 
 // TestSDESPaddingTable pins the §5.2.5 termination rule across name lengths:
 // 1 to 4 zero bytes, total size a multiple of 4 (the libRIST formula
-// ((10+n+1)+3)&~3, src/proto/rtp.c:74).
+// ((10+n+1)+3)&~3).
 func TestSDESPaddingTable(t *testing.T) {
 	tests := []struct {
 		nameLen  int

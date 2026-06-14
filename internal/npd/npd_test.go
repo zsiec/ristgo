@@ -9,7 +9,7 @@ import (
 // tsPacket builds a synthetic 188- or 204-byte MPEG-TS packet with the given
 // 13-bit PID. The two bytes after the sync byte carry the flags1 word; for a
 // null packet (PID 0x1FFF) the whole word is 0x1FFF, matching libRIST's
-// be16toh(hdr->flags1) == 0x1FFF test (src/mpegts.c:30).
+// be16toh(hdr->flags1) == 0x1FFF test.
 func tsPacket(size int, pid uint16, fill byte) []byte {
 	p := make([]byte, size)
 	p[0] = SyncByte
@@ -23,8 +23,8 @@ func tsPacket(size int, pid uint16, fill byte) []byte {
 }
 
 // nullPacket builds a TS null packet exactly as libRIST reconstructs one in
-// expand_null_packets (src/mpegts.c:88-92): 0x47, 0x1FFF, flags2 bit4, 0xFF
-// fill. This is the canonical form Expand must reproduce.
+// expand_null_packets: 0x47, 0x1FFF, flags2 bit4, 0xFF fill. This is the
+// canonical form Expand must reproduce.
 func nullPacket(size int) []byte {
 	p := make([]byte, size)
 	p[0] = SyncByte
@@ -38,7 +38,7 @@ func nullPacket(size int) []byte {
 }
 
 // TestExtGolden asserts the 8-byte wire encoding of the header extension
-// byte-for-byte (librist src/proto/rtp.h:131-137).
+// byte-for-byte (librist).
 func TestExtGolden(t *testing.T) {
 	tests := []struct {
 		name string
@@ -332,7 +332,7 @@ func TestExpandRejectsOverflow(t *testing.T) {
 }
 
 // TestNullPacketCanonicalForm pins the reconstructed null packet bytes to the
-// exact libRIST form (src/mpegts.c:88-92).
+// exact libRIST form.
 func TestNullPacketCanonicalForm(t *testing.T) {
 	got, err := Expand(nil, nil, byte(1<<6)) // one null, no kept
 	if err != nil {

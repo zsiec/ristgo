@@ -9,13 +9,12 @@ import (
 	"testing"
 )
 
-// KAT fixtures from libRIST test/rist/unit/srp_examples.c, the PAD-compliant
+// KAT fixtures from libRIST, the PAD-compliant
 // "correct hashing" exchange (DEBUG_USE_EXAMPLE_CONSTANTS=1) on the 2048-bit
 // NG_DEFAULT group. username="rist", password="mainprofile".
 const (
 	katSaltHex = "72F9D5383B7EB7599FB63028F47475B60A55F313D40E0BE023E026C97C0A2C32"
-	// Deterministic secrets: srp.c:786 (a) and srp.c:321 (b),
-	// DEBUG_USE_EXAMPLE_CONSTANTS branch.
+	// Deterministic secrets a and b, DEBUG_USE_EXAMPLE_CONSTANTS branch.
 	katAHex = "138AB4045633AD14961CB1AD0720B1989104151C0708794491113302CCCC27D5"
 	katBHex = "ED0D58FF861A1FC75A0829BEA5F1392D2B13AB2B05CBCD6ED1E71AAAD761E856"
 
@@ -280,7 +279,7 @@ func TestLegacyRoundTrip(t *testing.T) {
 
 // TestModeMismatch confirms that a PAD client against a legacy server (and vice
 // versa) fails at M1 — the "operator forgot srp-compat on one side" case
-// (srp_examples.c test_srp_compat_mismatch_*).
+// (test_srp_compat_mismatch_*).
 func TestModeMismatch(t *testing.T) {
 	g := DefaultGroup()
 	salt := make([]byte, 32)

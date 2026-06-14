@@ -6,7 +6,7 @@ import "testing"
 //   - Distance(a,a) == 0
 //   - Distance(a,b) == -Distance(b,a), except at the exact antipode where
 //     both directions are pinned to +Half16 (package doc, librist
-//     rist-common.c:555-557 treats a gap of exactly 32768 as forward)
+//     treats a gap of exactly 32768 as forward)
 //   - |Distance| <= Half16
 //   - Add(a, Distance(a,b)) == b
 //   - sign agrees with Less and ForwardGap

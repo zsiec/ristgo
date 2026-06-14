@@ -1,7 +1,7 @@
 // Package crypto implements the RIST Main-profile pre-shared-key (PSK)
 // payload encryption: PBKDF2-HMAC-SHA256 key derivation salted by the 4-byte
 // GRE nonce, followed by AES-CTR over the GRE payload. It is byte-exact with
-// libRIST v0.2.18-rc1 (src/crypto/psk.c, src/rist-private.h).
+// libRIST v0.2.18-rc1.
 //
 // The design is sans-I/O and deterministic in the host's hands: this package
 // never reads a clock, opens a socket, or spawns a goroutine. The only
@@ -14,23 +14,20 @@
 //
 //   - Key derivation is PBKDF2-HMAC-SHA256 over the passphrase, salted by the
 //     4-byte GRE nonce, with 1024 iterations and a derived length of
-//     keyBits/8 (psk.c:102-119; RIST_PBKDF2_HMAC_SHA256_ITERATIONS,
-//     rist-private.h:56).
+//     keyBits/8 (RIST_PBKDF2_HMAC_SHA256_ITERATIONS).
 //   - The 16-byte AES-CTR IV is the 32-bit GRE sequence number, big-endian, in
-//     bytes [0:4], then twelve zero bytes (psk.c:227-233, with copy_offset==0
-//     for the only runtime GRE version, >=1). AES-CTR increments the low bytes
-//     of the IV, so the per-packet seq sits high and never collides with the
-//     block counter (gre.h:51-53).
-//   - Encrypt and decrypt are the identical AES-CTR XOR-stream operation
-//     (psk.c:196-225).
+//     bytes [0:4], then twelve zero bytes (with copy_offset==0 for the only
+//     runtime GRE version, >=1). AES-CTR increments the low bytes of the IV, so
+//     the per-packet seq sits high and never collides with the block counter.
+//   - Encrypt and decrypt are the identical AES-CTR XOR-stream operation.
 //   - The 4-byte nonce is a random non-zero uint32; bit 7 of nonce[0] marks the
 //     odd/even passphrase (set for odd, clear for even). A zero nonce is never
-//     emitted and never accepted for decryption (psk.c:235-275).
+//     emitted and never accepted for decryption.
 //   - The key rotates — a fresh nonce and re-derived key — when the user's
 //     keyRotation threshold of encrypted packets is reached, or when the
-//     packet counter would exhaust RIST_AES_KEY_REUSE_TIMES (UINT32_MAX,
-//     rist-private.h:57) (psk.c:302-313). A receiver re-derives whenever the
-//     inbound nonce differs from the one it last keyed on (psk.c:277-287).
+//     packet counter would exhaust RIST_AES_KEY_REUSE_TIMES (UINT32_MAX). A
+//     receiver re-derives whenever the inbound nonce differs from the one it
+//     last keyed on.
 package crypto
 
 import (
@@ -50,7 +47,7 @@ var (
 	// ErrInvalidKeySize is returned by NewKey and DeriveKey when the
 	// requested key size is not 128 or 256 bits. Only these two sizes are
 	// representable on the RIST wire: the GRE header signals key length with a
-	// single H bit (0 => 128, 1 => 256; rist-common.c:2993). libRIST's
+	// single H bit (0 => 128, 1 => 256). libRIST's
 	// derivation backend also accepts 192, but it can never be signalled.
 	ErrInvalidKeySize = errors.New("rist: crypto: key size must be 128 or 256 bits")
 
@@ -70,20 +67,20 @@ var (
 
 	// ErrZeroNonce is returned by Decrypt when the inbound GRE nonce is zero.
 	// A zero nonce never comes from a legitimate sender, so it is refused
-	// rather than used to key the cipher (psk.c:271-275).
+	// rather than used to key the cipher.
 	ErrZeroNonce = errors.New("rist: crypto: zero nonce rejected")
 
 	// ErrKeyReuseExhausted is returned by Decryptor.Decrypt once more than
 	// reuseLimit packets have been decrypted under one unchanging nonce —
 	// defense-in-depth mirroring libRIST's receive-side refusal when
-	// used_times exceeds RIST_AES_KEY_REUSE_TIMES (psk.c:289-292). A
+	// used_times exceeds RIST_AES_KEY_REUSE_TIMES. A
 	// conformant sender rotates its nonce long before this, which re-derives
 	// the key and resets the counter, so it fires only against a peer that
 	// never rotates.
 	ErrKeyReuseExhausted = errors.New("rist: crypto: AES key reuse limit exhausted")
 
 	// ErrCSPRNG wraps a failure to read from crypto/rand during nonce
-	// generation. libRIST fails closed here (psk.c:236-258); so do we, by
+	// generation. libRIST fails closed here; so do we, by
 	// surfacing the error to the caller instead of running AES under a
 	// predictable nonce.
 	ErrCSPRNG = errors.New("rist: crypto: CSPRNG unavailable")
@@ -97,40 +94,40 @@ const (
 	KeySize256 = 256
 
 	// NonceSize is the length in bytes of the GRE nonce that salts key
-	// derivation (psk.c:104, sizeof(key->gre_nonce)).
+	// derivation (sizeof(key->gre_nonce)).
 	NonceSize = 4
 
 	// ivSize is the AES-CTR initialization-vector length: one AES block
-	// (psk.c:30, AES_BLOCK_SIZE).
+	// (AES_BLOCK_SIZE).
 	ivSize = aes.BlockSize
 
-	// pbkdf2Iterations is RIST_PBKDF2_HMAC_SHA256_ITERATIONS
-	// (rist-private.h:56): the PBKDF2 iteration count salting key derivation.
+	// pbkdf2Iterations is RIST_PBKDF2_HMAC_SHA256_ITERATIONS: the PBKDF2
+	// iteration count salting key derivation.
 	pbkdf2Iterations = 1024
 
-	// reuseLimit is RIST_AES_KEY_REUSE_TIMES (rist-private.h:57): the maximum
+	// reuseLimit is RIST_AES_KEY_REUSE_TIMES: the maximum
 	// number of packets encrypted under one nonce before the key must rotate
 	// regardless of the user's keyRotation knob. It is effectively unbounded.
 	reuseLimit = uint32(0xFFFFFFFF)
 
 	// nonceBBitByte is the index of the nonce byte carrying the odd/even
-	// passphrase marker (psk.c:262-264).
+	// passphrase marker.
 	nonceBBitByte = 0
 
 	// nonceBBitMask isolates bit 7 of nonceBBitByte, the odd/even marker
-	// (psk.c:262, UNSET_BIT(..., 7) / SET_BIT(..., 7)).
+	// (UNSET_BIT(..., 7) / SET_BIT(..., 7)).
 	nonceBBitMask = 1 << 7
 
 	// maxPasswordLen is libRIST's effective PBKDF2 passphrase bound:
 	// sizeof(key->password)-1. The passphrase lives in a fixed
-	// uint8_t password[128] (psk.h:48) and PBKDF2 runs over password_len bytes,
-	// which is strnlen-bounded to the first NUL and capped at 127 (psk.c:38,327).
+	// uint8_t password[128] and PBKDF2 runs over password_len bytes,
+	// which is strnlen-bounded to the first NUL and capped at 127.
 	maxPasswordLen = 127
 )
 
 // DeriveKey derives an AES key from a passphrase and the 4-byte GRE nonce
-// salt using PBKDF2-HMAC-SHA256 with RIST's fixed 1024-iteration count
-// (psk.c:102-119). keyBits must be 128 or 256; nonce4 must be exactly
+// salt using PBKDF2-HMAC-SHA256 with RIST's fixed 1024-iteration count.
+// keyBits must be 128 or 256; nonce4 must be exactly
 // NonceSize bytes. The returned slice has length keyBits/8.
 //
 // This is a pure function exported for unit testing against published
@@ -147,8 +144,8 @@ func DeriveKey(password, nonce4 []byte, keyBits int) ([]byte, error) {
 	}
 	// libRIST runs PBKDF2 over key->password for key->password_len bytes,
 	// where password_len is the passphrase truncated at the first NUL and
-	// capped at 127 (the fixed uint8_t password[128]; psk.h:48, psk.c:38
-	// strnlen, psk.c:327 >127 reject). Reproduce that bound so a passphrase
+	// capped at 127 (the fixed uint8_t password[128]; strnlen, >127 reject).
+	// Reproduce that bound so a passphrase
 	// with an embedded NUL, or longer than 127 bytes, derives the identical
 	// AES key libRIST would (the public Config caps Secret at 127 already, but
 	// this keeps the primitive faithful for any caller).
@@ -156,8 +153,7 @@ func DeriveKey(password, nonce4 []byte, keyBits int) ([]byte, error) {
 }
 
 // boundPassword reproduces libRIST's effective PBKDF2 passphrase: the bytes up
-// to the first NUL, then capped at maxPasswordLen (psk.c:38 strnlen, psk.c:327
-// >127 reject).
+// to the first NUL, then capped at maxPasswordLen (strnlen, >127 reject).
 func boundPassword(password []byte) []byte {
 	if i := bytes.IndexByte(password, 0); i >= 0 {
 		password = password[:i]
@@ -170,9 +166,9 @@ func boundPassword(password []byte) []byte {
 
 // BuildIV constructs the 16-byte AES-CTR initialization vector for a GRE
 // packet sequence number: the sequence number big-endian in bytes [0:4],
-// then twelve zero bytes (psk.c:227-233, copy_offset==0 for GRE version >=1).
+// then twelve zero bytes (copy_offset==0 for GRE version >=1).
 // AES-CTR increments the low bytes, so the per-packet seq in the high bytes
-// gives every packet a disjoint keystream window (gre.h:51-53).
+// gives every packet a disjoint keystream window.
 func BuildIV(seq uint32) [ivSize]byte {
 	var iv [ivSize]byte
 	binary.BigEndian.PutUint32(iv[0:4], seq)
@@ -216,8 +212,7 @@ type Key struct {
 // the correct odd/even B-bit and deriving the first AES key. keyRotation is
 // the number of packets to encrypt under one nonce before rotating; 0 selects
 // the library default of rotating only when the packet counter would exhaust.
-// odd selects which of the two passphrase keys this is (the B-bit marker,
-// psk.c:262-264).
+// odd selects which of the two passphrase keys this is (the B-bit marker).
 func NewKey(password []byte, keyBits, keyRotation int, odd bool) (*Key, error) {
 	if keyBits != KeySize128 && keyBits != KeySize256 {
 		return nil, ErrInvalidKeySize
@@ -241,14 +236,13 @@ func NewKey(password []byte, keyBits, keyRotation int, odd bool) (*Key, error) {
 }
 
 // Nonce returns the 4-byte GRE nonce currently in force. The host writes it
-// into the GRE Key/Nonce field of every packet Encrypt produces under it
-// (gre.h:42-49).
+// into the GRE Key/Nonce field of every packet Encrypt produces under it.
 func (k *Key) Nonce() [NonceSize]byte {
 	return k.nonce
 }
 
 // rekey generates a fresh non-zero nonce with the correct B-bit, derives the
-// AES cipher from it, and resets the used-times counter (psk.c:235-265,312).
+// AES cipher from it, and resets the used-times counter.
 func (k *Key) rekey() error {
 	nonce, err := generateNonce(k.odd)
 	if err != nil {
@@ -266,7 +260,7 @@ func (k *Key) rekey() error {
 
 // rotateDue reports whether the next Encrypt must rotate the nonce before
 // using it: the counter would exhaust the reuse limit, or the user's rotation
-// threshold (when positive) has been reached (psk.c:306).
+// threshold (when positive) has been reached.
 func (k *Key) rotateDue() bool {
 	if uint64(k.usedTimes)+1 > uint64(reuseLimit) {
 		return true
@@ -283,7 +277,7 @@ func (k *Key) rotateDue() bool {
 // On entry it rotates the nonce and re-derives the key if the rotation
 // threshold or reuse limit is due; the caller reads the nonce in force via
 // Nonce after the call. AES-CTR is symmetric, so this is the same XOR-stream
-// operation as Decrypt (psk.c:302-323).
+// operation as Decrypt.
 func (k *Key) Encrypt(seq uint32, dst, src []byte) ([]byte, error) {
 	if k.rotateDue() {
 		if err := k.rekey(); err != nil {
@@ -297,7 +291,7 @@ func (k *Key) Encrypt(seq uint32, dst, src []byte) ([]byte, error) {
 
 // Decryptor is the receive-side counterpart of Key: a stateful PSK decryptor
 // that re-derives the AES key whenever the inbound GRE nonce differs from the
-// one it last keyed on (psk.c:277-287). It holds no rotation policy of its
+// one it last keyed on. It holds no rotation policy of its
 // own — the sender drives rotation — and is not safe for concurrent use.
 type Decryptor struct {
 	password []byte
@@ -329,7 +323,7 @@ func NewDecryptor(password []byte, keyBits int) (*Decryptor, error) {
 
 // SetKeyBits sets the AES key size used for subsequent decryptions, forcing a
 // re-derivation if it changed. The Main receive path calls it with the size the
-// GRE H bit indicates (128 or 256; rist-common.c:2991), so a peer's configured
+// GRE H bit indicates (128 or 256), so a peer's configured
 // aes-type need not match this side's — matching libRIST, which reads the H bit
 // and keys accordingly. When the size is unchanged it is a no-op, so the warm
 // 0-alloc decrypt path is preserved. An invalid size is ignored here and
@@ -344,9 +338,9 @@ func (d *Decryptor) SetKeyBits(keyBits int) {
 
 // Decrypt decrypts len(src) payload bytes carried under the given inbound GRE
 // nonce and sequence number, appending the plaintext to dst and returning the
-// extended slice. A zero nonce is rejected with ErrZeroNonce (psk.c:271-275).
-// If the nonce differs from the one last keyed on, the AES key is re-derived
-// before decrypting (psk.c:277-287). AES-CTR is symmetric, so this is the
+// extended slice. A zero nonce is rejected with ErrZeroNonce. If the nonce
+// differs from the one last keyed on, the AES key is re-derived before
+// decrypting. AES-CTR is symmetric, so this is the
 // same XOR-stream operation as Key.Encrypt.
 func (d *Decryptor) Decrypt(nonce [NonceSize]byte, seq uint32, dst, src []byte) ([]byte, error) {
 	if isZeroNonce(nonce) {
@@ -369,7 +363,7 @@ func (d *Decryptor) Decrypt(nonce [NonceSize]byte, seq uint32, dst, src []byte) 
 		d.usedTimes = 0
 	}
 	// Defense-in-depth: refuse once the packet count under this nonce passes
-	// the reuse limit (psk.c:289-292). A conformant sender rotates its nonce —
+	// the reuse limit. A conformant sender rotates its nonce —
 	// re-deriving the key and resetting this counter — long before here.
 	if d.usedTimes > uint64(reuseLimit) {
 		return dst, ErrKeyReuseExhausted
@@ -416,8 +410,8 @@ func deriveBlock(password, nonce4 []byte, keyBits int) (cipher.Block, error) {
 // The IV is the full 16-byte big-endian counter; it is incremented by one per
 // AES block. With BuildIV placing the 32-bit packet sequence number in the
 // high four bytes and zeros below, the block counter occupies the low bytes
-// and a single packet's keystream never collides with the next packet's
-// (gre.h:51-53). This is byte-identical to crypto/cipher.NewCTR for this IV
+// and a single packet's keystream never collides with the next packet's. This
+// is byte-identical to crypto/cipher.NewCTR for this IV
 // layout, asserted directly against the stdlib stream in TestCTRMatchesStdlib
 // (and anchored to OpenSSL's aes-ctr output by the golden vectors).
 func (s *ctrState) crypt(iv [ivSize]byte, dst, src []byte) []byte {
@@ -464,9 +458,8 @@ func growSlice(buf []byte, size int) []byte {
 }
 
 // generateNonce draws a random non-zero 32-bit nonce from crypto/rand and
-// stamps the odd/even B-bit into bit 7 of nonce[0] (psk.c:235-265). A zero
-// draw is retried; persistent failure surfaces ErrCSPRNG (fail closed,
-// psk.c:236-258).
+// stamps the odd/even B-bit into bit 7 of nonce[0]. A zero
+// draw is retried; persistent failure surfaces ErrCSPRNG (fail closed).
 func generateNonce(odd bool) ([NonceSize]byte, error) {
 	var nonce [NonceSize]byte
 	for attempts := 0; attempts < 8; attempts++ {
@@ -475,9 +468,8 @@ func generateNonce(odd bool) ([NonceSize]byte, error) {
 		}
 		// Apply the B-bit before the zero check so a value that is non-zero
 		// only because of the marker bit is still rejected here, matching
-		// libRIST's order (it checks nonce_val before setting the bit;
-		// psk.c:248,262). We clear then optionally set, then test the raw
-		// four bytes.
+		// libRIST's order (it checks nonce_val before setting the bit). We
+		// clear then optionally set, then test the raw four bytes.
 		if binary.BigEndian.Uint32(nonce[:]) != 0 {
 			setBBit(&nonce, odd)
 			return nonce, nil
@@ -486,8 +478,7 @@ func generateNonce(odd bool) ([NonceSize]byte, error) {
 	return [NonceSize]byte{}, ErrCSPRNG
 }
 
-// setBBit clears bit 7 of nonce[0] and, for the odd passphrase, sets it
-// (psk.c:262-264).
+// setBBit clears bit 7 of nonce[0] and, for the odd passphrase, sets it.
 func setBBit(nonce *[NonceSize]byte, odd bool) {
 	nonce[nonceBBitByte] &^= nonceBBitMask
 	if odd {
@@ -495,7 +486,7 @@ func setBBit(nonce *[NonceSize]byte, odd bool) {
 	}
 }
 
-// isZeroNonce reports whether all four nonce bytes are zero (psk.c:272).
+// isZeroNonce reports whether all four nonce bytes are zero.
 func isZeroNonce(nonce [NonceSize]byte) bool {
 	return binary.BigEndian.Uint32(nonce[:]) == 0
 }
