@@ -387,9 +387,9 @@ func TestMainPTDemux(t *testing.T) {
 	}
 }
 
-// TestMainEncryptedNeedsDecryptor and its converse pin the configuration
-// guards: an encrypted datagram with no decryptor, and a cleartext datagram
-// with a decryptor, both error rather than mis-decode.
+// TestMainEncryptedNeedsDecryptor pins the encrypted-without-decryptor guard: an
+// encrypted (K-bit) datagram with no decryptor configured errors rather than
+// mis-decoding garbage.
 func TestMainEncryptedNeedsDecryptor(t *testing.T) {
 	const ssrc = 0x5
 	sk, _, k256 := pskPair(t, "k", crypto.KeySize128)
@@ -400,13 +400,26 @@ func TestMainEncryptedNeedsDecryptor(t *testing.T) {
 	if _, _, _, err := plainDec.decodeMain(dg, 0); err == nil {
 		t.Fatal("encrypted datagram decoded without a decryptor, want error")
 	}
+}
 
+// TestMainCleartextAcceptedWithDecryptor pins the per-packet K-bit rule: a
+// cleartext (no K-bit) datagram is decoded as cleartext even when a decryptor is
+// configured, matching libRIST, which keys per-packet on the GRE K bit
+// (CHECK_BIT(gre->flags1,5)) — the EAP-SRP use_key_as_passphrase mode sends
+// cleartext media while a decryptor for the encrypted feedback direction is
+// installed.
+func TestMainCleartextAcceptedWithDecryptor(t *testing.T) {
+	const ssrc = 0x5
 	plainEnc := newMainCodec(nil, nil, false, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, ssrc, "c", false)
 	_, rd, _ := pskPair(t, "k", crypto.KeySize128)
 	cipherDec := newMainCodec(nil, rd, false, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, ssrc, "c", false)
-	dg2, _ := plainEnc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SourceTime: mainSrcNTP(0), SSRC: ssrc, Payload: []byte{1}})
-	if _, _, _, err := cipherDec.decodeMain(dg2, 0); err == nil {
-		t.Fatal("cleartext datagram decoded with a decryptor configured, want error")
+	dg2, _ := plainEnc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SourceTime: mainSrcNTP(0), SSRC: ssrc, Payload: []byte{0xAB}})
+	isMedia, pkt, _, err := cipherDec.decodeMain(dg2, 0)
+	if err != nil || !isMedia {
+		t.Fatalf("cleartext datagram with decryptor: isMedia=%v err=%v, want cleartext media decode", isMedia, err)
+	}
+	if len(pkt.Payload) != 1 || pkt.Payload[0] != 0xAB {
+		t.Fatalf("cleartext payload mis-decoded: %x", pkt.Payload)
 	}
 }
 

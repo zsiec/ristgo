@@ -105,6 +105,8 @@ func TestParseURLErrors(t *testing.T) {
 		{"non-integer buffer", "rist://h:5000?buffer=abc"},
 		{"non-integer rtt-min", "rist://h:5000?rtt-min=fast"},
 		{"bad virt-dst-port", "rist://h:5000?virt-dst-port=99999"},
+		{"unknown parameter typo", "rist://h:5000?reoder-buffer=5"},
+		{"underscore not hyphen", "rist://h:5000?aes_type=128"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -114,6 +116,132 @@ func TestParseURLErrors(t *testing.T) {
 				t.Fatalf("error %v does not wrap ErrInvalidConfig", err)
 			}
 		})
+	}
+}
+
+// TestParseURLAcceptsUnimplementedLibristParams verifies that parameters libRIST
+// honors but ristgo does not yet implement are accepted and ignored (not
+// rejected), so a URL authored for libRIST still parses.
+func TestParseURLAcceptsUnimplementedLibristParams(t *testing.T) {
+	// recovery-priority is the lone accept-and-ignore param (set via BondedPeer).
+	raw := "rist://h:5000?buffer=1000&recovery-priority=5"
+	if _, _, err := ParseURL(raw, DefaultConfig()); err != nil {
+		t.Fatalf("ParseURL(%q) = %v, want nil (unimplemented libRIST params should be ignored)", raw, err)
+	}
+}
+
+// TestParseURLReturnBandwidth verifies return-bandwidth maps onto
+// Config.ReturnBandwidth (kbps).
+func TestParseURLReturnBandwidth(t *testing.T) {
+	_, cfg, err := ParseURL("rist://h:5000?return-bandwidth=2000", DefaultConfig())
+	if err != nil {
+		t.Fatalf("return-bandwidth: %v", err)
+	}
+	if cfg.ReturnBandwidth != 2000 {
+		t.Errorf("ReturnBandwidth = %d, want 2000", cfg.ReturnBandwidth)
+	}
+}
+
+// TestParseURLTimingMode verifies timing-mode maps libRIST's numbering
+// (0=source, 1=arrival, 2=rtc→arrival) onto Config.TimingMode and rejects an
+// out-of-range value.
+func TestParseURLTimingMode(t *testing.T) {
+	for _, tc := range []struct {
+		v    string
+		want TimingMode
+	}{
+		{"0", TimingSource},
+		{"1", TimingArrival},
+		{"2", TimingArrival}, // RTC maps to arrival
+	} {
+		_, cfg, err := ParseURL("rist://h:5000?timing-mode="+tc.v, DefaultConfig())
+		if err != nil {
+			t.Fatalf("timing-mode=%s: %v", tc.v, err)
+		}
+		if cfg.TimingMode != tc.want {
+			t.Errorf("timing-mode=%s → %v, want %v", tc.v, cfg.TimingMode, tc.want)
+		}
+	}
+	if _, _, err := ParseURL("rist://h:5000?timing-mode=9", DefaultConfig()); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("timing-mode=9 error = %v, want ErrInvalidConfig", err)
+	}
+}
+
+// TestParseURLSRPCompat verifies srp-compat=1 sets Config.SRPCompat.
+func TestParseURLSRPCompat(t *testing.T) {
+	_, cfg, err := ParseURL("rist://h:5000?srp-compat=1", DefaultConfig())
+	if err != nil {
+		t.Fatalf("srp-compat=1: %v", err)
+	}
+	if !cfg.SRPCompat {
+		t.Error("srp-compat=1 did not set Config.SRPCompat")
+	}
+	if _, cfg, _ := ParseURL("rist://h:5000?srp-compat=0", DefaultConfig()); cfg.SRPCompat {
+		t.Error("srp-compat=0 set Config.SRPCompat")
+	}
+}
+
+// TestParseURLCongestionControl verifies congestion-control maps libRIST's
+// numbering (0=off, 1=normal, 2=aggressive) onto Config.CongestionControl, and
+// rejects an out-of-range value.
+func TestParseURLCongestionControl(t *testing.T) {
+	for _, tc := range []struct {
+		v    string
+		want CongestionControl
+	}{
+		{"0", CongestionOff},
+		{"1", CongestionNormal},
+		{"2", CongestionAggressive},
+	} {
+		raw := "rist://h:5000?congestion-control=" + tc.v
+		_, cfg, err := ParseURL(raw, DefaultConfig())
+		if err != nil {
+			t.Fatalf("ParseURL(%q) = %v, want nil", raw, err)
+		}
+		if cfg.CongestionControl != tc.want {
+			t.Errorf("congestion-control=%s → %v, want %v", tc.v, cfg.CongestionControl, tc.want)
+		}
+	}
+	for _, raw := range []string{"rist://h:5000?congestion-control=3", "rist://h:5000?congestion-control=x"} {
+		if _, _, err := ParseURL(raw, DefaultConfig()); err == nil {
+			t.Errorf("ParseURL(%q) = nil error, want error", raw)
+		} else if !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("ParseURL(%q) error %v does not wrap ErrInvalidConfig", raw, err)
+		}
+	}
+}
+
+// TestParseURLMulticastParams verifies the multicast query parameters miface,
+// ttl, and source map onto Config.Interface, MulticastTTL, and MulticastSource.
+func TestParseURLMulticastParams(t *testing.T) {
+	raw := "rist://239.1.2.3:5000?miface=eth0&ttl=32&source=10.0.0.1"
+	_, cfg, err := ParseURL(raw, DefaultConfig())
+	if err != nil {
+		t.Fatalf("ParseURL(%q) = %v, want nil", raw, err)
+	}
+	if cfg.Interface != "eth0" {
+		t.Errorf("Interface = %q, want eth0", cfg.Interface)
+	}
+	if cfg.MulticastTTL != 32 {
+		t.Errorf("MulticastTTL = %d, want 32", cfg.MulticastTTL)
+	}
+	if cfg.MulticastSource != "10.0.0.1" {
+		t.Errorf("MulticastSource = %q, want 10.0.0.1", cfg.MulticastSource)
+	}
+}
+
+// TestParseURLBadTTL verifies an out-of-range or non-integer ttl is rejected.
+func TestParseURLBadTTL(t *testing.T) {
+	for _, raw := range []string{
+		"rist://239.1.2.3:5000?ttl=256",
+		"rist://239.1.2.3:5000?ttl=-1",
+		"rist://239.1.2.3:5000?ttl=high",
+	} {
+		if _, _, err := ParseURL(raw, DefaultConfig()); err == nil {
+			t.Errorf("ParseURL(%q) = nil error, want error", raw)
+		} else if !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("ParseURL(%q) error %v does not wrap ErrInvalidConfig", raw, err)
+		}
 	}
 }
 

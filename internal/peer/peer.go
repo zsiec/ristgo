@@ -8,18 +8,20 @@
 package peer
 
 import (
-	"net"
+	"net/netip"
 
 	"github.com/zsiec/ristgo/internal/clock"
 )
 
-// Peer is a remote endpoint's addressing and liveness state.
+// Peer is a remote endpoint's addressing and liveness state. Addresses are
+// netip.AddrPort values (not *net.UDPAddr) so the per-datagram receive path is
+// allocation-free; the zero AddrPort (!IsValid()) means "not yet known".
 type Peer struct {
 	// Media is where this side sends RTP (the receiver learns it from the
 	// source of inbound RTP; the sender is configured with it).
-	Media *net.UDPAddr
+	Media netip.AddrPort
 	// RTCP is where this side sends compound RTCP (NACKs, reports, echoes).
-	RTCP *net.UDPAddr
+	RTCP netip.AddrPort
 
 	timeout  clock.Microseconds
 	lastSeen clock.Timestamp
@@ -33,8 +35,8 @@ func New(timeout clock.Microseconds) *Peer {
 }
 
 // LearnMedia records the peer's media return address if not already known.
-func (p *Peer) LearnMedia(addr *net.UDPAddr) {
-	if p.Media == nil {
+func (p *Peer) LearnMedia(addr netip.AddrPort) {
+	if !p.Media.IsValid() {
 		p.Media = addr
 	}
 }
@@ -47,11 +49,15 @@ func (p *Peer) LearnMedia(addr *net.UDPAddr) {
 // receiver's NACK/RR feedback to a victim address — a low-factor reflection
 // vector. Until media is known there is nothing to validate against, so
 // first-source-wins applies (as it must, the session is still forming).
-func (p *Peer) LearnRTCP(addr *net.UDPAddr) {
-	if p.RTCP != nil {
+//
+// IPs are compared unmapped so an IPv4 source seen as 4-in-6 on a dual-stack
+// socket still matches its plain-IPv4 form (the net.IP.Equal semantics this
+// replaced).
+func (p *Peer) LearnRTCP(addr netip.AddrPort) {
+	if p.RTCP.IsValid() {
 		return
 	}
-	if p.Media != nil && addr != nil && !p.Media.IP.Equal(addr.IP) {
+	if p.Media.IsValid() && addr.IsValid() && p.Media.Addr().Unmap() != addr.Addr().Unmap() {
 		return // RTCP source on a different host than media: reject as a spoof
 	}
 	p.RTCP = addr

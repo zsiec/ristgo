@@ -3,23 +3,29 @@ package ristgo
 import (
 	"fmt"
 	"net"
-	"strconv"
+	"net/netip"
 	"time"
 
 	"github.com/zsiec/ristgo/internal/session"
-	"github.com/zsiec/ristgo/internal/socket"
 )
 
 // MaxMediaPayload is the largest payload a single Write may submit. The Simple
 // profile sends one RTP packet per Write with no fragmentation, so the payload
 // plus the 12-byte RTP header and the UDP/IPv4 headers must fit a standard
 // 1500-byte MTU without IP fragmentation: 1500 − 20 (IP) − 8 (UDP) − 12 (RTP)
-// = 1460. The Main profile adds ~12–16 bytes of GRE + reduced-overhead framing
-// (plus the nonce when encrypted), so a Main payload at this limit is
-// IP-fragmented on a strict-MTU path — Main callers should chunk smaller.
-// Callers chunk larger media before Write anyway (the example sender uses 1316,
-// a 7-cell MPEG-TS payload, which is safe for both profiles).
+// = 1460. This is an UPPER bound (the Simple-profile ceiling), not a portable
+// one: the Main profile adds ~12–16 bytes of GRE + reduced-overhead framing
+// (plus the nonce when encrypted), and DTLS adds ~37 bytes (record header,
+// explicit nonce, GCM tag), so a payload at this limit is IP-fragmented on a
+// strict-MTU path. For a payload size safe on EVERY profile (Simple, Main,
+// Advanced, and Main+DTLS), keep each Write at or below SafeMediaPayload.
 const MaxMediaPayload = 1460
+
+// SafeMediaPayload is the largest payload that fits without IP fragmentation on
+// any profile, including Main+DTLS, on a standard 1500-byte MTU path. It is the
+// 7-cell MPEG-TS payload (7 × 188) the example sender uses; callers that chunk
+// to this size never fragment regardless of profile or encryption.
+const SafeMediaPayload = 1316
 
 // Sender transmits media to a RIST receiver. It is an io.WriteCloser: each
 // Write submits one media payload (e.g. a batch of MPEG-TS packets), which the
@@ -29,7 +35,7 @@ const MaxMediaPayload = 1460
 // multiple goroutines at once.
 type Sender struct {
 	sess    *session.Session
-	remote  *net.UDPAddr
+	remote  netip.AddrPort
 	ctxStop func() // ends the context watcher (set by Dial); nil for New* constructors
 }
 
@@ -67,16 +73,20 @@ func newSimpleSender(addr string, cfg Config) (*Sender, error) {
 	if err != nil {
 		return nil, err
 	}
-	mediaAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	mediaAddr, err := resolveAddrPort(host, port)
 	if err != nil {
-		return nil, fmt.Errorf("%w: resolve media address: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: resolve media address: %w", ErrInvalidConfig, err)
 	}
-	rtcpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port+1)))
+	rtcpAddr, err := resolveAddrPort(host, port+1)
 	if err != nil {
-		return nil, fmt.Errorf("%w: resolve rtcp address: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: resolve rtcp address: %w", ErrInvalidConfig, err)
 	}
-	conn, err := socket.ListenEphemeral("")
+	conn, err := openSenderConn(false, mediaAddr.Addr())
 	if err != nil {
+		return nil, err
+	}
+	if err := setSenderMulticast(conn, cfg, mediaAddr.Addr()); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	ssrc := randomEvenSSRC()
@@ -96,9 +106,9 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 	if err != nil {
 		return nil, err
 	}
-	remote, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	remote, err := resolveAddrPort(host, port)
 	if err != nil {
-		return nil, fmt.Errorf("%w: resolve address: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: resolve address: %w", ErrInvalidConfig, err)
 	}
 	mp, err := buildMainParams(cfg)
 	if err != nil {
@@ -107,8 +117,12 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 	if mp.EAPClient, err = buildEAPClient(cfg); err != nil {
 		return nil, err
 	}
-	conn, err := socket.ListenEphemeralSingle("")
+	conn, err := openSenderConn(true, remote.Addr())
 	if err != nil {
+		return nil, err
+	}
+	if err := setSenderMulticast(conn, cfg, remote.Addr()); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	if cfg.DTLS != nil {
@@ -117,7 +131,7 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 			conn.Close()
 			return nil, err
 		}
-		conn.EnableDTLSClient(remote, dcfg)
+		conn.EnableDTLSClient(net.UDPAddrFromAddrPort(remote), dcfg)
 	}
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
@@ -138,16 +152,20 @@ func newAdvSender(addr string, cfg Config) (*Sender, error) {
 	if err != nil {
 		return nil, err
 	}
-	remote, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	remote, err := resolveAddrPort(host, port)
 	if err != nil {
-		return nil, fmt.Errorf("%w: resolve address: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: resolve address: %w", ErrInvalidConfig, err)
 	}
 	ap, err := buildAdvParams(cfg)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := socket.ListenEphemeralSingle("")
+	conn, err := openSenderConn(true, remote.Addr())
 	if err != nil {
+		return nil, err
+	}
+	if err := setSenderMulticast(conn, cfg, remote.Addr()); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	ssrc := randomEvenSSRC()
@@ -168,6 +186,11 @@ func newAdvSender(addr string, cfg Config) (*Sender, error) {
 // back-pressure; it does not wait for delivery (RIST is best-effort with ARQ
 // recovery). After Close it returns ErrClosed.
 func (s *Sender) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		// Conventional io.Writer no-op: a zero-length Write transmits nothing
+		// rather than emitting an empty media packet on the wire.
+		return 0, nil
+	}
 	if len(p) > MaxMediaPayload {
 		return 0, fmt.Errorf("rist: payload %d bytes exceeds MaxMediaPayload %d; chunk media before Write", len(p), MaxMediaPayload)
 	}
@@ -211,7 +234,7 @@ func (s *Sender) Stats() Stats { return toStats(s.sess.Stats()) }
 func (s *Sender) Authenticated() bool { return s.sess.Authenticated() }
 
 // RemoteAddr returns the receiver's media address.
-func (s *Sender) RemoteAddr() net.Addr { return s.remote }
+func (s *Sender) RemoteAddr() net.Addr { return net.UDPAddrFromAddrPort(s.remote) }
 
 // Close stops the sender and releases its sockets and goroutines.
 func (s *Sender) Close() error {

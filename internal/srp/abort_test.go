@@ -1,9 +1,34 @@
 package srp
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 )
+
+// TestVerifierMultipleOfNRejected documents and guards the intentional srp-2
+// divergence from libRIST: libRIST rejects only the raw verifier v == 0, but
+// ristgo applies the stricter v mod N == 0, so a verifier supplied as a nonzero
+// multiple of N (here N itself and 2N) — which is just as degenerate, reducing
+// to 0 in the group and stripping the password binding from B — is rejected too.
+// This is a safe superset of libRIST's check; a legitimate verifier in [1, N)
+// is never a multiple of N and so is unaffected.
+func TestVerifierMultipleOfNRejected(t *testing.T) {
+	g := DefaultGroup()
+	salt := []byte{0x01}
+	for _, mult := range []int64{1, 2} {
+		v := new(big.Int).Mul(g.N, big.NewInt(mult)) // mult*N ≡ 0 mod N
+		if _, err := NewServer(g, v.Bytes(), salt); !errors.Is(err, ErrInvalidVerifier) {
+			t.Fatalf("NewServer with v=%d*N: err=%v, want ErrInvalidVerifier", mult, err)
+		}
+	}
+	// A legitimate verifier (some value in [1, N)) is accepted, confirming the
+	// stricter check does not over-reject.
+	good := MakeVerifier(g, "rist", "mainprofile", salt)
+	if _, err := NewServer(g, good, salt); err != nil {
+		t.Fatalf("NewServer with a legitimate verifier: %v", err)
+	}
+}
 
 // TestServerUZeroAbort drives the u==0 safety abort on the server side.
 // u = H(PAD(A)|PAD(B)) cannot be forced to zero through the

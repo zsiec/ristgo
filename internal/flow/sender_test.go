@@ -208,6 +208,89 @@ func TestServiceNackMaxRetriesExhausted(t *testing.T) {
 	}
 }
 
+// TestServiceNackBandwidthBeforeExhausted verifies the dequeue-gate order: a
+// sequence that is BOTH over the recovery_maxbitrate ceiling AND past MaxRetries
+// is attributed to BandwidthSkipped, not RetransmitExhausted — matching libRIST
+// rist_retry_dequeue, which checks bandwidth_skip before the transmit_count >=
+// max_retries cap. Behaviorally both refuse to re-send; only the stat differs.
+func TestServiceNackBandwidthBeforeExhausted(t *testing.T) {
+	cfg := senderConfig()
+	cfg.MaxRetries = 1
+	cfg.CongestionControl = CongestionNormal
+	cfg.RecoveryMaxBitrate = 1000 // 1000 kbps -> 1_000_000 bps budget
+	f := New(RoleSender, cfg)
+	f.PushApp(10_000, []byte("a")) // seq 100
+	drainOutputs(f)
+
+	// Retransmit #1 (spaced beyond the 5ms gate, under budget) -> transmitCount 1.
+	f.FeedFeedback(20_000, wire.NackRequest{Missing: []uint32{100}})
+	if ms := mediaOutputs(drainOutputs(f)); len(ms) != 1 {
+		t.Fatalf("first retransmit missing")
+	}
+	if sl := &f.sender.ring[100&f.sender.mask]; sl.transmitCount != 1 {
+		t.Fatalf("transmitCount = %d, want 1 (== MaxRetries)", sl.transmitCount)
+	}
+
+	// Force the data-rate EWMA over budget (slowBps = eightTimesSlow/8). The
+	// re-NACK at +80ms keeps the slow window from expiring, so feed(now,0) does
+	// not decay it.
+	f.sender.dataBW.eightTimesSlow = 8 * 2_000_000 // slowBps = 2_000_000 > budget
+
+	// Re-NACK: transmitCount(1) >= MaxRetries(1) AND over budget. The bandwidth
+	// gate is evaluated first -> BandwidthSkipped, not RetransmitExhausted.
+	f.FeedFeedback(100_000, wire.NackRequest{Missing: []uint32{100}})
+	if ms := mediaOutputs(drainOutputs(f)); len(ms) != 0 {
+		t.Fatalf("over-budget retransmit emitted: %v", ms)
+	}
+	if st := f.Stats(); st.BandwidthSkipped != 1 || st.RetransmitExhausted != 0 {
+		t.Fatalf("bandwidthSkipped/exhausted = %d/%d, want 1/0 (bandwidth attributed before exhaustion)",
+			st.BandwidthSkipped, st.RetransmitExhausted)
+	}
+}
+
+// TestServiceNackAggressiveDoublesRTTSpacing verifies the AGGRESSIVE congestion
+// mode suppresses retransmits within 2*RTT, where NORMAL suppresses only within
+// 1*RTT (libRIST rist_retry_enqueue doubles the spacing under AGGRESSIVE). The
+// same +7.5ms re-NACK (1.5 * cold-start RTT of 5ms) is suppressed under
+// AGGRESSIVE but sent under NORMAL.
+func TestServiceNackAggressiveDoublesRTTSpacing(t *testing.T) {
+	tests := []struct {
+		name         string
+		mode         CongestionMode
+		wantSecondTx int    // media packets emitted by the second NACK
+		wantSuppress uint64 // RetransmitSuppressed after the second NACK
+	}{
+		{"normal sends at 1.5*RTT", CongestionNormal, 1, 0},
+		{"aggressive suppresses at 1.5*RTT", CongestionAggressive, 0, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := senderConfig()
+			cfg.CongestionControl = tt.mode
+			f := New(RoleSender, cfg)
+			f.PushApp(10_000, []byte("a")) // seq 100
+			drainOutputs(f)
+			// Cold-start clamped RTT = RTTMin = 5ms.
+
+			// Retransmit #1 at t=20ms sets lastRetry.
+			f.FeedFeedback(20_000, wire.NackRequest{Missing: []uint32{100}})
+			if ms := mediaOutputs(drainOutputs(f)); len(ms) != 1 {
+				t.Fatalf("first retransmit missing")
+			}
+
+			// Re-NACK 7.5ms later (1.5*RTT): inside the 2*RTT(10ms) AGGRESSIVE
+			// window but outside the 1*RTT(5ms) NORMAL window.
+			f.FeedFeedback(27_500, wire.NackRequest{Missing: []uint32{100}})
+			if ms := mediaOutputs(drainOutputs(f)); len(ms) != tt.wantSecondTx {
+				t.Fatalf("second NACK emitted %d media, want %d", len(ms), tt.wantSecondTx)
+			}
+			if got := f.Stats().RetransmitSuppressed; got != tt.wantSuppress {
+				t.Fatalf("RetransmitSuppressed = %d, want %d", got, tt.wantSuppress)
+			}
+		})
+	}
+}
+
 func TestServiceNackAgedOutAfterWrap(t *testing.T) {
 	cfg := senderConfig()
 	cfg.RingSize = 16 // tiny ring so a later seq overwrites an old slot

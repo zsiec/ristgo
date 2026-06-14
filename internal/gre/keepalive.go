@@ -35,8 +35,18 @@ const (
 )
 
 // Advanced-profile extended-capability bit positions in the first octet of
-// the optional 4-byte extended block (TR-06-3 §5.3.6),
-// in C bit numbering.
+// the optional 4-byte extended block, in C bit numbering (bit 7 is the MSB).
+//
+// These three flags are defined by TR-06-3 §5.3.6 (I = Advanced Profile
+// capable, G = key rotation, C = compression), but the layout encoded here is
+// libRIST's de-facto keepalive encoding, not the one Figure 12 of §5.3.6 draws.
+// Figure 12 places I/G/C inside the second capability octet of the keepalive
+// body (no separate extended block) and labels them as the low overall bits
+// 31/30/29 of a 32-bit capabilities word. libRIST instead appends a third
+// octet after the two capability octets and sets I=0x80 (bit 7), G=0x40
+// (bit 6), C=0x20 (bit 5) there. The interop-correct wire is libRIST's, so the
+// constants below match it: I at bit 7, G at bit 6, C at bit 5 of the
+// extended block's first octet.
 const (
 	advI = 7 // Advanced Profile capable.
 	advG = 6 // GRE key rotation capable.
@@ -117,6 +127,9 @@ func decodeCapabilities(c1, c2 byte) Capabilities {
 
 // AdvExtCaps holds the optional Advanced-profile extended capability bits
 // carried in the first octet of the 4-byte block after the keep-alive body.
+// The bit positions follow libRIST's de-facto keepalive encoding (a third
+// octet appended after the two capability octets with I/G/C at bits 7/6/5),
+// not the in-body bit layout drawn in TR-06-3 §5.3.6 Figure 12.
 type AdvExtCaps struct {
 	I bool // Advanced Profile capable (byte 8 bit 7).
 	G bool // GRE key rotation capable (byte 8 bit 6).

@@ -198,11 +198,24 @@ func (p BitmaskNACK) MissingSeqs() []uint32 {
 // AppendMissingSeqs appends the expanded sequence list to dst and returns
 // the extended slice, allocating only if dst lacks capacity.
 func (p BitmaskNACK) AppendMissingSeqs(dst []uint32) []uint32 {
+	// The amplification guard is enforced per appended sequence, not per FCI:
+	// a single FCI expands to up to 17 seqs (PID + 16 BLP bits), so checking
+	// only between FCIs could overshoot maxNackExpand by up to 16. Stopping
+	// exactly at the cap mid-FCI keeps the expansion bounded. See maxNackExpand.
 	for _, f := range p.FCIs {
 		if len(dst) >= maxNackExpand {
-			return dst // amplification guard; see maxNackExpand
+			return dst
 		}
-		dst = f.AppendSeqs(dst)
+		dst = append(dst, uint32(f.PID))
+		for i := uint16(0); i < 16; i++ {
+			if f.BLP&(1<<i) == 0 {
+				continue
+			}
+			if len(dst) >= maxNackExpand {
+				return dst
+			}
+			dst = append(dst, uint32(f.PID+i+1)) // uint16 wrap
+		}
 	}
 	return dst
 }

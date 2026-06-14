@@ -83,6 +83,14 @@ func (c *Conn) clientHandshake() error {
 	c.cipherSuite = sh.cipherSuite
 	serverRandom := sh.random
 	useEMS := sh.extMasterSecret
+	// Downgrade guard (RFC 7627): the client always offers extended_master_secret,
+	// so a ServerHello that omits it means either a non-EMS peer or an attacker who
+	// stripped the extension to force the weaker legacy derivation. When the caller
+	// requires EMS, refuse to continue rather than silently fall back.
+	if cfg.RequireExtendedMasterSecret && !useEMS {
+		c.sendAlert(alertHandshakeFailure)
+		return errors.New("rist: dtls: server omitted extended_master_secret but it is required")
+	}
 	isECDHE := c.cipherSuite == tlsECDHEECDSAWithAES128GCMSHA256
 	isPSK := c.cipherSuite == tlsPSKWithAES128GCMSHA256
 	if !isECDHE && !isPSK {
@@ -111,7 +119,7 @@ func (c *Conn) clientHandshake() error {
 			if err != nil {
 				return err
 			}
-			leaf, err := verifyPeerCertificate(cert.chain, cfg)
+			leaf, err := verifyPeerCertificate(cert.chain, cfg, verifyingServerCert)
 			if err != nil {
 				c.sendAlert(alertBadCertificate)
 				return err
@@ -208,6 +216,12 @@ func (c *Conn) clientHandshake() error {
 	}
 	if !c.peerCCS {
 		return errors.New("rist: dtls: server Finished without ChangeCipherSpec")
+	}
+	// A Finished MUST be epoch-1 protected (RFC 5246 §7.4.9 / RFC 6347); reject one
+	// reassembled from epoch-0 plaintext (L8).
+	if srvFin.epoch != 1 {
+		c.sendAlert(alertDecryptError)
+		return errors.New("rist: dtls: server Finished arrived unprotected (epoch 0)")
 	}
 	if !hmac.Equal(expectedServerVerify, srvFin.body) {
 		c.sendAlert(alertDecryptError)

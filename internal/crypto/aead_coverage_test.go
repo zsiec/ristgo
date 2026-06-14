@@ -176,25 +176,65 @@ func TestChaChaRequires256(t *testing.T) {
 
 // TestInterpretedAEADNonce documents and ASSERTS the interpreted 12-byte AEAD
 // nonce construction (interop-unvalidated; pending a reference or the full
-// TR-06-3 §5.2.5 detail): nonce = [IV field (4 B, big-endian) | 8 zero bytes],
-// mirroring crypto.BuildIV's 16-byte AES-CTR IV truncated to 12 bytes. If the
-// construction is ever changed, this guard must change with it — by design, so
-// the interpretation cannot drift silently.
+// TR-06-3 §5.2.5 detail): nonce = [PSK Nonce (4 B) | IV field (4 B, big-endian)
+// | 4 zero bytes]. The PSK Nonce is folded in so each key epoch is structurally
+// distinct in the nonce, not only in the derived key. If the construction is
+// ever changed, this guard must change with it — by design, so the
+// interpretation cannot drift silently.
 func TestInterpretedAEADNonce(t *testing.T) {
+	nonce4 := [NonceSize]byte{0xDE, 0xAD, 0xBE, 0xEF}
 	for _, iv4 := range []uint32{0, 1, 0x01020304, 0xFFFFFFFF} {
-		got := aeadNonce(iv4)
+		got := aeadNonce(nonce4, iv4)
 		var want [aeadNonceSize]byte
-		binary.BigEndian.PutUint32(want[0:4], iv4)
-		// bytes [4:12] are zero by construction.
+		copy(want[0:NonceSize], nonce4[:])
+		binary.BigEndian.PutUint32(want[NonceSize:NonceSize+4], iv4)
+		// bytes [8:12] are zero by construction.
 		if got != want {
-			t.Fatalf("aeadNonce(%#x) = %x, want %x (IV-field|8 zeros)", iv4, got, want)
+			t.Fatalf("aeadNonce(%x, %#x) = %x, want %x (PSK-nonce|IV-field|4 zeros)", nonce4, iv4, got, want)
 		}
-		// The first 12 bytes of BuildIV must equal the AEAD nonce: same layout,
-		// one truncated from the other.
-		full := BuildIV(iv4)
-		if !bytes.Equal(got[:], full[:aeadNonceSize]) {
-			t.Fatalf("aeadNonce(%#x) != BuildIV[:12]:\n got  %x\n want %x", iv4, got[:], full[:aeadNonceSize])
+		// A different PSK Nonce must yield a different AEAD nonce for the same IV
+		// field — the structural epoch separation this construction provides.
+		other := aeadNonce([NonceSize]byte{0x01, 0x02, 0x03, 0x04}, iv4)
+		if other == got {
+			t.Fatalf("aeadNonce collided across PSK nonces for iv4=%#x", iv4)
 		}
+	}
+}
+
+// TestAdvancedSealerIVExhaustion verifies the safe-by-construction send path:
+// AdvancedSealer hands out monotonically increasing IV fields, round-trips
+// through OpenAdvanced, and refuses (ErrIVExhausted) rather than wrap the IV
+// field within one PSK Nonce — driving it to the 0xFFFFFFFF boundary asserts
+// the rotation signal instead of a silent nonce reuse.
+func TestAdvancedSealerIVExhaustion(t *testing.T) {
+	password := []byte("sealer-pw")
+	nonce4 := [NonceSize]byte{0x11, 0x22, 0x33, 0x44}
+	aad := []byte("hdr")
+	pt := []byte("payload")
+
+	// Normal monotonic issuance + round-trip.
+	s := NewAdvancedSealer(PSKModeAESGCM, password, KeySize256, nonce4, 0)
+	for want := uint32(0); want < 4; want++ {
+		ct, hash, iv4, err := s.Seal(aad, pt)
+		if err != nil {
+			t.Fatalf("Seal #%d: %v", want, err)
+		}
+		if iv4 != want {
+			t.Fatalf("Seal #%d issued iv4=%d, want %d", want, iv4, want)
+		}
+		got, oerr := OpenAdvanced(PSKModeAESGCM, password, KeySize256, nonce4, iv4, aad, ct, hash)
+		if oerr != nil || !bytes.Equal(got, pt) {
+			t.Fatalf("OpenAdvanced(iv4=%d): %v, plaintext match=%v", iv4, oerr, bytes.Equal(got, pt))
+		}
+	}
+
+	// At the IV-field maximum: one final Seal succeeds, then the sealer refuses.
+	last := NewAdvancedSealer(PSKModeAESGCM, password, KeySize256, nonce4, ^uint32(0))
+	if _, _, iv4, err := last.Seal(aad, pt); err != nil || iv4 != ^uint32(0) {
+		t.Fatalf("Seal at max IV: iv4=%#x err=%v, want iv4=0xFFFFFFFF, no error", iv4, err)
+	}
+	if _, _, _, err := last.Seal(aad, pt); !errors.Is(err, ErrIVExhausted) {
+		t.Fatalf("Seal past max IV: err=%v, want ErrIVExhausted", err)
 	}
 }
 

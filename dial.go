@@ -64,8 +64,8 @@ func WithBuffer(d time.Duration) Option {
 }
 
 // WithBufferRange sets the minimum and maximum recovery buffer lengths.
-func WithBufferRange(min, max time.Duration) Option {
-	return func(c *Config) { c.BufferMin, c.BufferMax = min, max }
+func WithBufferRange(lo, hi time.Duration) Option {
+	return func(c *Config) { c.BufferMin, c.BufferMax = lo, hi }
 }
 
 // WithReorderBuffer sets how long the receiver holds out-of-order packets before
@@ -76,13 +76,13 @@ func WithReorderBuffer(d time.Duration) Option { return func(c *Config) { c.Reor
 func WithNACKType(t NACKType) Option { return func(c *Config) { c.NACKType = t } }
 
 // WithRTT sets the lower and upper clamps applied to the measured round-trip time.
-func WithRTT(min, max time.Duration) Option {
-	return func(c *Config) { c.RTTMin, c.RTTMax = min, max }
+func WithRTT(lo, hi time.Duration) Option {
+	return func(c *Config) { c.RTTMin, c.RTTMax = lo, hi }
 }
 
 // WithRetries sets the minimum and maximum retransmission attempts per packet.
-func WithRetries(min, max int) Option {
-	return func(c *Config) { c.MinRetries, c.MaxRetries = min, max }
+func WithRetries(lo, hi int) Option {
+	return func(c *Config) { c.MinRetries, c.MaxRetries = lo, hi }
 }
 
 // WithKeepalive sets the keepalive transmission interval.

@@ -49,22 +49,26 @@ interop:
 	$(GO) test -tags interop -run TestInterop -v -count=1 -timeout 300s ./...
 
 # check-deps: the module dependency graph may contain only this module,
-# golang.org/x/crypto, and the Go standard library. (PLAN.md: deps rule.)
-# golang.org/x/sys is allowed solely as a transitive dependency of x/crypto:
-# x/crypto/chacha20poly1305 -> chacha20 imports x/sys/cpu for CPU-feature
-# detection on amd64 (it does not appear on arm64). It is not a dependency we
-# choose directly, and stays within the x/crypto family.
+# golang.org/x/crypto, golang.org/x/net, and the Go standard library.
+# (PLAN.md: deps rule.) golang.org/x/net is a direct dependency, used for IP
+# multicast (group membership, multicast TTL, interface selection) — options
+# the standard library's *net.UDPConn does not expose. golang.org/x/sys (and
+# golang.org/x/text, were it ever pulled) are allowed solely as transitive
+# dependencies of the x/crypto and x/net families: x/crypto/chacha20 imports
+# x/sys/cpu for CPU-feature detection on amd64, and x/net/ipv4|ipv6 import
+# x/sys for the platform socket-option syscalls. They are not dependencies we
+# choose directly and stay within the Go-team x/ families.
 check-deps:
 	@out=$$($(GO) list -deps -f '{{if and (not .Standard) .Module}}{{.Module.Path}}{{end}}' ./... 2>/dev/null) \
 		|| { echo "check-deps: FAIL — go list -deps ./... failed"; exit 1; }; \
 	bad=$$(printf '%s\n' "$$out" | grep . | sort -u \
-		| grep -v -x -e '$(MODULE)' -e 'golang.org/x/crypto' -e 'golang.org/x/sys' || true); \
+		| grep -v -x -e '$(MODULE)' -e 'golang.org/x/crypto' -e 'golang.org/x/net' -e 'golang.org/x/sys' -e 'golang.org/x/text' || true); \
 	if [ -n "$$bad" ]; then \
 		echo "check-deps: FAIL — forbidden module dependencies:"; \
 		echo "$$bad"; \
 		exit 1; \
 	fi; \
-	echo "check-deps: OK (std + $(MODULE) + golang.org/x/crypto [+ x/sys via x/crypto] only)"
+	echo "check-deps: OK (std + $(MODULE) + golang.org/x/crypto + golang.org/x/net [+ x/sys, x/text transitively] only)"
 
 # check-flow-imports: the deterministic core internal/flow may depend only on
 # internal/{seq,clock,rtt,wire} and the standard library. (PLAN.md: hard

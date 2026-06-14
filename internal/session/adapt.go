@@ -32,15 +32,24 @@ import (
 // set, and a sender adapts only when a RateController and OnRateAdapt callback
 // are configured — so default sessions are byte-for-byte unchanged.
 
-// observeRxBytes accumulates received media bytes for the LQM's measured data
-// bandwidth. The host calls it as each media datagram arrives.
-func (s *Session) observeRxBytes(n int) { s.rxBytes += uint64(n) }
+// lqmKbps converts a per-period byte count into kilobits per second, rounded to
+// the nearest kbps (the previous floor-truncation under-reported every period).
+// bits/ms == kbit/s, so the value is bytes*8/periodMS with round-to-nearest.
+func lqmKbps(deltaBytes uint64, periodMS uint32) uint32 {
+	if periodMS == 0 {
+		return 0
+	}
+	bits := deltaBytes * 8
+	p := uint64(periodMS)
+	return uint32((bits + p/2) / p)
+}
 
 // computeLQM builds the Link Quality Message for the reporting period that ends
 // at now, from the deltas in the flow's counters since the previous report. The
-// loss-related fields are exact; the data-bandwidth field is derived from the
-// bytes received this period (NPD makes it uncomputable from packet counts, per
-// the spec, so it is measured directly).
+// loss-related fields are exact; the bandwidth fields are derived from the
+// RTP-level bytes metered this period (NPD makes them uncomputable from packet
+// counts, per the spec, so they are measured directly in observeRx). Source and
+// retransmission bandwidth are reported separately (TR-06-4 Part 1 §5.1).
 func (s *Session) computeLQM(now clock.Timestamp) adapt.LQM {
 	st := s.flow.Stats()
 	prev := s.lqmPrev
@@ -52,11 +61,9 @@ func (s *Session) computeLQM(now clock.Timestamp) adapt.LQM {
 	bytes := s.rxBytes
 	prevBytes := s.lqmPrevBytes
 	s.lqmPrevBytes = bytes
-	var dataKbps uint32
-	if periodMS > 0 {
-		// bits / ms == kbits/sec.
-		dataKbps = uint32((bytes - prevBytes) * 8 / uint64(periodMS))
-	}
+	retransBytes := s.rxRetransBytes
+	prevRetrans := s.lqmPrevRetransBytes
+	s.lqmPrevRetransBytes = retransBytes
 
 	s.lqmSeq++
 	return adapt.LQM{
@@ -65,36 +72,80 @@ func (s *Session) computeLQM(now clock.Timestamp) adapt.LQM {
 		NACKWindowMS:      uint32(int64(s.cfg.Flow.RecoveryBuffer()) / int64(clock.Millisecond)),
 		SourceReceived:    uint32(st.Received - prev.Received),
 		OriginalLost:      uint32(st.Missing - prev.Missing),
-		// ristgo does not separately count retransmitted packets received; the
-		// recovered count is the closest available proxy (retransmits that filled
-		// a gap), which is what the sender's controller does not depend on.
-		RetransmittedReceived:       uint32(st.Recovered - prev.Recovered),
-		Recovered:                   uint32(st.Recovered - prev.Recovered),
-		Unrecovered:                 uint32(st.Lost - prev.Lost),
-		Late:                        uint32(st.TooLate - prev.TooLate),
-		DataBandwidthKbps:           dataKbps,
-		RetransmissionBandwidthKbps: 0,
+		// RetransmittedReceived counts all retransmits actually received this
+		// period (the flow's dedicated counter, distinct from Recovered, which
+		// counts gaps filled by ARQ). TR-06-4 §5.1 treats these as two fields.
+		RetransmittedReceived: uint32(st.RetransmittedReceived - prev.RetransmittedReceived),
+		Recovered:             uint32(st.Recovered - prev.Recovered),
+		Unrecovered:           uint32(st.Lost - prev.Lost),
+		// Late counts original packets that arrived too late, excluding
+		// retransmitted packets received late (§5.1): subtract the too-late
+		// retransmits the flow tracks separately from the total too-late count.
+		Late:                        uint32((st.TooLate - st.TooLateRetransmit) - (prev.TooLate - prev.TooLateRetransmit)),
+		DataBandwidthKbps:           lqmKbps(bytes-prevBytes, periodMS),
+		RetransmissionBandwidthKbps: lqmKbps(retransBytes-prevRetrans, periodMS),
 	}
 }
 
 // sendLQM emits one Link Quality Message to the sender for the period ending at
 // now, encoded in the active profile's encapsulation (see the file comment).
-// Receiver role only; a no-op until the sender's return address is learned.
+// Receiver role only; a no-op until the sender's return address is learned. A
+// bonded receiver fans the same message (same sequence number) out to every live
+// path, per TR-06-4 Part 1 §5.5.
 func (s *Session) sendLQM(now clock.Timestamp) {
-	if s.peer.RTCP == nil {
+	// Skip a degenerate sub-millisecond reporting period (e.g. two ticks at the
+	// same instant): the period would floor to 0 ms, making the bandwidth fields
+	// uncomputable and the report meaningless. Wait for the next tick (lqm-8).
+	if int64(now.Sub(s.lqmLast)) < int64(clock.Millisecond) {
 		return
 	}
+
+	b, mediaSock, ok := s.encodeLQM(now)
+	if !ok {
+		return
+	}
+
+	if s.bond != nil {
+		s.writeBondLQM(b, mediaSock, now)
+		return
+	}
+	if !s.peer.RTCP.IsValid() {
+		return
+	}
+	var werr error
+	if mediaSock {
+		werr = s.conn.WriteMedia(b, s.peer.RTCP)
+	} else {
+		werr = s.writeFeedback(b)
+	}
+	if werr != nil {
+		s.logf("adapt: write LQM: %v", werr)
+		return
+	}
+	s.lastTx = now
+}
+
+// encodeLQM computes the LQM for the period ending at now and frames it in the
+// active profile's encapsulation. It returns the encoded datagram, whether it is
+// written on the media socket (single-socket profiles) versus the Simple RTCP
+// socket, and ok=false if encoding failed (already logged).
+func (s *Session) encodeLQM(now clock.Timestamp) (b []byte, mediaSock bool, ok bool) {
 	raw := s.computeLQM(now).Marshal()
 	s.rtcpBuf = s.rtcpBuf[:0]
 
-	var (
-		b         []byte
-		err       error
-		mediaSock bool // single-socket profiles write on the media conn
-	)
+	var err error
 	switch {
 	case s.adv != nil:
 		// Advanced (§5.4): native Type=Control, Control Index 0x0002 (Global LQM).
+		//
+		// INTEROP: TR-06-4 Part 1 assigns this CI for the LQM, but libRIST v0.2.18
+		// has not implemented TR-06-4 source adaptation — its Advanced control
+		// dispatcher has no case for 0x0002 and replies with an Unsupported Response
+		// (CI 0x8020), which ristgo's receive path ignores (decodeAdvControl's
+		// default case). So Advanced-profile LQM is effectively a ristgo extension
+		// when the peer is libRIST: it is harmless (media/NACK/RTT are unaffected)
+		// but yields no rate feedback. It only emits when SourceAdaptation/AdaptLQM
+		// is explicitly enabled, so default sessions never send it.
 		b, err = s.adv.frameControl(s.rtcpBuf, adv.BuildControl(nil, adv.CILQMGlobal, raw), advCtrlTS(now))
 		mediaSock = true
 	case s.main != nil:
@@ -111,21 +162,38 @@ func (s *Session) sendLQM(now clock.Timestamp) {
 	}
 	if err != nil {
 		s.logf("adapt: encode LQM: %v", err)
-		return
+		return nil, false, false
 	}
 	s.rtcpBuf = b
+	return b, mediaSock, true
+}
 
-	var werr error
-	if mediaSock {
-		werr = s.conn.WriteMedia(b, s.peer.RTCP)
-	} else {
-		werr = s.writeFeedback(b)
+// writeBondLQM fans one encoded Link Quality Message out to every live bonded
+// path, mirroring sendBondKeepalive: TR-06-4 Part 1 §5.5 requires the receiver
+// to send the Global LQM on every link with the same sequence number (the
+// message is encoded once, so the sequence number is shared).
+func (s *Session) writeBondLQM(b []byte, mediaSock bool, now clock.Timestamp) {
+	sent := false
+	for i := range s.bond.peers {
+		p := s.bond.peers[i]
+		if !p.RTCP.IsValid() {
+			continue // path's return address not learned yet
+		}
+		var werr error
+		if mediaSock {
+			werr = s.bond.conns[i].WriteMedia(b, p.RTCP)
+		} else {
+			werr = s.bond.conns[i].WriteRTCP(b, p.RTCP)
+		}
+		if werr != nil {
+			s.logf("adapt: write LQM path %d: %v", i, werr)
+			continue
+		}
+		sent = true
 	}
-	if werr != nil {
-		s.logf("adapt: write LQM: %v", werr)
-		return
+	if sent {
+		s.lastTx = now
 	}
-	s.lastTx = now
 }
 
 // feedFeedback routes one batch of drained inbound feedback to the flow core,

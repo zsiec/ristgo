@@ -14,6 +14,7 @@ package session
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,8 +52,11 @@ type Config struct {
 	KeepaliveInterval clock.Microseconds
 	// SessionTimeout tears the session down after this much peer silence.
 	SessionTimeout clock.Microseconds
-	// Logf, when non-nil, receives diagnostic messages.
-	Logf func(format string, args ...any)
+	// Logf, when non-nil, receives diagnostic messages tagged with a severity
+	// and a category. The host maps LogLevel/LogCategory to the public
+	// ristgo.LogLevel/LogCategory (the session is decoupled from the public
+	// package to avoid an import cycle).
+	Logf func(level LogLevel, category LogCategory, format string, args ...any)
 
 	// ErrClosed, ErrTimeout, ErrSessionTimeout, and ErrBufferOverflow are the
 	// sentinel errors the session returns to the caller. The public layer
@@ -116,6 +120,26 @@ type MainParams struct {
 	// succeeds. At most one is set; both nil means no authentication.
 	EAPClient *eap.Authenticatee
 	EAPServer *eap.Authenticator
+
+	// UseKeyAsPassphrase enables the EAP-SRP use_key_as_passphrase data-channel
+	// keying: when SRP is configured WITHOUT a pre-shared Secret, the media PSK
+	// keys are derived from the SRP session key K (both directions) on a
+	// successful handshake and installed into the running codec. SendKey/RecvKey
+	// are nil at construction in this mode (no secret); the handshake fills them.
+	// Meaningful only when EAPClient or EAPServer is set.
+	UseKeyAsPassphrase bool
+
+	// EAPKeySize256 selects the AES key size derived from K under
+	// use_key_as_passphrase: true for 256-bit (the libRIST default when no
+	// aes-type is given, since _librist_crypto_psk_set_passphrase defaults
+	// key_size to 256), false for 128-bit. Meaningful only when
+	// UseKeyAsPassphrase is set.
+	EAPKeySize256 bool
+
+	// EAPKeyRotation is the key-rotation threshold for the K-derived send key
+	// (packets per nonce; 0 = the library default). Meaningful only under
+	// UseKeyAsPassphrase.
+	EAPKeyRotation int
 }
 
 // AdvParams carries the Advanced-profile codec parameters. As with MainParams
@@ -146,10 +170,12 @@ type AdvParams struct {
 	VirtDstPort uint16
 }
 
-// inbound is one datagram handed from a reader goroutine to the event loop.
+// inbound is one datagram handed from a reader goroutine to the event loop. src
+// is a netip.AddrPort value (not *net.UDPAddr) so the per-datagram receive path
+// allocates nothing; the zero AddrPort (!IsValid()) means the source is unknown.
 type inbound struct {
 	data []byte
-	src  *net.UDPAddr
+	src  netip.AddrPort
 }
 
 // Session hosts one flow. Construct it with NewSender or NewReceiver.
@@ -217,6 +243,20 @@ type Session struct {
 	// by Authenticated() (hence atomic).
 	authed atomic.Bool
 
+	// useKeyAsPassphrase enables the EAP-SRP use_key_as_passphrase keying: on a
+	// successful handshake the media PSK keys are derived from the SRP session key
+	// K and installed into s.main. eapKeySize256 selects the derived AES key size
+	// (256-bit to match libRIST's default when no aes-type is given). pwReqSent
+	// latches the one-shot post-SUCCESS PASSWORD_REQUEST the authenticator emits.
+	// txKeyGen/rxKeyGen track the last installed keying generation so a rollover
+	// (a repeated K) still re-derives.
+	useKeyAsPassphrase bool
+	eapKeySize256      bool
+	eapKeyRotation     int
+	pwReqSent          bool
+	txKeyGen           uint64
+	rxKeyGen           uint64
+
 	// timers is the host's declarative timer wheel: the deadline the flow
 	// requested for each TimerID. A single time.Timer tracks the earliest.
 	timers map[flow.TimerID]clock.Timestamp
@@ -229,14 +269,19 @@ type Session struct {
 	// first inbound datagram, not repeatedly).
 	advPeerKnown bool
 
-	// Source-adaptation state (adapt.go), loop-owned. rxBytes/lqmPrevBytes meter
-	// the measured data bandwidth; lqmSeq/lqmPrev/lqmLast carry the per-reporting
-	// -period deltas a receiver folds into each Link Quality Message.
-	rxBytes      uint64
-	lqmPrevBytes uint64
-	lqmSeq       uint32
-	lqmPrev      flow.Stats
-	lqmLast      clock.Timestamp
+	// Source-adaptation state (adapt.go), loop-owned. rxBytes/rxRetransBytes meter
+	// RTP-level bytes (TR-06-4 Part 1 §5.1: payload + RTP header, NOT the GRE/adv
+	// encapsulation), split so the LQM reports source Data Bandwidth and
+	// Retransmission Bandwidth separately; the lqmPrev* snapshots carry the
+	// per-reporting-period deltas; lqmSeq/lqmPrev/lqmLast carry the rest of the
+	// per-period state a receiver folds into each Link Quality Message.
+	rxBytes             uint64
+	rxRetransBytes      uint64
+	lqmPrevBytes        uint64
+	lqmPrevRetransBytes uint64
+	lqmSeq              uint32
+	lqmPrev             flow.Stats
+	lqmLast             clock.Timestamp
 
 	// lastTx is the instant of the last RTCP/media transmission; the
 	// keepalive ticker only emits a periodic RTCP when the flow has been
@@ -294,7 +339,7 @@ type Session struct {
 
 // NewSender builds a sender-role session that transmits RTP to mediaAddr and
 // compound RTCP to rtcpAddr, and reads feedback on conn's RTCP socket.
-func NewSender(conn *socket.Conn, mediaAddr, rtcpAddr *net.UDPAddr, cfg Config) *Session {
+func NewSender(conn *socket.Conn, mediaAddr, rtcpAddr netip.AddrPort, cfg Config) *Session {
 	s := newSession(conn, cfg, true)
 	s.peer.Media = mediaAddr
 	s.peer.RTCP = rtcpAddr
@@ -315,11 +360,11 @@ func NewReceiver(conn *socket.Conn, cfg Config) *Session {
 // NewMainSender builds a Main-profile sender that tunnels media and reads
 // feedback over the single GRE socket conn, addressing remote. cfg.Main must be
 // set.
-func NewMainSender(conn *socket.Conn, remote *net.UDPAddr, cfg Config) *Session {
+func NewMainSender(conn *socket.Conn, remote netip.AddrPort, cfg Config) *Session {
 	s := newSession(conn, cfg, true)
 	// In Main profile a single port carries everything, so the media and RTCP
 	// peer addresses are the same; setting both keeps the liveness/feedback
-	// guards (peer.Media/RTCP != nil) working unchanged.
+	// guards (peer.Media/RTCP.IsValid()) working unchanged.
 	s.peer.Media = remote
 	s.peer.RTCP = remote
 	s.flow = flow.New(flow.RoleSender, cfg.Flow)
@@ -340,7 +385,7 @@ func NewMainReceiver(conn *socket.Conn, cfg Config) *Session {
 // NewAdvSender builds an Advanced-profile sender that transmits RTP-based media
 // and reads control over the single UDP socket conn, addressing remote. cfg.Adv
 // must be set.
-func NewAdvSender(conn *socket.Conn, remote *net.UDPAddr, cfg Config) *Session {
+func NewAdvSender(conn *socket.Conn, remote netip.AddrPort, cfg Config) *Session {
 	s := newSession(conn, cfg, true)
 	// One UDP port carries everything, so the media and control peer addresses
 	// are the same (matching the Main profile's single-port model).
@@ -395,8 +440,21 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		s.localMAC = localHardwareMAC()
 		s.eapClient = mp.EAPClient
 		s.eapServer = mp.EAPServer
+		s.useKeyAsPassphrase = mp.UseKeyAsPassphrase
+		s.eapKeySize256 = mp.EAPKeySize256
+		s.eapKeyRotation = mp.EAPKeyRotation
 		if s.eapClient != nil || s.eapServer != nil {
 			s.authed.Store(false) // hold the data channel until the handshake succeeds
+			// Under use_key_as_passphrase the media key is derived from K during
+			// the handshake; arm both EAP roles for that keying.
+			if mp.UseKeyAsPassphrase {
+				if s.eapClient != nil {
+					s.eapClient.UseKeyAsPassphrase(true)
+				}
+				if s.eapServer != nil {
+					s.eapServer.UseKeyAsPassphrase(true)
+				}
+			}
 		}
 	} else if cfg.Adv != nil {
 		ap := cfg.Adv
@@ -468,7 +526,7 @@ func (s *Session) loop() {
 		if err := s.conn.Handshake(); err != nil {
 			s.shutdown(s.cfg.ErrAuth)
 			closeDTLSReady()
-			s.logf("dtls: handshake failed: %v", err)
+			s.logAt(LogError, CatCrypto, "dtls: handshake failed: %v", err)
 			return
 		}
 	}
@@ -515,10 +573,8 @@ func (s *Session) loop() {
 			now := s.clk.Now()
 			s.peer.LearnMedia(m.src)
 			s.peer.Observe(now)
-			s.observeRxBytes(len(m.data))
 			if pkt, err := s.mdec.decode(m.data); err == nil {
-				s.flow.Feed(now, 0, pkt)
-				s.observeRx(now, pkt)
+				s.feedMedia(now, 0, pkt)
 			}
 			s.afterInput(now, timer)
 		case r := <-s.rtcpIn:
@@ -538,7 +594,7 @@ func (s *Session) loop() {
 			s.peer.Observe(now)
 			// Probe the GRE version with a dual-version keepalive burst the
 			// instant the peer is learned, so a v2-capable peer can upgrade.
-			if !s.greBurstSent && s.peer.RTCP != nil {
+			if !s.greBurstSent && s.peer.RTCP.IsValid() {
 				s.greBurstSent = true
 				s.sendGREKeepaliveBurst()
 			}
@@ -565,9 +621,7 @@ func (s *Session) loop() {
 				}
 			} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
 				if isMedia {
-					s.observeRxBytes(len(d.data))
-					s.flow.Feed(now, 0, pkt)
-					s.observeRx(now, pkt)
+					s.feedMedia(now, 0, pkt)
 				} else {
 					s.feedFeedback(now, fbs)
 				}
@@ -577,7 +631,7 @@ func (s *Session) loop() {
 				// garbage), which would otherwise look like total packet loss.
 				// Surface it so it is diagnosable; logf is zero-cost when no
 				// logger is set.
-				s.logf("main: drop undecodable datagram (%d bytes): %v", len(d.data), err)
+				s.logAt(LogWarning, CatCrypto, "main: drop undecodable datagram (%d bytes): %v", len(d.data), err)
 			}
 			s.afterInput(now, timer)
 		case d := <-s.advIn:
@@ -628,14 +682,14 @@ func (s *Session) loop() {
 			if s.bond != nil {
 				s.tickBond(now)
 				s.sendKeepalive(now)
-			} else if s.peer.RTCP != nil && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
+			} else if s.peer.RTCP.IsValid() && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
 				s.sendKeepalive(now)
 			}
 			// Main profile (non-bonded): also emit the periodic GRE keepalive (the
 			// node-MAC + capability beacon), at the negotiated GRE version. It is
 			// distinct from the RTCP keepalive above (libRIST runs both timers).
 			// Bonded sessions drive their own per-path keepalives.
-			if s.main != nil && s.bond == nil && s.peer.RTCP != nil {
+			if s.main != nil && s.bond == nil && s.peer.RTCP.IsValid() {
 				s.sendGREKeepalive(s.greVersion)
 			}
 			// A receiver that opted into source adaptation emits a Link Quality
@@ -702,7 +756,12 @@ func (s *Session) drain(now clock.Timestamp) {
 			s.clearTimer(o.ID)
 		}
 	}
-	if len(fbs) > 0 {
+	// Suppress reflected feedback (NACKs, echoes) toward an unauthenticated peer:
+	// before the EAP-SRP handshake completes authed is false, so a spoofed source
+	// cannot elicit reflected datagrams (M7). feedMedia already withholds pre-auth
+	// media, so fbs is normally empty here; this is the matching belt-and-braces
+	// on the emit side. For non-authenticated sessions authed is always true.
+	if len(fbs) > 0 && s.authed.Load() {
 		s.sendFeedback(fbs, now)
 	}
 	for {
@@ -724,7 +783,7 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		s.sendBondMedia(now, pkt)
 		return
 	}
-	if s.peer.Media == nil {
+	if !s.peer.Media.IsValid() {
 		return
 	}
 	s.mediaBuf = s.mediaBuf[:0]
@@ -744,7 +803,7 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	s.mediaBuf = b
 	// WriteMedia targets the single GRE socket in Main mode (media == rtcp).
 	if err := s.conn.WriteMedia(b, s.peer.Media); err != nil {
-		s.logf("write media: %v", err)
+		s.logAt(LogWarning, CatSocket, "write media: %v", err)
 	}
 	s.lastTx = now
 }
@@ -756,7 +815,7 @@ func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 		s.sendBondFeedback(fbs, now)
 		return
 	}
-	if s.peer.RTCP == nil {
+	if !s.peer.RTCP.IsValid() {
 		return // return path not learned yet
 	}
 	// Advanced profile has no compound RTCP: each feedback item is its own
@@ -785,7 +844,7 @@ func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 	}
 	s.rtcpBuf = b
 	if err := s.writeFeedback(b); err != nil {
-		s.logf("write rtcp: %v", err)
+		s.logAt(LogWarning, CatSocket, "write rtcp: %v", err)
 	}
 	s.lastTx = now
 }
@@ -876,7 +935,7 @@ func (s *Session) sendAdvKeepalive(now clock.Timestamp) {
 // transmission. It reuses the same GRE+RTCP encoding WP6 proved interoperable;
 // advGRE encrypts it under the PSK when one is configured.
 func (s *Session) sendAdvGREHandshake(now clock.Timestamp) {
-	if s.peer.RTCP == nil {
+	if !s.peer.RTCP.IsValid() {
 		return
 	}
 	s.rtcpBuf = s.rtcpBuf[:0]
@@ -908,14 +967,12 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 				}
 				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(p); derr == nil {
 					if isMedia {
-						s.observeRxBytes(len(data))
-						s.flow.Feed(now, 0, pkt)
-						s.observeRx(now, pkt)
+						s.feedMedia(now, 0, pkt)
 					} else {
 						s.feedAdvFeedback(now, fbs)
 					}
 				} else {
-					s.logf("adv: drop undecodable adv datagram (%d bytes): %v", len(data), derr)
+					s.logAt(LogWarning, CatCrypto, "adv: drop undecodable adv datagram (%d bytes): %v", len(data), derr)
 				}
 				return
 			}
@@ -947,9 +1004,7 @@ func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
 	if isMedia {
 		// libRIST does not send GRE-framed media in Advanced mode; accept it
 		// defensively all the same.
-		s.observeRxBytes(len(data))
-		s.flow.Feed(now, 0, pkt)
-		s.observeRx(now, pkt)
+		s.feedMedia(now, 0, pkt)
 		return
 	}
 	s.feedAdvFeedback(now, fbs)
@@ -991,7 +1046,7 @@ func dropAdvEchoRequests(fbs []wire.Feedback) []wire.Feedback {
 // side channel that bypasses the flow core (no ARQ); it is dropped, with a log,
 // before the peer's address is known.
 func (s *Session) sendOOB(now clock.Timestamp, payload []byte) {
-	if s.peer.Media == nil {
+	if !s.peer.Media.IsValid() {
 		s.logf("oob: peer not learned yet, dropping %d-byte datagram", len(payload))
 		return
 	}
@@ -1058,7 +1113,7 @@ func localHardwareMAC() [6]byte {
 // _librist_proto_gre_send_keepalive). It is the Main-profile capability/liveness
 // beacon, distinct from the periodic RTCP. A no-op until the peer is learned.
 func (s *Session) sendGREKeepalive(version uint8) {
-	if s.main == nil || s.peer.RTCP == nil {
+	if s.main == nil || !s.peer.RTCP.IsValid() {
 		return
 	}
 	ka := gre.Keepalive{MAC: s.localMAC, Caps: gre.StandardCapabilities()}
@@ -1077,7 +1132,7 @@ func (s *Session) sendGREKeepalive(version uint8) {
 // upgrades while a v1-only peer still hears us (libRIST's dual-version probe). A
 // sender also advertises its max buffer via buffer negotiation.
 func (s *Session) sendGREKeepaliveBurst() {
-	if s.main == nil || s.peer.RTCP == nil {
+	if s.main == nil || !s.peer.RTCP.IsValid() {
 		return
 	}
 	for i := 0; i < 3; i++ {
@@ -1095,7 +1150,7 @@ func (s *Session) sendGREKeepaliveBurst() {
 // + 2*rtt_min, libRIST sender_recover_min_time), three times for datagram
 // redundancy. Version 2 only.
 func (s *Session) sendBufferNegotiation() {
-	if s.main == nil || s.peer.RTCP == nil || !s.sender {
+	if s.main == nil || !s.peer.RTCP.IsValid() || !s.sender {
 		return
 	}
 	maxMs := uint16((s.cfg.Flow.RecoveryBufferMax + 2*s.cfg.Flow.RTTMin) / clock.Millisecond)
@@ -1159,18 +1214,123 @@ func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 	if err != nil {
 		s.logf("eap: %v", err)
 	}
+	// Install any data-channel keying material the handshake produced under
+	// use_key_as_passphrase BEFORE opening the gate, so the first media datagram
+	// is already keyed. This polls the role each step: the TX key is installed at
+	// M1/M2 and the RX key on processing the peer's validator, so by SUCCESS both
+	// are available.
+	wasAuthed := s.authed.Load()
+	s.installEAPKeying()
 	if role.Authenticated() {
+		// The authenticatee drives the post-SUCCESS PASSWORD_REQUEST once, after
+		// installing its keys (eap_request_passphrase(start=true) on SUCCESS).
+		s.maybeSendPasswordRequest(now)
 		s.authed.Store(true)
+		// On the transition to authenticated under use_key_as_passphrase, send an
+		// immediate keepalive (a GRE MAC beacon and, on a receiver, the RTCP SDES
+		// handshake) so the peer gets fresh liveness — now keyed under K on a
+		// receiver — without waiting a full keepalive interval. libRIST's
+		// liveness window is tight right after auth (it is "Waiting for EAP
+		// authentication"); a prompt beacon keeps it from aging the peer out and
+		// cycling, which would drop the first media burst.
+		if !wasAuthed && s.useKeyAsPassphrase {
+			s.sendPostAuthBeacon(now)
+		}
 	} else if role.Done() {
 		// A terminal state without success means authentication failed.
 		s.shutdown(s.cfg.ErrAuth)
 	}
 }
 
+// sendPostAuthBeacon sends an immediate liveness/handshake burst the instant the
+// EAP-SRP handshake authenticates under use_key_as_passphrase: the GRE keepalive
+// (MAC beacon) plus, on a receiver, the RTCP keepalive (the SDES the peer needs to
+// authenticate our RTCP peer and ungate media). Both now ride the K-derived key
+// on a receiver. The RTCP/SDES is sent a few times for datagram redundancy: it is
+// the gate that lets a libRIST sender start streaming, and a single lost copy in
+// the narrow post-auth window would otherwise delay the stream by a full keepalive
+// interval (or, with cycling, drop the opening burst).
+func (s *Session) sendPostAuthBeacon(now clock.Timestamp) {
+	if s.main == nil || !s.peer.RTCP.IsValid() {
+		return
+	}
+	s.sendGREKeepalive(s.greVersion)
+	for i := 0; i < 3; i++ {
+		s.sendKeepalive(now)
+	}
+}
+
+// installEAPKeying derives and installs the Main media PSK keys from the SRP
+// session key K when the EAP-SRP use_key_as_passphrase mode produced new keying
+// material. It is idempotent: each direction is re-keyed only when its keying
+// generation advances (so a rollover with a repeated K still re-derives, and an
+// unchanged generation is a no-op). The send key is derived with NewKeyRaw and
+// the receive key with NewDecryptorRaw (no NUL-truncation — K is a raw digest),
+// matching libRIST's _librist_crypto_psk_set_passphrase, which hashes the full
+// 32 K bytes. K never reaches a log here.
+func (s *Session) installEAPKeying() {
+	if !s.useKeyAsPassphrase || s.main == nil {
+		return
+	}
+	var (
+		tx, rx     eap.Passphrase
+		haveTx     bool
+		haveRx     bool
+		keyBits    = crypto.KeySize128
+		keySize256 = s.eapKeySize256
+	)
+	if keySize256 {
+		keyBits = crypto.KeySize256
+	}
+	switch {
+	case s.eapClient != nil:
+		tx, haveTx = s.eapClient.TxKeying()
+		rx, haveRx = s.eapClient.RxKeying()
+	case s.eapServer != nil:
+		tx, haveTx = s.eapServer.TxKeying()
+		rx, haveRx = s.eapServer.RxKeying()
+	}
+	if haveTx && tx.Gen != s.txKeyGen {
+		k, err := crypto.NewKeyRaw(tx.Key, keyBits, s.eapKeyRotation, false)
+		if err != nil {
+			s.logAt(LogError, CatCrypto, "eap: derive send key from session key: %v", err)
+		} else {
+			s.main.setSendKey(k, keySize256)
+			s.txKeyGen = tx.Gen
+		}
+	}
+	if haveRx && rx.Gen != s.rxKeyGen {
+		d, err := crypto.NewDecryptorRaw(rx.Key, keyBits)
+		if err != nil {
+			s.logAt(LogError, CatCrypto, "eap: derive recv key from session key: %v", err)
+		} else {
+			s.main.setRecvKey(d)
+			s.rxKeyGen = rx.Gen
+		}
+	}
+}
+
+// maybeSendPasswordRequest sends the authenticatee's one-shot post-SUCCESS EAP
+// PASSWORD_REQUEST (subtype 0x10) soliciting the receiver's data-channel keying
+// confirmation. libRIST's authenticatee (the RIST sender) issues it once on
+// verifying M2 / reaching SUCCESS (eap_request_passphrase, from
+// process_eap_request_srp_server_validator); the authenticator answers with a
+// PASSWORD_RESPONSE the handleEAP path routes back, which keys the authenticatee's
+// RX. A no-op for the authenticator role or when not in use_key_as_passphrase mode.
+func (s *Session) maybeSendPasswordRequest(now clock.Timestamp) {
+	if s.eapClient == nil || !s.useKeyAsPassphrase || s.pwReqSent {
+		return
+	}
+	if f, ok := s.eapClient.PasswordRequest(); ok {
+		s.pwReqSent = true
+		s.sendEAP(f, now)
+	}
+}
+
 // sendEAP frames an EAP frame as a GRE EAPOL datagram and sends it to the peer
 // over the single Main socket. EAPOL is never encrypted.
 func (s *Session) sendEAP(f eap.Frame, now clock.Timestamp) {
-	if s.main == nil || s.peer.Media == nil {
+	if s.main == nil || !s.peer.Media.IsValid() {
 		return
 	}
 	s.rtcpBuf = s.rtcpBuf[:0]
@@ -1301,10 +1461,43 @@ func (s *Session) readRTCP() {
 	}
 }
 
-// logf emits a diagnostic if a logger is configured.
+// LogLevel is the severity of a session diagnostic; the host maps it to the
+// public ristgo.LogLevel. Values are ordered least-to-most severe.
+type LogLevel int
+
+// Session log severities.
+const (
+	LogDebug LogLevel = iota
+	LogNote
+	LogWarning
+	LogError
+)
+
+// LogCategory tags a session diagnostic by subsystem; the host maps it to the
+// public ristgo.LogCategory.
+type LogCategory int
+
+// Session log categories.
+const (
+	CatSession LogCategory = iota
+	CatCrypto
+	CatSocket
+	CatRTCP
+	CatFlow
+	CatBonding
+)
+
+// logf emits a routine diagnostic (LogDebug / CatSession) if a logger is
+// configured. Use logAt to emit at a different severity or category.
 func (s *Session) logf(format string, args ...any) {
+	s.logAt(LogDebug, CatSession, format, args...)
+}
+
+// logAt emits a diagnostic at the given severity and category if a logger is
+// configured. It is zero-cost (no formatting) when no logger is set.
+func (s *Session) logAt(level LogLevel, category LogCategory, format string, args ...any) {
 	if s.cfg.Logf != nil {
-		s.cfg.Logf(format, args...)
+		s.cfg.Logf(level, category, format, args...)
 	}
 }
 

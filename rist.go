@@ -69,6 +69,18 @@
 // 2022-7 link bonding ([BondedSender]/[BondedReceiver]) for seamless multipath
 // reconstruction, and source adaptation (VSF TR-06-4 Part 1) that feeds link
 // quality back to an encoder-rate callback.
+//
+// # Limitations
+//
+// Transport is unicast UDP only. IP multicast (IGMP/MLD group join, multicast
+// TTL, and source-specific multicast) is not supported: a receiver pointed at a
+// multicast group address binds the socket but does not join the group, so on
+// most platforms and IGMP-snooping networks it receives nothing, and a sender
+// does not set the multicast TTL. libRIST supports multicast; ristgo does not,
+// because a correct implementation needs golang.org/x/net/ipv4 and ipv6 for
+// group membership and TTL control, which falls outside ristgo's standard-
+// library-plus-x/crypto dependency policy. Use unicast addresses, or terminate
+// multicast with an external relay (e.g. a udpxy/socat bridge).
 package ristgo
 
 // Version is the ristgo library version.
@@ -128,6 +140,79 @@ func (n NACKType) String() string {
 		return "range"
 	case NACKBitmask:
 		return "bitmask"
+	default:
+		return "unknown"
+	}
+}
+
+// CongestionControl selects how the sender paces retransmissions against the
+// recovery bitrate (MaxBitrate) — libRIST's congestion_control. The zero value
+// is CongestionNormal, the libRIST default, so a zero Config behaves like
+// DefaultConfig.
+//
+// NOTE: these constant values are ristgo's own API encoding (chosen so the zero
+// value is the default), NOT libRIST's wire/URL numbering, which is
+// off=0/normal=1/aggressive=2. ParseURL maps the libRIST congestion-control=N
+// query value to the right constant.
+type CongestionControl int
+
+const (
+	// CongestionNormal paces retransmissions against MaxBitrate using the slow
+	// bandwidth EWMA — the libRIST default (congestion_control = NORMAL). As the
+	// zero value it applies to a zero Config.
+	CongestionNormal CongestionControl = 0
+
+	// CongestionAggressive uses the fast EWMA for both the data and the
+	// retransmit rate, recovering loss faster at the cost of burstier
+	// retransmission (libRIST congestion_control = AGGRESSIVE).
+	CongestionAggressive CongestionControl = 1
+
+	// CongestionOff disables MaxBitrate pacing of retransmissions entirely
+	// (libRIST congestion_control = OFF).
+	CongestionOff CongestionControl = 2
+)
+
+// String returns a human-readable name for the congestion-control mode.
+func (c CongestionControl) String() string {
+	switch c {
+	case CongestionNormal:
+		return "normal"
+	case CongestionAggressive:
+		return "aggressive"
+	case CongestionOff:
+		return "off"
+	default:
+		return "unknown"
+	}
+}
+
+// TimingMode selects how the receiver schedules media playout (libRIST
+// timing_mode). The zero value is TimingSource, the libRIST default. These
+// values match libRIST's SOURCE=0/ARRIVAL=1 numbering; libRIST's RTC=2 maps to
+// TimingArrival (ristgo has no wall-clock source).
+type TimingMode int
+
+const (
+	// TimingSource paces playout by the media SOURCE timestamps: a packet's
+	// playout deadline is its source time plus the recovery buffer, so
+	// inter-packet spacing follows the source clock. Default and zero value.
+	TimingSource TimingMode = 0
+
+	// TimingArrival paces playout by ARRIVAL time: each packet is held a fixed
+	// recovery buffer from when it arrived, ignoring the source timestamps for
+	// pacing (they still drive the (Seq, SourceTime) dedup / 2022-7 merge). It is
+	// robust to a drifting or absent source clock but does not preserve source
+	// inter-packet timing.
+	TimingArrival TimingMode = 1
+)
+
+// String returns a human-readable name for the timing mode.
+func (m TimingMode) String() string {
+	switch m {
+	case TimingSource:
+		return "source"
+	case TimingArrival:
+		return "arrival"
 	default:
 		return "unknown"
 	}

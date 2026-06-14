@@ -137,6 +137,17 @@ type Stats struct {
 	// (libRIST stats_instant.reordered).
 	Reordered uint64
 
+	// RetransmittedReceived counts inbound media packets flagged as
+	// retransmits (the codec un-toggled the SSRC LSB and set MediaPacket.
+	// Retransmit), tallied once per arriving retransmit-flagged packet before
+	// the too-late / dedup / cursor tests — so it includes retransmits that
+	// are subsequently shed as too-late or dropped as duplicates. It is
+	// distinct from Recovered: Recovered counts gaps filled by ARQ (missing
+	// entries removed after a NACK), whereas this counts retransmit copies
+	// actually received on the wire (libRIST stats_instant.retransmitted vs
+	// recovered).
+	RetransmittedReceived uint64
+
 	// Overwritten counts ring slots that held a stale entry — same slot,
 	// different (seq, sourceTime) — and were overwritten by a newer packet
 	// (libRIST's "Invalid Dupe" path).
@@ -145,8 +156,16 @@ type Stats struct {
 	// TooLate counts media packets dropped because they could no longer be
 	// delivered: either older than the recovery window per libRIST's
 	// now > packetTime + recoveryBuffer*1.1 rule, or already behind the
-	// in-order playout cursor.
+	// in-order playout cursor. It includes both original and retransmitted
+	// packets; TooLateRetransmit isolates the retransmitted subset.
 	TooLate uint64
+
+	// TooLateRetransmit counts the subset of TooLate drops that were
+	// retransmit-flagged packets (a NACK answered after the deadline). The
+	// source-adaptation Link Quality Message "Late" field reports original
+	// packets only (TR-06-4 Part 1 §5.1 excludes retransmits received late), so
+	// it is computed as TooLate - TooLateRetransmit.
+	TooLateRetransmit uint64
 
 	// Missing counts missing entries created by gap detection (each lost
 	// sequence number once per detection).
@@ -182,11 +201,12 @@ type Stats struct {
 	// the core.
 	IgnoredFeedback uint64
 
-	// ClockResync counts source-clock re-anchors: a fresh in-sequence packet
-	// mapped far outside the recovery window (a 32-bit RTP-timestamp wrap, ~13h
-	// at 90 kHz, or a source clock reset), so the locked offset was refreshed to
-	// keep playout from stalling (libRIST receiver_calculate_packet_time wrap
-	// fix-up).
+	// ClockResync counts source-clock re-anchors: a fresh non-retransmit packet
+	// whose source time fell backward by more than half the 32-bit timestamp
+	// space (a true 32-bit RTP-timestamp wrap, ~13h at 90 kHz), gated by a dwell
+	// guard, so the locked offset was bumped by one wrap period to keep playout
+	// from stalling (libRIST receiver_calculate_packet_time wrap fix-up). An
+	// anomalous-but-not-wrapped or merely-late timestamp does not count here.
 	ClockResync uint64
 
 	// --- Sender-half counters ---

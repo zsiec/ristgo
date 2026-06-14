@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -53,7 +54,7 @@ func loopbackConn(t *testing.T) *socket.Conn {
 // bug: every Write on a closed sender must return ErrClosed and never silently
 // enqueue into the (undrained) appIn buffer.
 func TestWriteAfterCloseReturnsClosed(t *testing.T) {
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000}
+	dst := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 5000)
 	s := NewSender(loopbackConn(t), dst, dst, testConfig())
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

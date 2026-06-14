@@ -3,7 +3,7 @@ package ristgo
 import (
 	"fmt"
 	"net"
-	"strconv"
+	"net/netip"
 	"time"
 
 	"github.com/zsiec/ristgo/internal/bonding"
@@ -29,8 +29,8 @@ type BondedReceiver struct {
 // path with identical sequence and timestamp, so the receiver can merge them.
 type BondedSender struct {
 	sess    *session.Session
-	remote  *net.UDPAddr // the first path, for RemoteAddr
-	ctxStop func()       // ends the context watcher (set by DialBonded)
+	remote  netip.AddrPort // the first path, for RemoteAddr
+	ctxStop func()         // ends the context watcher (set by DialBonded)
 }
 
 // newBondingGroup builds the per-flow bonding group from cfg's liveness and RTT
@@ -43,15 +43,77 @@ func newBondingGroup(cfg Config) *bonding.Group {
 	)
 }
 
+// BondedPeer is one path of a per-peer bonded configuration: an address plus its
+// NACK recovery priority. Use it with [NewBondedReceiverPeers] /
+// [NewBondedSenderPeers] when paths need distinct priorities; the plain
+// [NewBondedReceiver] / [NewBondedSender] ([]string forms) give every path the
+// default priority 0.
+type BondedPeer struct {
+	// Addr is the path's "host:port" (even media port for the Simple profile, a
+	// single port for the Main/Advanced profiles).
+	Addr string
+
+	// Priority is the NACK recovery priority (libRIST recovery-priority): a
+	// bonded receiver routes each retransmission request to the live path with
+	// the HIGHEST priority, ties broken by the lowest RTT. Higher is preferred;
+	// the default 0 is the lowest. Must be >= 0. It is meaningful on a receiver
+	// (which selects a NACK path); a sender duplicates to every path regardless.
+	Priority int
+}
+
+// splitBondedPeers validates peers and splits them into parallel address and
+// priority slices.
+func splitBondedPeers(peers []BondedPeer) (addrs []string, priorities []uint32, err error) {
+	addrs = make([]string, len(peers))
+	priorities = make([]uint32, len(peers))
+	for i, p := range peers {
+		if p.Priority < 0 {
+			return nil, nil, fmt.Errorf("%w: BondedPeer.Priority must be >= 0", ErrInvalidConfig)
+		}
+		addrs[i] = p.Addr
+		priorities[i] = uint32(p.Priority)
+	}
+	return addrs, priorities, nil
+}
+
+// bondingGroupWith builds the bonding group and pre-registers each path with its
+// recovery priority; the session then skips re-registering those paths
+// (Group.HasPath), preserving the priorities. A nil priorities slice leaves the
+// group empty for the session to populate with the priority-0 defaults.
+func bondingGroupWith(cfg Config, priorities []uint32) *bonding.Group {
+	g := newBondingGroup(cfg)
+	for i, pr := range priorities {
+		g.AddPath(uint8(i), bonding.WeightDuplicate, pr)
+	}
+	return g
+}
+
 // NewBondedReceiver binds a bonded receiver across addrs, merging all paths into
 // one deduplicated flow. The socket topology follows cfg.Profile: the Simple
 // profile uses an even/odd media/RTCP pair per path (so each addr's port must be
 // even); the Main and Advanced profiles tunnel each path over a single port,
 // with PSK encryption when a Secret is set. At least one address is required; two
 // or more gives 2022-7 redundancy. Bonded DTLS and EAP-SRP are not supported.
+// Every path is given recovery priority 0; use [NewBondedReceiverPeers] for
+// per-path priorities.
 //
 // See [ListenBonded] for the context-aware constructor with functional options.
 func NewBondedReceiver(addrs []string, cfg Config) (*BondedReceiver, error) {
+	return newBondedReceiver(addrs, nil, cfg)
+}
+
+// NewBondedReceiverPeers is [NewBondedReceiver] with a per-path NACK recovery
+// priority (libRIST recovery-priority): retransmission requests prefer the live
+// path with the highest priority.
+func NewBondedReceiverPeers(peers []BondedPeer, cfg Config) (*BondedReceiver, error) {
+	addrs, priorities, err := splitBondedPeers(peers)
+	if err != nil {
+		return nil, err
+	}
+	return newBondedReceiver(addrs, priorities, cfg)
+}
+
+func newBondedReceiver(addrs []string, priorities []uint32, cfg Config) (*BondedReceiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
@@ -63,7 +125,7 @@ func NewBondedReceiver(addrs []string, cfg Config) (*BondedReceiver, error) {
 	}
 	conns := make([]*socket.Conn, 0, len(addrs))
 	for _, a := range addrs {
-		c, err := listenBondPath(a, cfg.Profile)
+		c, err := listenBondPath(a, cfg)
 		if err != nil {
 			closeConns(conns)
 			return nil, err
@@ -76,7 +138,7 @@ func NewBondedReceiver(addrs []string, cfg Config) (*BondedReceiver, error) {
 		closeConns(conns)
 		return nil, err
 	}
-	sess := session.NewBondedReceiver(conns, newBondingGroup(cfg), sc)
+	sess := session.NewBondedReceiver(conns, bondingGroupWith(cfg, priorities), sc)
 	return &BondedReceiver{sess: sess}, nil
 }
 
@@ -87,8 +149,27 @@ func NewBondedReceiver(addrs []string, cfg Config) (*BondedReceiver, error) {
 // a Secret is set. At least one address is required; two or more gives 2022-7
 // redundancy. Bonded DTLS and EAP-SRP are not supported.
 //
+// Every path is given recovery priority 0; use [NewBondedSenderPeers] for
+// per-path priorities.
+//
 // See [DialBonded] for the context-aware constructor with functional options.
 func NewBondedSender(addrs []string, cfg Config) (*BondedSender, error) {
+	return newBondedSender(addrs, nil, cfg)
+}
+
+// NewBondedSenderPeers is [NewBondedSender] with a per-path recovery priority.
+// Priority is meaningful on a receiver; on a sender it is carried for symmetry
+// (a sender duplicates to every path), so this mainly mirrors the receiver's
+// per-peer configuration.
+func NewBondedSenderPeers(peers []BondedPeer, cfg Config) (*BondedSender, error) {
+	addrs, priorities, err := splitBondedPeers(peers)
+	if err != nil {
+		return nil, err
+	}
+	return newBondedSender(addrs, priorities, cfg)
+}
+
+func newBondedSender(addrs []string, priorities []uint32, cfg Config) (*BondedSender, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
@@ -98,7 +179,7 @@ func NewBondedSender(addrs []string, cfg Config) (*BondedSender, error) {
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("%w: a bonded sender needs at least one address", ErrInvalidConfig)
 	}
-	remotes := make([][2]*net.UDPAddr, 0, len(addrs))
+	remotes := make([][2]netip.AddrPort, 0, len(addrs))
 	for _, a := range addrs {
 		r, err := bondSenderRemote(a, cfg.Profile)
 		if err != nil {
@@ -107,16 +188,28 @@ func NewBondedSender(addrs []string, cfg Config) (*BondedSender, error) {
 		remotes = append(remotes, r)
 	}
 	// Main/Advanced tunnel each path over a single port; Simple uses an even/odd
-	// pair, so the local send socket must match.
-	var conn *socket.Conn
-	var err error
-	if cfg.Profile == ProfileSimple {
-		conn, err = socket.ListenEphemeral("")
-	} else {
-		conn, err = socket.ListenEphemeralSingle("")
+	// pair, so the local send socket must match. When any path targets a
+	// multicast group, the socket is bound in that group's address family (see
+	// openSenderConn).
+	var mcDst netip.Addr
+	for _, r := range remotes {
+		if d := r[0].Addr(); d.IsMulticast() {
+			mcDst = d
+			break
+		}
 	}
+	conn, err := openSenderConn(cfg.Profile != ProfileSimple, mcDst)
 	if err != nil {
 		return nil, err
+	}
+	// Apply outbound multicast egress (TTL/interface/loopback) when a path
+	// targets a multicast group. The bonded sender duplicates over one socket, so
+	// the options apply to that socket. A no-op when every path is unicast.
+	if mcDst.IsMulticast() {
+		if err := setSenderMulticast(conn, cfg, mcDst); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
@@ -127,7 +220,7 @@ func NewBondedSender(addrs []string, cfg Config) (*BondedSender, error) {
 		conn.Close()
 		return nil, err
 	}
-	sess := session.NewBondedSender(conn, remotes, newBondingGroup(cfg), sc)
+	sess := session.NewBondedSender(conn, remotes, bondingGroupWith(cfg, priorities), sc)
 	return &BondedSender{sess: sess, remote: remotes[0][0]}, nil
 }
 
@@ -146,51 +239,69 @@ func bondedSupported(cfg Config) error {
 
 // listenBondPath binds one receiver path socket for the configured profile: the
 // Simple profile uses an even/odd media+RTCP pair (so the port must be even);
-// the Main and Advanced profiles tunnel each path over a single port.
-func listenBondPath(addr string, profile Profile) (*socket.Conn, error) {
-	if profile == ProfileSimple {
-		host, port, err := resolveMediaPort(addr)
+// the Main and Advanced profiles tunnel each path over a single port. When the
+// path's bind host is a multicast group it also joins the group (per cfg), so a
+// bonded receiver can pull each redundant path from its own multicast group.
+func listenBondPath(addr string, cfg Config) (*socket.Conn, error) {
+	var (
+		conn *socket.Conn
+		host string
+		err  error
+	)
+	if cfg.Profile == ProfileSimple {
+		var port int
+		host, port, err = resolveMediaPort(addr)
 		if err != nil {
 			return nil, err
 		}
-		return socket.Listen(host, port)
+		conn, err = socket.Listen(host, port)
+	} else {
+		var port int
+		host, port, err = resolveSinglePort(addr)
+		if err != nil {
+			return nil, err
+		}
+		conn, err = socket.ListenSingle(host, port)
 	}
-	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
 	}
-	return socket.ListenSingle(host, port)
+	if err := joinReceiverMulticast(conn, cfg, host); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 // bondSenderRemote resolves one sender path's destination for the profile: the
 // Simple profile returns the even media and odd+1 RTCP pair; the Main/Advanced
 // profiles tunnel over a single port, so both entries are that one address.
-func bondSenderRemote(addr string, profile Profile) ([2]*net.UDPAddr, error) {
-	var out [2]*net.UDPAddr
+func bondSenderRemote(addr string, profile Profile) ([2]netip.AddrPort, error) {
+	var out [2]netip.AddrPort
 	if profile == ProfileSimple {
 		host, port, err := resolveMediaPort(addr)
 		if err != nil {
 			return out, err
 		}
-		media, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+		media, err := resolveAddrPort(host, port)
 		if err != nil {
-			return out, fmt.Errorf("%w: resolve media address %q: %v", ErrInvalidConfig, addr, err)
+			return out, fmt.Errorf("%w: resolve media address %q: %w", ErrInvalidConfig, addr, err)
 		}
-		rtcp, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port+1)))
+		rtcp, err := resolveAddrPort(host, port+1)
 		if err != nil {
-			return out, fmt.Errorf("%w: resolve rtcp address for %q: %v", ErrInvalidConfig, addr, err)
+			return out, fmt.Errorf("%w: resolve rtcp address for %q: %w", ErrInvalidConfig, addr, err)
 		}
-		return [2]*net.UDPAddr{media, rtcp}, nil
+		return [2]netip.AddrPort{media, rtcp}, nil
 	}
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return out, err
 	}
-	a, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	a, err := resolveAddrPort(host, port)
 	if err != nil {
-		return out, fmt.Errorf("%w: resolve address %q: %v", ErrInvalidConfig, addr, err)
+		return out, fmt.Errorf("%w: resolve address %q: %w", ErrInvalidConfig, addr, err)
 	}
-	return [2]*net.UDPAddr{a, a}, nil
+	return [2]netip.AddrPort{a, a}, nil
 }
 
 // applyBondProfile fills the session config's profile parameters (PSK keys,
@@ -267,7 +378,7 @@ func (s *BondedSender) SetWriteDeadline(t time.Time) error {
 func (s *BondedSender) Stats() Stats { return toStats(s.sess.Stats()) }
 
 // RemoteAddr returns the first path's media address.
-func (s *BondedSender) RemoteAddr() net.Addr { return s.remote }
+func (s *BondedSender) RemoteAddr() net.Addr { return net.UDPAddrFromAddrPort(s.remote) }
 
 // Close stops the sender and releases its socket and goroutines.
 func (s *BondedSender) Close() error {

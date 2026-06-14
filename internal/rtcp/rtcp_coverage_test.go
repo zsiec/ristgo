@@ -284,9 +284,47 @@ func TestBitmaskNACKExpansionBounded(t *testing.T) {
 		fcis[i] = NackPair{PID: uint16(i), BLP: 0xFFFF}
 	}
 	pkt := BitmaskNACK{MediaSSRC: 1, FCIs: fcis}
-	// Each FCI appends up to 17 seqs after the cap check, so the bound is
-	// maxNackExpand rounded up by at most one FCI window.
-	if got := pkt.MissingSeqs(); len(got) > maxNackExpand+17 {
-		t.Fatalf("MissingSeqs expanded to %d, want <= %d", len(got), maxNackExpand+17)
+	// The guard is enforced per appended sequence, so the expansion never
+	// exceeds maxNackExpand even when the cap is reached partway through an FCI.
+	if got := pkt.MissingSeqs(); len(got) > maxNackExpand {
+		t.Fatalf("MissingSeqs expanded to %d, want <= %d", len(got), maxNackExpand)
+	}
+}
+
+// TestBitmaskNACKExpansionStopsExactlyAtCap asserts the amplification guard
+// stops at exactly maxNackExpand even when the cap falls in the middle of an
+// FCI's 17-sequence window — the per-bit check must not let a whole bitmask
+// word push the total past the cap (rtcp-3).
+func TestBitmaskNACKExpansionStopsExactlyAtCap(t *testing.T) {
+	// Each FCI with BLP=0xFFFF expands to exactly 17 seqs (PID + 16 bits).
+	// 17 does not divide maxNackExpand (65536 = 17*3855 + 1), so the cap is
+	// hit one seq into FCI index 3855, mid-word. Enough FCIs to overshoot the
+	// cap by a full window if the guard were per-FCI rather than per-seq.
+	const fciCount = maxNackExpand/17 + 5
+	fcis := make([]NackPair, fciCount)
+	for i := range fcis {
+		fcis[i] = NackPair{PID: uint16(i), BLP: 0xFFFF}
+	}
+	pkt := BitmaskNACK{MediaSSRC: 1, FCIs: fcis}
+	got := pkt.MissingSeqs()
+	if len(got) != maxNackExpand {
+		t.Fatalf("MissingSeqs expanded to %d, want exactly %d (cap must stop mid-word)", len(got), maxNackExpand)
+	}
+
+	// Sanity: the expansion is a faithful prefix of the unbounded expansion up
+	// to the cap, so the last kept seq is the cap-th seq, not a window-rounded
+	// value. Rebuild the expected prefix the slow way and compare.
+	want := make([]uint32, 0, maxNackExpand)
+	for _, f := range fcis {
+		want = f.AppendSeqs(want)
+		if len(want) >= maxNackExpand {
+			break
+		}
+	}
+	want = want[:maxNackExpand]
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("seq %d: got %d, want %d (expansion must be an exact prefix)", i, got[i], want[i])
+		}
 	}
 }

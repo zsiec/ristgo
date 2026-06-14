@@ -6,6 +6,34 @@ import (
 	"github.com/zsiec/ristgo/internal/wire"
 )
 
+// Source-clock wrap constants (libRIST receiver_calculate_packet_time).
+//
+// A source media timestamp that jumps backward by more than half the 32-bit
+// timestamp space is a true wrap of the 32-bit RTP-derived counter, not jitter
+// or reordering. SourceTime crosses the wire as NTP-64; one full wrap of the
+// 32-bit MPEG-TS counter at 90 kHz spans (2^32 / 90000) seconds of media time:
+//
+//   - srcWrapPeriodNTP is that span in NTP-64 ticks ((UINT32_MAX << 32) /
+//     90000), matching libRIST's bump amount ((UINT32_MAX << 32) /
+//     RTP_PTYPE_MPEGTS_CLOCKHZ) exactly. The offset is bumped by this on a wrap
+//     so playout stays continuous, rather than snapped to now.
+//   - srcWrapPeriodMicros is the same span in microseconds (2^32 * 100 / 9),
+//     added to the stored offset (which the core keeps in microseconds).
+//   - srcWrapHalfNTP is half that span: a backward source-time delta exceeding
+//     it identifies a genuine wrap (libRIST's (max_source_time - source_time) >
+//     UINT32_MAX/2 test, scaled to the NTP-64 SourceTime domain). The half-span
+//     also far exceeds libRIST's ~10-hour offset-diff sanity floor, so that
+//     inner guard is subsumed.
+//
+// The 90 kHz figure is a constant, not a profile import: the core stays
+// profile-agnostic (it imports only seq/clock/rtt/wire) and never branches on
+// payload type.
+const (
+	srcWrapPeriodNTP    uint64             = (uint64(0xFFFFFFFF) << 32) / 90000
+	srcWrapHalfNTP      uint64             = srcWrapPeriodNTP / 2
+	srcWrapPeriodMicros clock.Microseconds = (clock.Microseconds(1) << 32) * 100 / 9
+)
+
 // slotState is the occupancy state of one ring slot.
 type slotState uint8
 
@@ -93,6 +121,12 @@ type receiverState struct {
 	maxSourceTime  uint64
 	lastPacketTime clock.Timestamp
 
+	// lastResync is libRIST's time_offset_changed_ts: the instant the source
+	// clock offset was last (re-)anchored. It gates the wrap re-anchor by a
+	// dwell guard (>= 3*recoveryBuffer since the last change) so a single
+	// out-of-order or anomalous timestamp cannot trigger repeated resyncs.
+	lastResync clock.Timestamp
+
 	// highest is the newest (circularly greatest) sequence inserted; it
 	// bounds the playout scan.
 	highest uint32
@@ -125,6 +159,18 @@ type receiverState struct {
 
 	// nackBatch is the reusable scratch buffer for one NACK pass.
 	nackBatch []uint32
+
+	// Return-bandwidth limiter (libRIST return-bandwidth): a token bucket capping
+	// the rate of NACK sequence numbers emitted on the return channel, so the
+	// receiver's NACK traffic stays within a configured upstream budget on an
+	// asymmetric link. nackSeqsPerSec == 0 means unlimited. A NACK seq that has no
+	// token is left due (its nextNack is not advanced) and re-serviced on the next
+	// pass, exactly like the RIST_MAX_NACKS per-pass cap — so recovery slows but
+	// is never broken. Deterministic: tokens refill from the explicit `now`.
+	nackSeqsPerSec float64
+	nackTokenBurst float64
+	nackTokens     float64
+	nackTokensTime clock.Timestamp
 }
 
 // pathBit returns the pathSeen bit for a path index (aliasing mod 64; see
@@ -154,48 +200,89 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 		return
 	}
 
-	packetTime := f.mapSourceTime(pkt.SourceTime)
+	// Count every retransmit-flagged copy that reaches the started flow, before
+	// any too-late / dedup / cursor test sheds it — so RetransmittedReceived
+	// tallies all retransmits actually received (including late and duplicate
+	// ones), separately from the gaps-filled-by-ARQ Recovered counter.
+	if pkt.Retransmit {
+		f.stats.RetransmittedReceived++
+	}
 
-	// Source-clock re-anchor (libRIST receiver_calculate_packet_time wrap
-	// fix-up): if a fresh, in-sequence packet maps far outside the recovery
-	// window, the source clock wrapped (a 32-bit RTP timestamp wraps every ~13h
-	// at 90 kHz) or was reset. The offset locked at the first packet is now
-	// stale, so without this every subsequent packet would map into the past and
-	// be shed as too-late — a permanent stall. Re-anchor the offset to the
-	// current arrival and reset the source-time tracking so playout continues.
-	// Gated on a fresh, in-order, non-retransmit packet far (> recovery window)
-	// from now, so ordinary jitter and reordering never trigger it.
-	if !pkt.Retransmit && pkt.Seq == r.lastFound+1 &&
-		(packetTime.Before(now.Add(-f.recoveryBuffer110)) || packetTime.After(now.Add(f.recoveryBuffer110))) {
-		src := clock.NTPTime(pkt.SourceTime).Timestamp()
-		r.offset = now.Sub(src)
+	// packetTime is the local-clock instant playout is scheduled from. In SOURCE
+	// timing it is the media source timestamp mapped into the local clock (so
+	// inter-packet spacing follows the source clock); in ARRIVAL timing it is the
+	// local arrival instant (so each packet is held a fixed recovery buffer from
+	// when it arrived, regardless of the source clock).
+	var packetTime clock.Timestamp
+	if f.cfg.TimingMode == TimingArrival {
+		// ARRIVAL timing: the source timestamp still feeds the (Seq, SourceTime)
+		// dedup/merge below, but does not drive playout — so the source-clock
+		// re-anchor and the source-time reorder/too-late test are skipped, and
+		// shedding falls to the seq-based playout-cursor guard plus each packet's
+		// own arrival-anchored outputTime.
 		packetTime = now
-		r.maxSourceTime = pkt.SourceTime
-		r.lastPacketTime = now
-		f.stats.ClockResync++
+	} else {
+		packetTime = f.mapSourceTime(pkt.SourceTime)
+
+		// Source-clock re-anchor (libRIST receiver_calculate_packet_time wrap
+		// fix-up). The 32-bit RTP-derived source counter wraps every ~13h at 90 kHz;
+		// after a wrap the offset locked at the first packet is one wrap period stale,
+		// so every subsequent packet would map into the past and be shed as too-late
+		// — a permanent stall. libRIST detects only a TRUE BACKWARD wrap, not a packet
+		// merely far from now: a fresh non-retransmit whose source time fell backward
+		// by more than half the 32-bit space (maxSourceTime - sourceTime >
+		// UINT32_MAX/2), gated by a dwell guard so a single anomalous or out-of-order
+		// timestamp cannot trigger it. On a wrap it BUMPS the offset by one wrap
+		// period (keeping playout continuous) rather than snapping to now.
+		//
+		//   - backward-wrap test: source time fell by more than half the wrap span.
+		//     Ordinary jitter/reordering moves it by milliseconds, far below the
+		//     ~6.6h half-span, so they never trigger it. A forward jump (or a packet
+		//     that is merely late) never triggers it either.
+		//   - dwell guard: at least 3*recoveryBuffer must have elapsed since the last
+		//     re-anchor (libRIST: now - time_offset_changed_ts > 3*recovery_buffer),
+		//     so a wrap is corrected at most once per dwell window.
+		//   - bump, don't snap: offset += one wrap period, so the wrapped source time
+		//     maps to ~now and playout continues without a timing discontinuity.
+		if !pkt.Retransmit && pkt.SourceTime < r.maxSourceTime &&
+			r.maxSourceTime-pkt.SourceTime > srcWrapHalfNTP &&
+			now.Sub(r.lastResync) >= 3*f.recoveryBuffer {
+			r.offset += srcWrapPeriodMicros
+			packetTime = f.mapSourceTime(pkt.SourceTime)
+			r.maxSourceTime = pkt.SourceTime
+			r.lastPacketTime = packetTime
+			r.lastResync = now
+			f.stats.ClockResync++
+		}
 	}
 
 	// Track the newest source timestamp and its packet time, mirroring
 	// calculate_packet_time. The update runs before the out-of-order
 	// comparison, exactly as in libRIST, so the packet advancing the clock
-	// can never compare against itself.
+	// can never compare against itself. (In ARRIVAL timing lastPacketTime is
+	// not read — the source-time reorder test below is skipped — but tracking
+	// it is harmless.)
 	if pkt.SourceTime > r.maxSourceTime {
 		r.maxSourceTime = pkt.SourceTime
 		r.lastPacketTime = packetTime
 	}
 
-	// Out-of-order / too-late shedding: only packets older than the newest
-	// packet time and not the immediate successor of lastFound are
-	// candidates.
+	// Out-of-order / too-late shedding by SOURCE time: only packets older than
+	// the newest packet time and not the immediate successor of lastFound are
+	// candidates. Skipped in ARRIVAL timing, where playout is not source-paced
+	// (the seq-based cursor guard below sheds the unrecoverable ones instead).
 	// DEVIATION(librist): libRIST computes the expected successor as
 	// (last_seq_found+1) & (UINT16_MAX-1) — the 0xFFFE mask clears bit 0
 	// and looks like a typo for & UINT16_MAX; we compare against the true
 	// widened successor.
 	outOfOrder := false
-	if packetTime.Before(r.lastPacketTime) && pkt.Seq != r.lastFound+1 {
+	if f.cfg.TimingMode == TimingSource && packetTime.Before(r.lastPacketTime) && pkt.Seq != r.lastFound+1 {
 		if now.After(packetTime.Add(f.recoveryBuffer110)) {
 			// now > packetTime + recoveryBuffer*1.1.
 			f.stats.TooLate++
+			if pkt.Retransmit {
+				f.stats.TooLateRetransmit++
+			}
 			return
 		}
 		if !pkt.Retransmit {
@@ -213,6 +300,9 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	// cursor guard subsumes it.
 	if seq.Num32(pkt.Seq).Less(seq.Num32(r.deliverNext)) {
 		f.stats.TooLate++
+		if pkt.Retransmit {
+			f.stats.TooLateRetransmit++
+		}
 		return
 	}
 
@@ -275,6 +365,7 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	r.lastFound = pkt.Seq
 	r.maxSourceTime = pkt.SourceTime
 	r.lastPacketTime = now // == src + offset by construction
+	r.lastResync = now     // dwell anchor for the wrap re-anchor guard
 	r.highest = pkt.Seq
 	r.deliverNext = pkt.Seq
 	r.lastPath = path
@@ -304,6 +395,15 @@ func (f *Flow) markMissing(now clock.Timestamp, path uint8, current uint32, pack
 	// from 16-bit sequences, matching libRIST's
 	// `if (missing_count > 32768) return`.
 	// See ORCHESTRATION.md, 2026-06-12 WP3 binding.
+	//
+	// CONSEQUENCE for native 32-bit Advanced (TR-06-3) flows: this 16-bit
+	// threshold is applied uniformly (libRIST likewise masks missing_count to
+	// 16 bits via & UINT16_MAX before the test), so a *contiguous* loss burst
+	// wider than 32768 sequences is mistaken for a backward wrap and never
+	// NACKed — those packets are recovered only by playout skip, not ARQ. This
+	// is kept deliberately bug-compatible with libRIST for interop parity; a
+	// burst that large already exceeds any realistic recovery window, so the
+	// packets would age out before they could be recovered regardless.
 	if gap > seq.MaxGap16 {
 		return
 	}
@@ -423,6 +523,20 @@ func (f *Flow) processNacks(now clock.Timestamp) {
 	if r.missingCount == 0 {
 		return
 	}
+	// Refill the return-bandwidth token bucket from the elapsed time (sans-I/O:
+	// the rate is applied against the explicit `now`, not a wall clock). The
+	// bucket starts full (one burst), so the first pass — whatever `now` is —
+	// just clamps at the burst cap.
+	if r.nackSeqsPerSec > 0 {
+		if elapsed := now.Sub(r.nackTokensTime); elapsed > 0 {
+			r.nackTokens += float64(elapsed) / 1e6 * r.nackSeqsPerSec
+			if r.nackTokens > r.nackTokenBurst {
+				r.nackTokens = r.nackTokenBurst
+			}
+		}
+		r.nackTokensTime = now
+	}
+
 	batch := r.nackBatch[:0]
 	var prev *missingEntry
 	for e := r.missingHead; e != nil; {
@@ -446,14 +560,18 @@ func (f *Flow) processNacks(now clock.Timestamp) {
 			remove = true
 		case !now.Before(e.nextNack):
 			// Cap one emitted NackRequest at RIST_MAX_NACKS sequences (libRIST
-			// receiver_nack_output maxcounter). When the budget is full the entry
-			// is left due — its nextNack is not advanced — so it is serviced on
-			// the next 5 ms pass rather than dropped.
-			if len(batch) < ristMaxNacks {
+			// receiver_nack_output maxcounter) AND at the return-bandwidth token
+			// budget. When either is full the entry is left due — its nextNack is
+			// not advanced — so it is serviced on the next 5 ms pass rather than
+			// dropped (recovery slows, nothing is lost).
+			if len(batch) < ristMaxNacks && (r.nackSeqsPerSec == 0 || r.nackTokens >= 1) {
 				e.nextNack = now.Add(f.est.RetryInterval(f.cfg.RTTMin, f.cfg.RTTMax))
 				e.nackCount++
 				batch = append(batch, e.seq)
 				f.stats.NacksSent++
+				if r.nackSeqsPerSec > 0 {
+					r.nackTokens--
+				}
 			}
 		}
 		if remove {

@@ -73,15 +73,26 @@ const (
 	minMatch = 4
 
 	// lastLiterals is the number of trailing input bytes that the LZ4 block
-	// format requires to be emitted as literals (a match may not end inside
-	// the final 5 bytes), and mfLimit is the position past which the match
-	// finder stops looking for new matches. These are reference-lz4 invariants
-	// that keep emitted blocks decodable.
+	// format requires to be emitted as literals: a match may not end inside the
+	// final 5 bytes (LASTLITERALS in the reference codec). This is a fixed LZ4
+	// block-format invariant that keeps emitted blocks decodable.
 	lastLiterals = 5
-	mfLimit      = minMatch + lastLiterals
+
+	// mfLimit is the offset from the end of input past which this match finder
+	// stops looking for new matches: a candidate match needs minMatch bytes
+	// plus lastLiterals trailing literals, so it must stop minMatch+lastLiterals
+	// (9) bytes from the end. This is NOT the reference LZ4 MFLIMIT constant
+	// (which is a fixed 12, sized to give a decoder room for its 8-byte
+	// wildcopies); this codec's Decompress copies one byte at a time, so the
+	// smaller, exactly-sufficient bound of 9 is safe and every block it emits
+	// is still a valid LZ4 block decodable by the reference codec (which only
+	// requires the LASTLITERALS=5 trailing-literals rule).
+	mfLimit = minMatch + lastLiterals
 
 	// minLength is the smallest input the match finder will scan; shorter
-	// inputs are emitted as a single literals-only sequence.
+	// inputs are emitted as a single literals-only sequence. The reference LZ4
+	// uses LZ4_minLength = MFLIMIT+1 = 13 with its MFLIMIT of 12; this codec's
+	// matching minLength is mfLimit+1 = 10, consistent with its smaller mfLimit.
 	minLength = mfLimit + 1
 
 	// hashLog sizes the match-finder hash table (1<<hashLog entries). 12 gives

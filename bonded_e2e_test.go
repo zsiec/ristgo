@@ -3,6 +3,7 @@ package ristgo_test
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
@@ -387,5 +388,46 @@ func TestE2EBondedMainAdvanced(t *testing.T) {
 				t.Fatalf("%s: expected the second path's copies to be deduplicated, Duplicates=0", tc.name)
 			}
 		})
+	}
+}
+
+// TestNewBondedReceiverPeersPriority builds a per-peer bonded receiver with
+// distinct recovery priorities and streams over it, proving the per-path
+// priority API constructs a working session (the priority→NACK-path selection
+// itself is unit-tested in internal/bonding).
+func TestNewBondedReceiverPeersPriority(t *testing.T) {
+	const totalBytes = 64 * 1024
+	pA, pB := twoEvenPorts(t)
+	peers := []ristgo.BondedPeer{
+		{Addr: fmt.Sprintf("127.0.0.1:%d", pA), Priority: 9}, // preferred NACK path
+		{Addr: fmt.Sprintf("127.0.0.1:%d", pB), Priority: 1},
+	}
+	rx, err := ristgo.NewBondedReceiverPeers(peers, bondConfig())
+	if err != nil {
+		t.Fatalf("NewBondedReceiverPeers: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewBondedSender(
+		[]string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}, bondConfig())
+	if err != nil {
+		t.Fatalf("NewBondedSender: %v", err)
+	}
+	defer tx.Close()
+
+	payload := make([]byte, totalBytes)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if got := streamSHA(t, tx, rx, payload, nil); got != sha256.Sum256(payload) {
+		t.Fatalf("per-peer bonded delivery hash mismatch")
+	}
+}
+
+// TestBondedPeerNegativePriorityRejected verifies a negative BondedPeer.Priority
+// is rejected with ErrInvalidConfig.
+func TestBondedPeerNegativePriorityRejected(t *testing.T) {
+	peers := []ristgo.BondedPeer{{Addr: "127.0.0.1:5000", Priority: -1}}
+	if _, err := ristgo.NewBondedReceiverPeers(peers, bondConfig()); !errors.Is(err, ristgo.ErrInvalidConfig) {
+		t.Fatalf("NewBondedReceiverPeers negative priority err = %v, want ErrInvalidConfig", err)
 	}
 }

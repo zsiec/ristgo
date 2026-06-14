@@ -21,6 +21,7 @@ package socket
 import (
 	"fmt"
 	"net"
+	"net/netip"
 
 	"github.com/zsiec/ristgo/internal/dtls"
 )
@@ -39,9 +40,9 @@ type Conn struct {
 	// dtls.go.
 	dtlsCfg    *dtls.Config
 	dtlsClient bool
-	dtlsRemote *net.UDPAddr // client role: the peer to converse with
-	dtls       *dtls.Conn   // established by Handshake
-	dtlsPeer   *net.UDPAddr // known (client) or learned (server) peer address
+	dtlsRemote *net.UDPAddr   // client role: the peer to converse with
+	dtls       *dtls.Conn     // established by Handshake
+	dtlsPeer   netip.AddrPort // known (client) or learned (server) peer address
 }
 
 // Listen binds the media socket to host:port and the RTCP socket to
@@ -81,6 +82,36 @@ func ListenEphemeral(host string) (*Conn, error) {
 	return &Conn{media: media, rtcp: rtcp}, nil
 }
 
+// ListenEphemeralFamily is ListenEphemeral with an explicit address family
+// ("udp4" or "udp6"). A multicast sender must bind its egress socket in the
+// group's family: a dual-stack ("udp", [::]) socket cannot have an IPv4
+// multicast interface/TTL set on it (the ipv4 socket options reject a
+// v6-bound fd with EINVAL). network "udp" (the default) preserves the
+// dual-stack unicast behavior.
+func ListenEphemeralFamily(network, host string) (*Conn, error) {
+	media, err := bindNet(network, host, 0)
+	if err != nil {
+		return nil, fmt.Errorf("rist: socket: bind media: %w", err)
+	}
+	rtcp, err := bindNet(network, host, 0)
+	if err != nil {
+		media.Close()
+		return nil, fmt.Errorf("rist: socket: bind rtcp: %w", err)
+	}
+	return &Conn{media: media, rtcp: rtcp}, nil
+}
+
+// ListenEphemeralSingleFamily is ListenEphemeralSingle with an explicit address
+// family ("udp4"/"udp6"); see ListenEphemeralFamily for why a multicast sender
+// needs it.
+func ListenEphemeralSingleFamily(network, host string) (*Conn, error) {
+	c, err := bindNet(network, host, 0)
+	if err != nil {
+		return nil, fmt.Errorf("rist: socket: bind main: %w", err)
+	}
+	return &Conn{media: c, rtcp: c, single: true}, nil
+}
+
 // FromConns wraps two already-bound UDP sockets (media even, rtcp odd). It
 // lets a caller inject sockets — for tests or to satisfy a PacketConn-style
 // API — and takes ownership: Close closes both.
@@ -115,13 +146,23 @@ func ListenEphemeralSingle(host string) (*Conn, error) {
 	return &Conn{media: c, rtcp: c, single: true}, nil
 }
 
-// bind opens an unconnected UDP socket on host:port.
+// bind opens an unconnected UDP socket on host:port using the dual-stack "udp"
+// network (the default unicast behavior).
 func bind(host string, port int) (*net.UDPConn, error) {
+	return bindNet("udp", host, port)
+}
+
+// bindNet opens an unconnected UDP socket on host:port in the given network
+// ("udp", "udp4", or "udp6"). An empty network defaults to "udp".
+func bindNet(network, host string, port int) (*net.UDPConn, error) {
+	if network == "" {
+		network = "udp"
+	}
 	addr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
 	if host == "" {
 		addr.IP = nil
 	}
-	return net.ListenUDP("udp", addr)
+	return net.ListenUDP(network, addr)
 }
 
 // MediaPort returns the local media (even) port the transport is bound to.
@@ -131,35 +172,39 @@ func (c *Conn) MediaPort() int { return c.media.LocalAddr().(*net.UDPAddr).Port 
 // and the source address (the sender's media address, for a receiver). When DTLS
 // is enabled (Main profile), it returns the next decrypted application record and
 // the established peer's address.
-func (c *Conn) ReadMedia(buf []byte) (int, *net.UDPAddr, error) {
+//
+// It uses (*net.UDPConn).ReadFromUDPAddrPort so the per-datagram receive path is
+// allocation-free: a netip.AddrPort is a value type, so the source address is not
+// heap-allocated the way ReadFromUDP's *net.UDPAddr was.
+func (c *Conn) ReadMedia(buf []byte) (int, netip.AddrPort, error) {
 	if c.dtls != nil {
 		n, err := c.dtls.Read(buf)
 		return n, c.dtlsPeer, err
 	}
-	return c.media.ReadFromUDP(buf)
+	return c.media.ReadFromUDPAddrPort(buf)
 }
 
 // ReadRTCP reads one RTCP datagram into buf, returning the byte count and the
-// source address.
-func (c *Conn) ReadRTCP(buf []byte) (int, *net.UDPAddr, error) {
-	return c.rtcp.ReadFromUDP(buf)
+// source address. Like ReadMedia it reads via ReadFromUDPAddrPort (alloc-free).
+func (c *Conn) ReadRTCP(buf []byte) (int, netip.AddrPort, error) {
+	return c.rtcp.ReadFromUDPAddrPort(buf)
 }
 
 // WriteMedia sends a media (RTP) datagram to dst. When DTLS is enabled (Main
 // profile) it seals b as a DTLS application record to the established peer and
 // dst is ignored (the DTLS session is bound to one peer).
-func (c *Conn) WriteMedia(b []byte, dst *net.UDPAddr) error {
+func (c *Conn) WriteMedia(b []byte, dst netip.AddrPort) error {
 	if c.dtls != nil {
 		_, err := c.dtls.Write(b)
 		return err
 	}
-	_, err := c.media.WriteToUDP(b, dst)
+	_, err := c.media.WriteToUDPAddrPort(b, dst)
 	return err
 }
 
 // WriteRTCP sends an RTCP datagram to dst.
-func (c *Conn) WriteRTCP(b []byte, dst *net.UDPAddr) error {
-	_, err := c.rtcp.WriteToUDP(b, dst)
+func (c *Conn) WriteRTCP(b []byte, dst netip.AddrPort) error {
+	_, err := c.rtcp.WriteToUDPAddrPort(b, dst)
 	return err
 }
 

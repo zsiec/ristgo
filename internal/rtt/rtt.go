@@ -35,6 +35,28 @@ package rtt
 
 import "github.com/zsiec/ristgo/internal/clock"
 
+// ristRTTMinFloorMs is libRIST's RIST_RTT_MIN: the hard 3 ms floor enforced on
+// the effective recovery_rtt_min. A configured rtt_min below this is raised to
+// 3 ms before it bounds the smoothed or raw RTT, so cold-start NACK retry
+// spacing (and the sender's retransmit gate) never collapses to a sub-3 ms
+// interval — roughly an order of magnitude too tight — before the EWMA climbs.
+const ristRTTMinFloorMs = 3
+
+// rttMinFloor is the 3 ms RIST_RTT_MIN floor in clock.Microseconds.
+const rttMinFloor = clock.Microseconds(ristRTTMinFloorMs) * clock.Millisecond
+
+// effectiveRTTMin raises a configured rtt_min to the 3 ms RIST_RTT_MIN hard
+// floor. It is applied at every clamped read (Clamped/LastClamped, and so
+// RetryInterval), so the floor holds wherever the RTT actually bounds a value,
+// regardless of the configured rtt_min. The raw New seed is left unfloored to
+// document libRIST's exact init arithmetic.
+func effectiveRTTMin(rttMin clock.Microseconds) clock.Microseconds {
+	if rttMin < rttMinFloor {
+		return rttMinFloor
+	}
+	return rttMin
+}
+
 // Estimator holds the two RTT values libRIST keeps per peer: the
 // eight_times_rtt EWMA and the most recent raw sample (last_rtt). libRIST
 // uses them for different jobs — the EWMA paces the receiver's NACK retry
@@ -62,7 +84,10 @@ type Estimator struct {
 
 // New returns an Estimator seeded for cold start:
 // eight_times_rtt = rttMin * 8, so the first Smoothed() reading is exactly
-// rttMin (init_peer_settings).
+// rttMin (init_peer_settings). The seed replicates libRIST's raw init
+// arithmetic verbatim; the 3 ms RIST_RTT_MIN hard floor is applied later, at
+// every clamped read (Clamped/LastClamped), so a configured rtt_min below 3 ms
+// still yields an effective floor of 3 ms wherever the value is actually used.
 //
 // A negative rttMin is pinned to 0. libRIST cannot express one
 // (recovery_rtt_min is unsigned), and Config validation rejects it before
@@ -108,10 +133,12 @@ func (e Estimator) Smoothed() clock.Microseconds {
 //	if (rtt < rtt_min)      rtt = rtt_min;
 //	else if (rtt > rtt_max) rtt = rtt_max;
 //
-// The else-if is load-bearing for degenerate bounds: when rttMin > rttMax
-// (rejected by Config validation, but accepted here without panicking) a
-// value below rttMin returns rttMin even though it exceeds rttMax, just as
-// the C does.
+// The 3 ms RIST_RTT_MIN floor is applied by the Clamped/LastClamped callers
+// (which raise rttMin via effectiveRTTMin), not here, so this helper documents
+// the bare libRIST branch — including the else-if's load-bearing behavior for
+// degenerate bounds: when rttMin > rttMax (rejected by Config validation, but
+// accepted here without panicking) a value below rttMin returns rttMin even
+// though it exceeds rttMax, just as the C does.
 func clamp(rtt, rttMin, rttMax clock.Microseconds) clock.Microseconds {
 	if rtt < rttMin {
 		rtt = rttMin
@@ -121,24 +148,27 @@ func clamp(rtt, rttMin, rttMax clock.Microseconds) clock.Microseconds {
 	return rtt
 }
 
-// Clamped returns Smoothed() clamped to [rttMin, rttMax]. This is the value
-// libRIST's receiver uses for the NACK retry interval.
+// Clamped returns Smoothed() clamped to [rttMin, rttMax], where rttMin is first
+// raised to the 3 ms RIST_RTT_MIN hard floor (effectiveRTTMin). This is the
+// value libRIST's receiver uses for the NACK retry interval; the floor keeps
+// cold-start retry spacing from collapsing below 3 ms before the EWMA climbs.
 func (e Estimator) Clamped(rttMin, rttMax clock.Microseconds) clock.Microseconds {
-	return clamp(e.Smoothed(), rttMin, rttMax)
+	return clamp(e.Smoothed(), effectiveRTTMin(rttMin), rttMax)
 }
 
 // Last returns the most recent raw RTT sample (libRIST peer->last_rtt), 0
 // before the first Observe.
 func (e Estimator) Last() clock.Microseconds { return e.lastSample }
 
-// LastClamped returns the most recent raw sample clamped to [rttMin, rttMax].
+// LastClamped returns the most recent raw sample clamped to [rttMin, rttMax],
+// with rttMin first raised to the 3 ms RIST_RTT_MIN hard floor (effectiveRTTMin).
 // This is the value libRIST's sender uses for the per-packet retransmit gate
 // (peer->last_rtt clamped): deliberately the freshest sample, not the EWMA, so
 // the gate tracks the current round-trip time. Before the first echo response
-// lastSample is 0, which clamps up to rttMin, matching libRIST's cold-start
-// gate.
+// lastSample is 0, which clamps up to the effective rtt_min (>= 3 ms), matching
+// libRIST's cold-start gate.
 func (e Estimator) LastClamped(rttMin, rttMax clock.Microseconds) clock.Microseconds {
-	return clamp(e.lastSample, rttMin, rttMax)
+	return clamp(e.lastSample, effectiveRTTMin(rttMin), rttMax)
 }
 
 // RetryInterval returns the NACK retry spacing: 1.1 times Clamped(rttMin,

@@ -165,6 +165,14 @@ type Config struct {
 	// default is CongestionNormal, set by DefaultConfig and the host.
 	CongestionControl CongestionMode
 
+	// ReturnMaxBitrate is libRIST's return-bandwidth in kbps: a cap on the
+	// receiver's outbound NACK channel so its retransmission requests stay within
+	// an upstream budget on an asymmetric link. 0 (the default) means unlimited.
+	// Receiver-side only. NOTE: libRIST v0.2.18 stores but does not enforce this
+	// value; ristgo enforces it as an interop-safe enhancement (a sender simply
+	// receives fewer NACKs, which is never a protocol violation).
+	ReturnMaxBitrate int
+
 	// RingSize is the ring capacity in slots — the receiver history ring and
 	// the sender retransmit-history ring alike. Values <= 0 default to a size
 	// derived from the recovery window and RecoveryMaxBitrate (so a window's
@@ -183,7 +191,31 @@ type Config struct {
 	// PushApp packet, incrementing by one thereafter. Sender-only; the
 	// receiver anchors on whatever sequence first arrives.
 	StartSeq uint32
+
+	// TimingMode selects how the receiver schedules playout (libRIST
+	// timing_mode). The zero value is TimingSource, the libRIST default.
+	// Receiver-only.
+	TimingMode TimingMode
 }
+
+// TimingMode selects the receiver playout-scheduling clock.
+type TimingMode uint8
+
+const (
+	// TimingSource paces playout by the media SOURCE timestamps (libRIST
+	// timing_mode SOURCE): a packet's playout deadline is its source time mapped
+	// into the local clock plus the recovery buffer, so inter-packet spacing
+	// follows the source clock. This is the default and the zero value.
+	TimingSource TimingMode = iota
+
+	// TimingArrival paces playout by ARRIVAL time (libRIST timing_mode ARRIVAL):
+	// each packet's playout deadline is its own arrival instant plus the recovery
+	// buffer, ignoring the source timestamps for pacing (they are still used for
+	// the (Seq, SourceTime) dedup / 2022-7 merge). This is robust to a drifting or
+	// absent source clock at the cost of not preserving source inter-packet
+	// timing.
+	TimingArrival
+)
 
 // DefaultConfig returns the libRIST defaults:
 // recovery_length_min/max = 1000 ms, reorder_buffer = 15 ms, rtt_min = 5 ms,
@@ -274,6 +306,13 @@ func New(role Role, cfg Config) *Flow {
 	case RoleReceiver:
 		f.receiver.ring = make([]slot, size)
 		f.receiver.mask = uint32(size - 1)
+		if cfg.ReturnMaxBitrate > 0 {
+			// return-channel bytes/sec divided by bytes-per-NACK-seq = the NACK
+			// sequence rate; burst up to one full per-pass NACK group.
+			f.receiver.nackSeqsPerSec = float64(cfg.ReturnMaxBitrate) * 1000 / 8 / ristNackBytesPerSeq
+			f.receiver.nackTokenBurst = float64(ristMaxNacks)
+			f.receiver.nackTokens = f.receiver.nackTokenBurst
+		}
 	case RoleSender:
 		f.sender.ring = make([]senderSlot, size)
 		f.sender.mask = uint32(size - 1)

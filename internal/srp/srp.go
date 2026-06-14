@@ -60,13 +60,22 @@ var (
 	ErrInvalidGroup = errors.New("rist: srp: invalid group")
 
 	// ErrInvalidSalt is returned by NewClient/NewServer when the salt is empty.
-	// libRIST bounds the salt at 1..64 bytes; we accept any
-	// non-empty salt and never reject on the upper bound, since the salt is the
-	// caller's to choose.
+	// libRIST bounds the salt at 1..64 bytes; we accept any non-empty salt up to
+	// MaxSaltLen (a far looser bound than libRIST's, but enough to reject an
+	// absurdly long, attacker-supplied salt that would be a needless parse and
+	// hashing-work hazard), since the salt is otherwise the caller's to choose.
 	ErrInvalidSalt = errors.New("rist: srp: empty salt")
 
+	// ErrSaltTooLong is returned by NewClient/NewServer/MakeVerifier when the
+	// salt exceeds MaxSaltLen bytes. The bound caps the work an attacker can
+	// force through a CHALLENGE-supplied salt (it is hashed into x, M1, and the
+	// session key) without rejecting any plausible real salt.
+	ErrSaltTooLong = errors.New("rist: srp: salt too long")
+
 	// ErrInvalidVerifier is returned by NewServer when the verifier is empty or
-	// is congruent to zero modulo N (RFC 5054 rejects v == 0).
+	// is congruent to zero modulo N. libRIST rejects only the raw v == 0; ristgo
+	// applies the stricter (and safe-superset) v mod N == 0 check, since a
+	// verifier that is any multiple of N is equally degenerate. See NewServer.
 	ErrInvalidVerifier = errors.New("rist: srp: invalid verifier")
 
 	// ErrBadParameter is returned by HandleA/ComputeKey when a peer-supplied
@@ -84,6 +93,14 @@ var (
 // hashLen is the SHA-256 digest length in bytes; the SRP hash output size and
 // the size of M1, M2, and the session key K.
 const hashLen = sha256.Size
+
+// MaxSaltLen is the largest salt this package accepts. A real SRP salt is a
+// small random nonce (libRIST uses 32 bytes and bounds it at 64); the on-wire
+// CHALLENGE salt length is a 16-bit field, so a peer could otherwise hand us a
+// ~64 KiB salt that we would hash on every handshake. 1024 bytes is far above
+// any legitimate salt yet firmly rejects an absurdly long, attacker-supplied
+// one. NewClient, NewServer, and MakeVerifier all enforce it.
+const MaxSaltLen = 1024
 
 // Hash returns SHA-256 over the concatenation of parts. It is the SRP hash
 // (libRIST's librist_crypto_srp_hash) and is exported because
@@ -177,6 +194,18 @@ func hashUnpadded(a, b *big.Int) [hashLen]byte {
 	return Hash(minimalBytes(a), minimalBytes(b))
 }
 
+// validateSalt enforces the salt length bounds shared by NewClient, NewServer,
+// and MakeVerifier: non-empty and at most MaxSaltLen bytes.
+func validateSalt(salt []byte) error {
+	if len(salt) == 0 {
+		return ErrInvalidSalt
+	}
+	if len(salt) > MaxSaltLen {
+		return ErrSaltTooLong
+	}
+	return nil
+}
+
 // canonSalt strips leading zero bytes from the salt, matching libRIST, which
 // holds the salt as a BIGNUM and re-exports it at its minimal big-endian length
 // (BIGNUM_GET_BINARY_SIZE) wherever it is hashed — in calc_x and in
@@ -258,9 +287,12 @@ func calcM2(a *big.Int, m1, key [hashLen]byte) [hashLen]byte {
 // result is the big-endian verifier at its natural minimal length, matching
 // libRIST's librist_crypto_srp_create_verifier
 // (BIGNUM_WRITE_BYTES_ALLOC at the verifier's mpi_size). It uses the
-// PAD-compliant ("correct hashing") path. A nil or invalid group yields nil.
+// PAD-compliant ("correct hashing") path. A nil or invalid group, an empty
+// salt, or a salt longer than MaxSaltLen yields nil (this is the error-free
+// provisioning helper; the handshake constructors NewClient/NewServer return
+// the matching ErrInvalidSalt/ErrSaltTooLong sentinels for the same inputs).
 func MakeVerifier(g *Group, username, password string, salt []byte) []byte {
-	if !g.valid() || len(salt) == 0 {
+	if !g.valid() || validateSalt(salt) != nil {
 		return nil
 	}
 	x := calcX(salt, username, password)
@@ -314,8 +346,8 @@ func newClient(g *Group, salt []byte, legacyPad bool, src io.Reader) (*Client, e
 	if !g.valid() {
 		return nil, ErrInvalidGroup
 	}
-	if len(salt) == 0 {
-		return nil, ErrInvalidSalt
+	if err := validateSalt(salt); err != nil {
+		return nil, err
 	}
 	a, err := readSecret(src, g.N)
 	if err != nil {
@@ -465,15 +497,21 @@ func newServer(g *Group, verifier, salt []byte, legacyPad bool, src io.Reader) (
 	if !g.valid() {
 		return nil, ErrInvalidGroup
 	}
-	if len(salt) == 0 {
-		return nil, ErrInvalidSalt
+	if err := validateSalt(salt); err != nil {
+		return nil, err
 	}
 	if len(verifier) == 0 {
 		return nil, ErrInvalidVerifier
 	}
 	v := new(big.Int).SetBytes(verifier)
-	// RFC 5054: reject v == 0. We test v mod N == 0 so a
-	// verifier supplied as a multiple of N is also rejected.
+	// Reject a degenerate verifier. libRIST checks only the raw v == 0; ristgo
+	// deliberately diverges and applies the STRICTER test v mod N == 0, so a
+	// verifier supplied as a multiple of N (e.g. N itself, or 2N) is rejected
+	// too. Such a value is just as degenerate as 0: it reduces to 0 in the group,
+	// collapsing B = (k*v + g^b) mod N to g^b and stripping the password binding
+	// from the exchange. The stricter check is a safe superset of libRIST's (it
+	// rejects everything libRIST rejects, plus the equally-broken multiples of N)
+	// and never rejects a legitimate verifier, which is always in [1, N).
 	if new(big.Int).Mod(v, g.N).Sign() == 0 {
 		return nil, ErrInvalidVerifier
 	}

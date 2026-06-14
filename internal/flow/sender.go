@@ -125,21 +125,25 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 
 // serviceNack retransmits every requested sequence still resendable, applying
 // the libRIST sender gates in libRIST's own evaluation order — the RTT/bloat
-// suppression gate (rist_retry_enqueue) before the max-retries cap
-// (rist_retry_dequeue), because enqueue runs before dequeue:
+// suppression gate (rist_retry_enqueue) first, then the rist_retry_dequeue
+// gates in their own order (bandwidth cap before the max-retries cap):
 //
 //   - slot empty or holding a different seq -> aged out, unserviceable
 //     (RetransmitSkipped);
-//   - last retransmit < one clamped RTT ago -> suppressed
-//     (RetransmitSuppressed);
+//   - last retransmit < one clamped RTT ago (2*RTT under AGGRESSIVE) ->
+//     suppressed (RetransmitSuppressed);
+//   - over the recovery_maxbitrate ceiling  -> BandwidthSkipped;
 //   - transmitCount >= MaxRetries           -> abandoned (RetransmitExhausted);
 //   - otherwise                             -> re-send with Retransmit set.
 //
-// Evaluating suppression before exhaustion matches libRIST's counter
+// Evaluating suppression before the dequeue gates matches libRIST's counter
 // attribution: a sequence both past MaxRetries and re-NACKed within one RTT is
 // counted suppressed (libRIST increments bloat_skip at enqueue and never
-// reaches the dequeue cap), not exhausted. The outcome (no re-send) is the
-// same either way; only the stat differs.
+// reaches the dequeue cap), not exhausted. Within the dequeue gates the
+// bandwidth cap precedes the max-retries cap, mirroring rist_retry_dequeue
+// (bandwidth_skip then the transmit_count >= max_retries retrans_skip), so a
+// sequence both over budget and past MaxRetries is attributed BandwidthSkipped.
+// The outcome (no re-send) is the same either way; only the stat differs.
 //
 // The gate clamps the most recent raw RTT sample (libRIST peer->last_rtt),
 // deliberately the freshest sample rather than the EWMA the receiver uses for
@@ -164,6 +168,12 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 func (f *Flow) serviceNack(now clock.Timestamp, req wire.NackRequest) {
 	s := &f.sender
 	rtt := f.est.LastClamped(f.cfg.RTTMin, f.cfg.RTTMax)
+	if f.cfg.CongestionControl == CongestionAggressive {
+		// Aggressive congestion control allows a retransmit only every 2*RTT
+		// (libRIST rist_retry_enqueue doubles the suppression spacing under
+		// AGGRESSIVE). NORMAL (the default) keeps the 1*RTT spacing.
+		rtt *= 2
+	}
 	// Refresh the bitrate windows so a stale-but-high estimate decays even when
 	// no new bytes have flowed since the last pass (libRIST refreshes with len 0
 	// at the top of rist_retry_dequeue).
@@ -177,13 +187,16 @@ func (f *Flow) serviceNack(now clock.Timestamp, req wire.NackRequest) {
 			f.stats.RetransmitSkipped++
 		case sl.retried && now.Sub(sl.lastRetry) < rtt:
 			f.stats.RetransmitSuppressed++
-		case sl.transmitCount >= f.cfg.MaxRetries:
-			f.stats.RetransmitExhausted++
 		case overBudget(f.cfg.CongestionControl, &s.dataBW, &s.retryBW, f.cfg.RecoveryMaxBitrate):
 			// Over the recovery_maxbitrate ceiling: refuse without advancing the
 			// retry state, so the receiver re-NACKs and we accept it once the
-			// rate decays (libRIST returns before touching transmit_count).
+			// rate decays (libRIST returns before touching transmit_count). The
+			// bandwidth gate is evaluated BEFORE the max-retries cap, matching
+			// libRIST's rist_retry_dequeue order (bandwidth_skip then the
+			// transmit_count >= max_retries retrans_skip).
 			f.stats.BandwidthSkipped++
+		case sl.transmitCount >= f.cfg.MaxRetries:
+			f.stats.RetransmitExhausted++
 		default:
 			sl.lastRetry = now
 			sl.retried = true

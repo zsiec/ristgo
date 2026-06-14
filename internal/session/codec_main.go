@@ -184,6 +184,28 @@ func newMainCodec(sendKey *crypto.Key, recvKey *crypto.Decryptor, keySize256 boo
 	}
 }
 
+// setSendKey installs (or replaces) the PSK encryptor used for outbound
+// datagrams, with keySize256 selecting the GRE H bit. It is the re-key seam for
+// the EAP-SRP use_key_as_passphrase mode: a Main session starts cleartext (no
+// secret) and, on the SRP session key K becoming available, keys the send path
+// from K. A nil key disables encryption. The host calls it on the loop goroutine
+// (the codec's sole owner) before any media is sent, so no in-flight datagram
+// straddles the change.
+func (c *mainCodec) setSendKey(k *crypto.Key, keySize256 bool) {
+	c.sendKey = k
+	c.keySize256 = keySize256
+}
+
+// setRecvKey installs (or replaces) the PSK decryptor used for inbound
+// datagrams. It is the receive-side counterpart of setSendKey (EAP-SRP
+// use_key_as_passphrase re-key). A nil decryptor disables decryption.
+func (c *mainCodec) setRecvKey(d *crypto.Decryptor) {
+	c.recvKey = d
+}
+
+// hasSendKey reports whether the codec is currently keying its send path.
+func (c *mainCodec) hasSendKey() bool { return c.sendKey != nil }
+
 // encodeMainMedia encodes a normalized MediaPacket as one Main-profile data
 // datagram, appending to dst and returning the extended slice. The RTP packet
 // is built exactly as the Simple codec's encodeMedia does (even-base SSRC with
@@ -586,6 +608,8 @@ func (c *mainCodec) peekOOB(b []byte) (oob []byte, ok bool, err error) {
 		return nil, false, nil
 	}
 	region := b[off:]
+	// Honor the per-packet K bit (see decodeMain): a cleartext OOB datagram is
+	// returned as cleartext even when a decryptor is configured.
 	if hdr.HasKey {
 		if c.recvKey == nil {
 			return nil, true, fmt.Errorf("rist: main: encrypted OOB but no decryptor configured")
@@ -596,9 +620,6 @@ func (c *mainCodec) peekOOB(b []byte) (oob []byte, ok bool, err error) {
 			return nil, true, derr
 		}
 		return pt, true, nil
-	}
-	if c.recvKey != nil {
-		return nil, true, fmt.Errorf("rist: main: cleartext OOB but decryptor configured")
 	}
 	return region, true, nil
 }
@@ -668,9 +689,13 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 	}
 	region := b[off:]
 
-	// Decrypt the reduced header + inner region when a key is present. The GRE
-	// header signals encryption via the key bit; a configured decryptor and a
-	// key-bearing header must agree.
+	// Decrypt the reduced header + inner region when the per-packet GRE K bit is
+	// set. libRIST keys per-packet on the K bit (CHECK_BIT(gre->flags1,5)), NOT on
+	// a global "is a key configured" flag: a peer may legitimately mix cleartext
+	// and encrypted datagrams (the EAP-SRP use_key_as_passphrase mode encrypts only
+	// the receiver->sender feedback direction and leaves sender->receiver media in
+	// the clear). So a cleartext datagram is decoded as cleartext even when a
+	// decryptor is configured.
 	if hdr.HasKey {
 		if c.recvKey == nil {
 			return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: encrypted datagram but no decryptor configured")
@@ -683,8 +708,6 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 		if err != nil {
 			return false, wire.MediaPacket{}, nil, err
 		}
-	} else if c.recvKey != nil {
-		return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: cleartext datagram but decryptor configured")
 	}
 
 	// Unwrap the version-2 VSF proto (now decrypted): libRIST maps subtype

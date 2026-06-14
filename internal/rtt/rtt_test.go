@@ -212,7 +212,9 @@ func estimatorWithSmoothed(v clock.Microseconds) Estimator {
 
 // TestClamped covers the boundary behavior of the [rttMin, rttMax] clamp,
 // including libRIST's exact else-if semantics for degenerate (min > max)
-// bounds.
+// bounds. All rttMin values here are at or above the 3 ms RIST_RTT_MIN floor
+// that Clamped applies, so the floor does not alter these results (it is
+// exercised separately in TestRTTMinFloor).
 func TestClamped(t *testing.T) {
 	const min, max = 5000, 500000 // libRIST defaults, in microseconds
 	tests := []struct {
@@ -229,14 +231,15 @@ func TestClamped(t *testing.T) {
 		{"at-max", 500000, min, max, 500000},
 		{"above-max", 500001, min, max, 500000},
 		{"zero-reading", 0, min, max, 5000},
-		{"degenerate-min-equals-max", 777, 100, 100, 100},
-		{"degenerate-min-equals-max-above", 200, 100, 100, 100},
+		{"degenerate-min-equals-max", 7770, 4000, 4000, 4000},
+		{"degenerate-min-equals-max-above", 5000, 4000, 4000, 4000},
 		// min > max is rejected by Config validation but must not panic
 		// here; the C's else-if makes the min branch win for low readings
-		// even though the result exceeds max.
-		{"inverted-bounds-low-reading", 10, 100, 50, 100},
-		{"inverted-bounds-mid-reading", 60, 100, 50, 100},
-		{"inverted-bounds-high-reading", 200, 100, 50, 50},
+		// even though the result exceeds max. Both bounds stay above the
+		// 3 ms floor so only the else-if (not the floor) governs the result.
+		{"inverted-bounds-low-reading", 3100, 4000, 3500, 4000},
+		{"inverted-bounds-mid-reading", 3700, 4000, 3500, 4000},
+		{"inverted-bounds-high-reading", 5000, 4000, 3500, 3500},
 	}
 
 	for _, tt := range tests {
@@ -286,7 +289,9 @@ func TestLastClamped(t *testing.T) {
 		{"mid-range", 123456, min, max, 123456},
 		{"at-max", 500000, min, max, 500000},
 		{"above-max", 500001, min, max, 500000},
-		{"inverted-bounds-high-reading", 200, 100, 50, 50},
+		// Both bounds above the 3 ms floor so the else-if (not the floor)
+		// governs: a reading above the inverted max clamps down to max.
+		{"inverted-bounds-high-reading", 5000, 4000, 3500, 3500},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -321,9 +326,12 @@ func TestLastVsSmoothedDiverge(t *testing.T) {
 //
 //	clamped 5000   -> 5500    (cold start at the 5ms default: 1.1 * rttMin)
 //	clamped 100000 -> 110000
-//	clamped 9      -> 9       (9.9 truncates: the cast drops the fraction)
-//	clamped 15     -> 16      (16.5 truncates to 16)
+//	clamped 3009   -> 3309    (3309.9 truncates: the cast drops the fraction)
+//	clamped 3015   -> 3316    (3316.5 truncates to 3316)
 //	clamped 500000 -> 550000  (reading above max clamps first, then scales)
+//
+// The truncation cases use clamped values above the 3 ms RIST_RTT_MIN floor so
+// the floor does not lift them; the .9/.5 fractions still exercise the cast.
 func TestRetryInterval(t *testing.T) {
 	const min, max = 5000, 500000
 	tests := []struct {
@@ -336,9 +344,12 @@ func TestRetryInterval(t *testing.T) {
 		{"below-min-clamps-first", 0, min, max, 5500},
 		{"mid-range", 100000, min, max, 110000},
 		{"above-max-clamps-first", 1000000, min, max, 550000},
-		{"truncates-9.9-to-9", 9, 0, max, 9},
-		{"truncates-16.5-to-16", 15, 0, max, 16},
-		{"zero", 0, 0, max, 0},
+		// rttMin 0 floors to the 3 ms RIST_RTT_MIN; the smoothed reading is
+		// above that, so it passes through and the 1.1x cast truncates.
+		{"truncates-3309.9-to-3309", 3009, 0, max, 3309},
+		{"truncates-3316.5-to-3316", 3015, 0, max, 3316},
+		// A sub-floor reading is lifted to 3 ms first: 3000 * 1.1 = 3300.
+		{"below-floor-lifts-to-3ms", 0, 0, max, 3300},
 	}
 
 	for _, tt := range tests {
@@ -361,14 +372,17 @@ func TestRetryInterval(t *testing.T) {
 func TestRetryIntervalIntegerIdentity(t *testing.T) {
 	check := func(v clock.Microseconds) {
 		t.Helper()
+		// rttMin = 3 ms RIST_RTT_MIN floor, rttMax wide open: for v >= floor the
+		// clamp passes v through unchanged, so the reading equals v.
 		e := estimatorWithSmoothed(v)
-		got := e.RetryInterval(0, 1<<40) // bounds wide open: clamped == v
+		got := e.RetryInterval(rttMinFloor, 1<<40)
 		if want := v + v/10; got != want {
 			t.Fatalf("RetryInterval identity broken at v=%d: float path %d, integer path %d",
 				v, got, want)
 		}
 	}
-	for v := clock.Microseconds(0); v <= 100000; v++ {
+	// Sweep from the 3 ms floor (clamped == v holds only at or above it).
+	for v := rttMinFloor; v <= 100000; v++ {
 		check(v)
 	}
 	// Spot-check the full configurable range (MaxRTT is 1s = 1e6 us).
@@ -402,6 +416,50 @@ func TestZeroValue(t *testing.T) {
 	}
 	if got := e.RetryInterval(5000, 500000); got != 5500 {
 		t.Errorf("zero value RetryInterval(5000, 500000) = %d, want 5500", got)
+	}
+}
+
+// TestRTTMinFloor verifies the 3 ms RIST_RTT_MIN hard floor (ristRTTMinFloorMs)
+// on the effective rtt_min used by Clamped/LastClamped/RetryInterval. A
+// configured rtt_min below 3 ms is raised to 3 ms before it bounds the reading,
+// so cold-start NACK retry spacing (and the sender retransmit gate) never
+// collapses below 3 ms; a configured rtt_min at or above 3 ms is untouched.
+func TestRTTMinFloor(t *testing.T) {
+	const floor = clock.Microseconds(ristRTTMinFloorMs) * clock.Millisecond // 3000us
+	if rttMinFloor != floor {
+		t.Fatalf("rttMinFloor const = %d, want %d (3 ms)", rttMinFloor, floor)
+	}
+	const max = 500 * clock.Millisecond
+	tests := []struct {
+		name           string
+		smoothed, last clock.Microseconds
+		rttMin         clock.Microseconds
+		wantClamped    clock.Microseconds
+		wantLast       clock.Microseconds
+		wantRetry      clock.Microseconds
+	}{
+		// rttMin below the floor: a sub-floor reading is lifted to 3 ms.
+		{"min-1ms-reading-0", 0, 0, 1 * clock.Millisecond, floor, floor, 3300},
+		{"min-0-reading-0", 0, 0, 0, floor, floor, 3300},
+		// A reading above the floor passes through even when rttMin < floor.
+		{"min-1ms-reading-10ms", 10000, 10000, 1 * clock.Millisecond, 10000, 10000, 11000},
+		// rttMin at/above the floor is unchanged (the libRIST 5 ms default).
+		{"min-5ms-reading-0", 0, 0, 5 * clock.Millisecond, 5000, 5000, 5500},
+		{"min-5ms-reading-2ms", 2000, 2000, 5 * clock.Millisecond, 5000, 5000, 5500},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := Estimator{eightTimesRTT: 8 * tt.smoothed, lastSample: tt.last}
+			if got := e.Clamped(tt.rttMin, max); got != tt.wantClamped {
+				t.Errorf("Clamped(%d, max) = %d, want %d", tt.rttMin, got, tt.wantClamped)
+			}
+			if got := e.LastClamped(tt.rttMin, max); got != tt.wantLast {
+				t.Errorf("LastClamped(%d, max) = %d, want %d", tt.rttMin, got, tt.wantLast)
+			}
+			if got := e.RetryInterval(tt.rttMin, max); got != tt.wantRetry {
+				t.Errorf("RetryInterval(%d, max) = %d, want %d", tt.rttMin, got, tt.wantRetry)
+			}
+		})
 	}
 }
 

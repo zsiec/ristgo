@@ -40,14 +40,16 @@ func (c *Conn) Handshake() error {
 		return nil
 	}
 	if c.dtlsClient {
-		c.dtlsPeer = c.dtlsRemote
+		// The handshake conn keeps the *net.UDPAddr internally; only the
+		// dtlsPeer crossing the ReadMedia boundary is widened to netip.AddrPort.
+		c.dtlsPeer = c.dtlsRemote.AddrPort()
 		c.dtls = dtls.Client(&connectedUDP{pc: c.media, peer: c.dtlsRemote}, c.dtlsCfg)
 	} else {
 		ad, err := acceptUDP(c.media)
 		if err != nil {
 			return err
 		}
-		c.dtlsPeer = ad.peer
+		c.dtlsPeer = ad.peer.AddrPort()
 		c.dtls = dtls.Server(ad, c.dtlsCfg)
 	}
 	return c.dtls.Handshake()
@@ -85,6 +87,18 @@ type udpAdapter struct {
 }
 
 // acceptUDP blocks for the first datagram, learning the peer address.
+//
+// THREAT MODEL: the DTLS server peer is bound to the source IP+port of the first
+// datagram seen on the socket (RIST has no DTLS Connection ID, RFC 9146). An
+// off-path attacker who races a spoofed datagram to the listening port before
+// the legitimate client can therefore capture the binding and force the real
+// client's handshake to be dropped (a first-datagram-binding denial of service).
+// This is a pre-handshake liveness concern only: it cannot break confidentiality
+// or authenticity — once the handshake completes, every record is bound to the
+// negotiated keys, and the DTLS layer's HelloVerifyRequest cookie (handshake_io)
+// forces a return-routability round-trip before any handshake state is
+// committed, so a blind off-path spoof cannot complete a handshake. Post-
+// handshake, AEAD plus the anti-replay window fully protect the session.
 func acceptUDP(pc *net.UDPConn) (*udpAdapter, error) {
 	buf := make([]byte, 1<<16)
 	n, addr, err := pc.ReadFromUDP(buf)

@@ -22,11 +22,48 @@ type rxStats struct {
 	lastReceived uint64
 }
 
+// lqmRTPHeaderBytes is the RTP header size, in bytes, attributed to each
+// received media packet for the Link Quality Message bandwidth fields. TR-06-4
+// Part 1 §5.1 defines the measured bandwidth over RTP payload + RTP header bits
+// and excludes encapsulation overhead outside the RTP headers; the codec strips
+// the 12-byte RTP header on decode, so it is added back here while the GRE/DTLS/
+// Advanced envelope is (correctly) left out.
+const lqmRTPHeaderBytes = 12
+
+// feedMedia hands one decoded media packet to the flow core and folds it into
+// the reception statistics — but only once the data channel is authenticated.
+// Before the EAP-SRP handshake completes (authenticator role) authed is false,
+// so media from an as-yet-unauthenticated peer is dropped instead of driving the
+// receiver ring or eliciting reflected NACK/echo feedback toward a possibly
+// spoofed source (M7). A legitimate sender holds its own media until it
+// authenticates, so nothing recoverable is lost. For sessions without
+// authentication authed is always true, making this a transparent pass-through.
+func (s *Session) feedMedia(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
+	if !s.authed.Load() {
+		return
+	}
+	s.flow.Feed(now, path, pkt)
+	s.observeRx(now, pkt)
+}
+
 // observeRx folds one accepted media packet into the reception statistics: it
-// extends the highest sequence and updates the interarrival jitter estimate.
+// extends the highest sequence, updates the interarrival jitter estimate, and
+// meters the packet's RTP-level bytes for the Link Quality Message bandwidth
+// fields (source vs retransmission kept separate, per TR-06-4 Part 1 §5.1).
 // The jitter is computed in 90 kHz RTP ticks; because it measures the change
 // in transit time, the (constant) sender/receiver clock offset cancels.
 func (s *Session) observeRx(now clock.Timestamp, pkt wire.MediaPacket) {
+	// LQM bandwidth metering: count RTP payload + RTP header only (not the
+	// encapsulation the spec excludes), and attribute retransmitted packets to
+	// the separate Retransmission Bandwidth so Data Bandwidth reflects source
+	// packets alone.
+	rtpBytes := uint64(len(pkt.Payload) + lqmRTPHeaderBytes)
+	if pkt.Retransmit {
+		s.rxRetransBytes += rtpBytes
+	} else {
+		s.rxBytes += rtpBytes
+	}
+
 	r := &s.rx
 	r.mediaSSRC = pkt.SSRC
 	if !r.baseSet {
@@ -96,7 +133,7 @@ func (s *Session) sendKeepalive(now clock.Timestamp) {
 		s.sendBondKeepalive(now)
 		return
 	}
-	if s.peer.RTCP == nil {
+	if !s.peer.RTCP.IsValid() {
 		return // return path not learned yet
 	}
 	// Advanced profile: send the Main-profile GRE+RTCP handshake (authenticates

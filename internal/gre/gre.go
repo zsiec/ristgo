@@ -157,8 +157,10 @@ const (
 	KeepaliveSize = 8
 
 	// AdvExtSize is the size of the optional Advanced-profile extended
-	// capabilities block that may follow the keep-alive body
-	// (TR-06-3 §5.3.6).
+	// capabilities block that may follow the keep-alive body. The block
+	// carries the I/G/C flags defined by TR-06-3 §5.3.6; its on-wire byte
+	// layout follows libRIST's de-facto keepalive encoding (see AdvExtCaps),
+	// which differs from §5.3.6 Figure 12.
 	AdvExtSize = 4
 )
 
@@ -235,6 +237,15 @@ func (h Header) Size() int {
 // the optional nonce and sequence number) to dst and returns the extended
 // slice. The field order matches libRIST: nonce at offset 4, sequence number
 // immediately after. On error dst is returned unchanged.
+//
+// The H bit (256-bit AES key length) is emitted whenever HasKey and KeySize256
+// are both set, independent of Version. libRIST suppresses H at GRE version 0
+// (it sets H only when the version is non-zero and the key is 256-bit), but
+// version 0 is not a RIST GRE version — the lowest is VersionMin (1) — so for
+// every version this codec emits, the unconditional H emission is byte-for-byte
+// what libRIST produces. Callers must therefore not set Version below
+// VersionMin; doing so is rejected only for values that overflow the 3-bit RVer
+// field, not for 0.
 func (h Header) AppendTo(dst []byte) ([]byte, error) {
 	if h.Version > flags2RVerMask {
 		return dst, fmt.Errorf("%w: version %d does not fit 3-bit RVer field", ErrNonConformant, h.Version)

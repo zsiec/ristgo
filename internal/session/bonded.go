@@ -1,7 +1,7 @@
 package session
 
 import (
-	"net"
+	"net/netip"
 
 	"github.com/zsiec/ristgo/internal/adv"
 	"github.com/zsiec/ristgo/internal/bonding"
@@ -38,12 +38,13 @@ import (
 // safe and yields identical normalized packets for identical wire bytes.
 
 // bondInbound is one datagram a per-path reader hands to the event loop, tagged
-// with the path it arrived on (for a receiver) and whether it is RTCP.
+// with the path it arrived on (for a receiver) and whether it is RTCP. src is a
+// netip.AddrPort value so the per-datagram receive path allocates nothing.
 type bondInbound struct {
 	idx    uint8
 	isRTCP bool
 	data   []byte
-	src    *net.UDPAddr
+	src    netip.AddrPort
 }
 
 // bondState holds the per-path I/O and policy for a bonded session.
@@ -55,8 +56,9 @@ type bondState struct {
 	conns []*socket.Conn
 
 	// remotes is the sender's per-path {media, rtcp} destination pair; nil on a
-	// receiver (which learns each path's peer from inbound traffic).
-	remotes [][2]*net.UDPAddr
+	// receiver (which learns each path's peer from inbound traffic). The
+	// addresses are netip.AddrPort values, matching the rest of the send path.
+	remotes [][2]netip.AddrPort
 
 	// peers tracks each path's learned/known addresses and liveness.
 	peers []*peer.Peer
@@ -72,7 +74,11 @@ func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *
 	bs := &bondState{group: group, conns: conns, peers: make([]*peer.Peer, len(conns))}
 	for i := range conns {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
-		group.AddPath(uint8(i), bonding.WeightDuplicate, 0)
+		// Register the path with the default duplicate weight / priority 0 unless
+		// the host pre-registered it with a chosen recovery priority.
+		if !group.HasPath(uint8(i)) {
+			group.AddPath(uint8(i), bonding.WeightDuplicate, 0)
+		}
 	}
 	s.bond = bs
 	s.bondIn = make(chan bondInbound, 256*len(conns))
@@ -83,7 +89,7 @@ func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *
 // NewBondedSender builds a Simple-profile bonded sender: one socket that
 // duplicates every media datagram to each remote {media, rtcp} pair. conn is the
 // local ephemeral socket; remotes are the per-path receiver addresses.
-func NewBondedSender(conn *socket.Conn, remotes [][2]*net.UDPAddr, group *bonding.Group, cfg Config) *Session {
+func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bonding.Group, cfg Config) *Session {
 	s := newSession(conn, cfg, true)
 	s.flow = flow.New(flow.RoleSender, cfg.Flow)
 	bs := &bondState{group: group, conns: []*socket.Conn{conn}, remotes: remotes, peers: make([]*peer.Peer, len(remotes))}
@@ -91,7 +97,11 @@ func NewBondedSender(conn *socket.Conn, remotes [][2]*net.UDPAddr, group *bondin
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
 		bs.peers[i].Media = remotes[i][0]
 		bs.peers[i].RTCP = remotes[i][1]
-		group.AddPath(uint8(i), bonding.WeightDuplicate, 0)
+		// Register with default duplicate weight / priority 0 unless the host
+		// pre-registered this path with a chosen recovery priority.
+		if !group.HasPath(uint8(i)) {
+			group.AddPath(uint8(i), bonding.WeightDuplicate, 0)
+		}
 	}
 	// The base Session's peer guards (peer.Media/RTCP != nil) gate transmission;
 	// point them at path 0 so the keepalive/feedback guards pass.
@@ -135,7 +145,7 @@ func (s *Session) startBondReaders() {
 
 // readBond reads datagrams from one path socket (media or RTCP) and forwards
 // them to the loop tagged with the path index.
-func (s *Session) readBond(idx uint8, isRTCP bool, read func([]byte) (int, *net.UDPAddr, error)) {
+func (s *Session) readBond(idx uint8, isRTCP bool, read func([]byte) (int, netip.AddrPort, error)) {
 	defer s.wg.Done()
 	for {
 		buf := make([]byte, maxDatagram)
@@ -207,8 +217,7 @@ func (s *Session) handleBondSimple(now clock.Timestamp, idx uint8, p *peer.Peer,
 	}
 	p.LearnMedia(bi.src)
 	if pkt, err := s.mdec.decode(bi.data); err == nil {
-		s.flow.Feed(now, idx, pkt)
-		s.observeRx(now, pkt)
+		s.feedMedia(now, idx, pkt)
 	}
 }
 
@@ -229,9 +238,7 @@ func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, b
 		return
 	}
 	if isMedia {
-		s.observeRxBytes(len(bi.data))
-		s.flow.Feed(now, idx, pkt)
-		s.observeRx(now, pkt)
+		s.feedMedia(now, idx, pkt)
 		return
 	}
 	s.bondObserveRTT(now, idx, fbs)
@@ -253,9 +260,7 @@ func (s *Session) handleBondAdv(now clock.Timestamp, idx uint8, p *peer.Peer, bi
 				}
 				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(pr); derr == nil {
 					if isMedia {
-						s.observeRxBytes(len(data))
-						s.flow.Feed(now, idx, pkt)
-						s.observeRx(now, pkt)
+						s.feedMedia(now, idx, pkt)
 					} else {
 						s.bondObserveRTT(now, idx, dropAdvEchoRequests(fbs))
 					}
@@ -282,9 +287,7 @@ func (s *Session) handleBondAdvGRE(now clock.Timestamp, idx uint8, data []byte) 
 		return
 	}
 	if isMedia {
-		s.observeRxBytes(len(data))
-		s.flow.Feed(now, idx, pkt)
-		s.observeRx(now, pkt)
+		s.feedMedia(now, idx, pkt)
 		return
 	}
 	s.bondObserveRTT(now, idx, dropAdvEchoRequests(fbs))
@@ -292,21 +295,23 @@ func (s *Session) handleBondAdvGRE(now clock.Timestamp, idx uint8, data []byte) 
 
 // bondPathForSrc resolves a sender's inbound source address (a receiver path's
 // RTCP socket) to its path index.
-func (s *Session) bondPathForSrc(src *net.UDPAddr) (uint8, bool) {
-	if src == nil {
+func (s *Session) bondPathForSrc(src netip.AddrPort) (uint8, bool) {
+	if !src.IsValid() {
 		return 0, false
 	}
 	for i, r := range s.bond.remotes {
-		if udpAddrEqual(src, r[1]) {
+		if addrPortEqual(src, r[1]) {
 			return uint8(i), true
 		}
 	}
 	return 0, false
 }
 
-// udpAddrEqual reports whether two UDP addresses share IP and port.
-func udpAddrEqual(a, b *net.UDPAddr) bool {
-	return a != nil && b != nil && a.Port == b.Port && a.IP.Equal(b.IP)
+// addrPortEqual reports whether two UDP addresses share host and port. The host
+// is compared unmapped so an IPv4 source seen as 4-in-6 on a dual-stack socket
+// still matches its plain-IPv4 destination form.
+func addrPortEqual(a, b netip.AddrPort) bool {
+	return a.IsValid() && b.IsValid() && a.Port() == b.Port() && a.Addr().Unmap() == b.Addr().Unmap()
 }
 
 // sendBondMedia duplicates one encoded media datagram to every path (full 2022-7
@@ -349,42 +354,32 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	s.lastTx = now
 }
 
-// sendBondFeedback transmits drained feedback. A receiver sends one compound
-// RTCP on the NACK-peer-selected live path (bonding.SelectNackPath); a sender
-// sends its RTT-echo feedback on every path so each path's liveness/RTT is
-// exercised.
+// sendBondFeedback transmits drained feedback. A sender sends its compound on
+// every path so each path's liveness/RTT is exercised. A receiver splits the
+// feedback: RTT-echo requests fan out to EVERY learned path (so each path's RTT
+// refreshes at the flow's 100 ms echo cadence, feeding the NACK-peer RTT
+// tie-break on all paths, not only the selected one at the 1000 ms keepalive),
+// while NACK groups route to the single NACK-peer-selected path (bonding.
+// SelectNackPath) to avoid duplicate retransmissions.
 func (s *Session) sendBondFeedback(fbs []wire.Feedback, now clock.Timestamp) {
-	var lead rtcp.Packet
-	if s.sender {
-		lead = rtcp.SenderReport{
-			SSRC:    s.cfg.SSRC,
-			NTP:     s.wallNTP(now), // absolute wall-clock NTP (RFC 3550); see wallNTP
-			RTPTime: uint32(rtpTicksFromMicros(int64(now))),
-		}
-	} else {
-		lead = s.receiverReport()
-	}
-	s.rtcpBuf = s.rtcpBuf[:0]
 	// Main and Advanced tunnel feedback as a GRE compound (the Main codec, or the
 	// Advanced profile's GRE control substrate) over the single per-path socket;
 	// the Simple profile sends bare compound RTCP on the odd port.
 	greCodec := s.bondGRECodec()
-	var (
-		b   []byte
-		err error
-	)
-	if greCodec != nil {
-		b, err = greCodec.encodeMainFeedback(s.rtcpBuf, lead, fbs, s.cfg.Bitmask)
-	} else {
-		b, err = encodeFeedback(s.rtcpBuf, lead, s.cfg.SSRC, s.cfg.CNAME, fbs, s.cfg.Bitmask)
-	}
-	if err != nil {
-		s.logf("bond: encode feedback: %v", err)
-		return
-	}
-	s.rtcpBuf = b
 
 	if s.sender {
+		lead := rtcp.SenderReport{
+			SSRC:    s.cfg.SSRC,
+			NTP:     s.wallNTP(now), // absolute wall-clock NTP (RFC 3550); see wallNTP
+			RTPTime: uint32(rtpTicksFromMicros(int64(now))),
+		}
+		s.rtcpBuf = s.rtcpBuf[:0]
+		b, err := s.encodeBondFeedback(lead, fbs, greCodec)
+		if err != nil {
+			s.logf("bond: encode feedback: %v", err)
+			return
+		}
+		s.rtcpBuf = b
 		// Send on every path so RTT echoes and SDES reach each receiver path.
 		for i := range s.bond.remotes {
 			if err := s.writeBondFeedback(s.bond.conns[0], greCodec, s.bond.remotes[i][1], s.bond.remotes[i][0]); err != nil {
@@ -394,15 +389,82 @@ func (s *Session) sendBondFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 		s.lastTx = now
 		return
 	}
-	// Receiver: route NACK groups to the single selected live path.
-	idx, ok := s.bond.group.SelectNackPath(now)
+
+	// Receiver: split RTT echoes (fan out to every path) from NACKs (selected
+	// path only).
+	var echoes, nacks []wire.Feedback
+	for _, fb := range fbs {
+		if _, ok := fb.(wire.RttEchoRequest); ok {
+			echoes = append(echoes, fb)
+		} else {
+			nacks = append(nacks, fb)
+		}
+	}
+	if len(echoes) > 0 {
+		s.fanReceiverFeedback(echoes, greCodec, now)
+	}
+	if len(nacks) > 0 {
+		s.routeReceiverNacks(nacks, greCodec, now)
+	}
+}
+
+// encodeBondFeedback encodes a bonded RTCP compound (profile-aware: GRE-tunnelled
+// for Main/Advanced, bare compound for Simple) into s.rtcpBuf.
+func (s *Session) encodeBondFeedback(lead rtcp.Packet, fbs []wire.Feedback, greCodec *mainCodec) ([]byte, error) {
+	s.rtcpBuf = s.rtcpBuf[:0]
+	if greCodec != nil {
+		return greCodec.encodeMainFeedback(s.rtcpBuf, lead, fbs, s.cfg.Bitmask)
+	}
+	return encodeFeedback(s.rtcpBuf, lead, s.cfg.SSRC, s.cfg.CNAME, fbs, s.cfg.Bitmask)
+}
+
+// fanReceiverFeedback writes a receiver compound (RR + fbs) to every learned
+// path, mirroring sendBondKeepalive — used for the receiver-originated RTT echo
+// so every path's RTT is refreshed at the echo cadence.
+func (s *Session) fanReceiverFeedback(fbs []wire.Feedback, greCodec *mainCodec, now clock.Timestamp) {
+	b, err := s.encodeBondFeedback(s.receiverReport(), fbs, greCodec)
+	if err != nil {
+		s.logf("bond: encode receiver feedback: %v", err)
+		return
+	}
+	s.rtcpBuf = b
+	sent := false
+	for i := range s.bond.peers {
+		p := s.bond.peers[i]
+		if !p.RTCP.IsValid() {
+			continue
+		}
+		if err := s.writeBondFeedback(s.bond.conns[i], greCodec, p.RTCP, p.RTCP); err != nil {
+			s.logf("bond: write echo path %d: %v", i, err)
+			continue
+		}
+		sent = true
+	}
+	if sent {
+		s.lastTx = now
+	}
+}
+
+// routeReceiverNacks writes a receiver compound (RR + NACKs) to the single
+// NACK-peer-selected live path. The addrKnown predicate keeps SelectNackPath
+// from choosing a path whose return address is not yet learned — including in
+// the all-dead fallback, which would otherwise pick a seen-but-unaddressable
+// path and silently drop the NACK.
+func (s *Session) routeReceiverNacks(fbs []wire.Feedback, greCodec *mainCodec, now clock.Timestamp) {
+	idx, ok := s.bond.group.SelectNackPath(now, func(i uint8) bool { return s.bond.peers[i].RTCP.IsValid() })
 	if !ok {
 		return
 	}
 	p := s.bond.peers[idx]
-	if p.RTCP == nil {
-		return // that path's return address not learned yet
+	if !p.RTCP.IsValid() {
+		return // defensive: predicate already excluded unaddressable paths
 	}
+	b, err := s.encodeBondFeedback(s.receiverReport(), fbs, greCodec)
+	if err != nil {
+		s.logf("bond: encode nacks: %v", err)
+		return
+	}
+	s.rtcpBuf = b
 	if err := s.writeBondFeedback(s.bond.conns[idx], greCodec, p.RTCP, p.RTCP); err != nil {
 		s.logf("bond: write feedback on path %d: %v", idx, err)
 	}
@@ -422,7 +484,7 @@ func (s *Session) bondGRECodec() *mainCodec {
 // writeBondFeedback writes one encoded feedback datagram to a path. Single-port
 // profiles (greCodec != nil) write the media-side socket/address; the Simple
 // profile writes the RTCP socket/odd-port address.
-func (s *Session) writeBondFeedback(conn *socket.Conn, greCodec *mainCodec, simpleRTCP, singlePort *net.UDPAddr) error {
+func (s *Session) writeBondFeedback(conn *socket.Conn, greCodec *mainCodec, simpleRTCP, singlePort netip.AddrPort) error {
 	if greCodec != nil {
 		return conn.WriteMedia(s.rtcpBuf, singlePort)
 	}
@@ -461,7 +523,7 @@ func (s *Session) sendBondKeepalive(now clock.Timestamp) {
 	sent := false
 	for i := range s.bond.peers {
 		p := s.bond.peers[i]
-		if p.RTCP == nil {
+		if !p.RTCP.IsValid() {
 			continue // path's return address not learned yet
 		}
 		if err := s.writeBondFeedback(s.bond.conns[i], greCodec, p.RTCP, p.RTCP); err != nil {
@@ -479,7 +541,7 @@ func (s *Session) sendBondKeepalive(now clock.Timestamp) {
 // running on the survivors; the merge needs no notification.)
 func (s *Session) tickBond(now clock.Timestamp) {
 	for _, idx := range s.bond.group.Tick(now) {
-		s.logf("bond: path %d declared dead", idx)
+		s.logAt(LogNote, CatBonding, "bond: path %d declared dead", idx)
 	}
 }
 

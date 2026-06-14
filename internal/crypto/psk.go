@@ -152,6 +152,27 @@ func DeriveKey(password, nonce4 []byte, keyBits int) ([]byte, error) {
 	return pbkdf2.Key(sha256.New, string(boundPassword(password)), nonce4, pbkdf2Iterations, keyBits/8)
 }
 
+// DeriveKeyRaw is DeriveKey without libRIST's NUL-truncation / 127-byte cap: it
+// runs PBKDF2 over the FULL password bytes. It is the derivation libRIST uses
+// when the passphrase is installed via _librist_crypto_psk_set_passphrase (the
+// EAP-SRP use_key_as_passphrase path), which stores an explicit password_len and
+// hashes all of it — so a passphrase containing a NUL byte (the SRP session key K
+// is a 32-byte SHA-256 digest and may) derives the same AES key as libRIST. The
+// string-secret path (DeriveKey) keeps the NUL-truncation because libRIST's
+// _librist_crypto_psk_rist_key_init uses strnlen there.
+func DeriveKeyRaw(password, nonce4 []byte, keyBits int) ([]byte, error) {
+	if keyBits != KeySize128 && keyBits != KeySize256 {
+		return nil, ErrInvalidKeySize
+	}
+	if len(password) == 0 {
+		return nil, ErrEmptyPassword
+	}
+	if len(nonce4) != NonceSize {
+		return nil, ErrInvalidNonceLength
+	}
+	return pbkdf2.Key(sha256.New, string(password), nonce4, pbkdf2Iterations, keyBits/8)
+}
+
 // boundPassword reproduces libRIST's effective PBKDF2 passphrase: the bytes up
 // to the first NUL, then capped at maxPasswordLen (strnlen, >127 reject).
 func boundPassword(password []byte) []byte {
@@ -201,6 +222,10 @@ type Key struct {
 	keyBits     int
 	keyRotation uint32 // 0 = rotate only at reuse-limit exhaustion
 	odd         bool
+	// raw selects DeriveKeyRaw (no NUL-truncation) over DeriveKey. It is set for
+	// a key derived from the SRP session key K (the EAP use_key_as_passphrase
+	// path), which libRIST hashes in full.
+	raw bool
 
 	nonce     [NonceSize]byte
 	ctr       ctrState
@@ -214,6 +239,17 @@ type Key struct {
 // the library default of rotating only when the packet counter would exhaust.
 // odd selects which of the two passphrase keys this is (the B-bit marker).
 func NewKey(password []byte, keyBits, keyRotation int, odd bool) (*Key, error) {
+	return newKey(password, keyBits, keyRotation, odd, false)
+}
+
+// NewKeyRaw is NewKey for a passphrase whose full bytes are hashed without
+// libRIST's NUL-truncation / 127-byte cap — used to key the data channel from
+// the 32-byte SRP session key K (EAP use_key_as_passphrase). See DeriveKeyRaw.
+func NewKeyRaw(password []byte, keyBits, keyRotation int, odd bool) (*Key, error) {
+	return newKey(password, keyBits, keyRotation, odd, true)
+}
+
+func newKey(password []byte, keyBits, keyRotation int, odd, raw bool) (*Key, error) {
 	if keyBits != KeySize128 && keyBits != KeySize256 {
 		return nil, ErrInvalidKeySize
 	}
@@ -228,6 +264,7 @@ func NewKey(password []byte, keyBits, keyRotation int, odd bool) (*Key, error) {
 		keyBits:     keyBits,
 		keyRotation: uint32(keyRotation),
 		odd:         odd,
+		raw:         raw,
 	}
 	if err := k.rekey(); err != nil {
 		return nil, err
@@ -248,7 +285,7 @@ func (k *Key) rekey() error {
 	if err != nil {
 		return err
 	}
-	block, err := deriveBlock(k.password, nonce[:], k.keyBits)
+	block, err := deriveBlock(k.password, nonce[:], k.keyBits, k.raw)
 	if err != nil {
 		return err
 	}
@@ -296,6 +333,8 @@ func (k *Key) Encrypt(seq uint32, dst, src []byte) ([]byte, error) {
 type Decryptor struct {
 	password []byte
 	keyBits  int
+	// raw selects DeriveKeyRaw (no NUL-truncation), set for a K-derived key.
+	raw bool
 
 	nonce     [NonceSize]byte
 	ctr       ctrState
@@ -309,6 +348,17 @@ type Decryptor struct {
 // odd/even passphrase, which the caller resolves before choosing which
 // Decryptor to use).
 func NewDecryptor(password []byte, keyBits int) (*Decryptor, error) {
+	return newDecryptor(password, keyBits, false)
+}
+
+// NewDecryptorRaw is NewDecryptor for a passphrase whose full bytes are hashed
+// without NUL-truncation — used to key the receive data channel from the 32-byte
+// SRP session key K (EAP use_key_as_passphrase). See DeriveKeyRaw.
+func NewDecryptorRaw(password []byte, keyBits int) (*Decryptor, error) {
+	return newDecryptor(password, keyBits, true)
+}
+
+func newDecryptor(password []byte, keyBits int, raw bool) (*Decryptor, error) {
 	if keyBits != KeySize128 && keyBits != KeySize256 {
 		return nil, ErrInvalidKeySize
 	}
@@ -318,6 +368,7 @@ func NewDecryptor(password []byte, keyBits int) (*Decryptor, error) {
 	return &Decryptor{
 		password: append([]byte(nil), password...),
 		keyBits:  keyBits,
+		raw:      raw,
 	}, nil
 }
 
@@ -353,7 +404,7 @@ func (d *Decryptor) Decrypt(nonce [NonceSize]byte, seq uint32, dst, src []byte) 
 		// rekey branch), defeating the 0-alloc warm path. Slicing the heap
 		// field instead keeps the steady-state call allocation-free.
 		d.nonce = nonce
-		block, err := deriveBlock(d.password, d.nonce[:], d.keyBits)
+		block, err := deriveBlock(d.password, d.nonce[:], d.keyBits, d.raw)
 		if err != nil {
 			d.hasNonce = false
 			return dst, err
@@ -381,7 +432,7 @@ func Decrypt(password []byte, keyBits int, nonce [NonceSize]byte, seq uint32, ds
 	if isZeroNonce(nonce) {
 		return dst, ErrZeroNonce
 	}
-	block, err := deriveBlock(password, nonce[:], keyBits)
+	block, err := deriveBlock(password, nonce[:], keyBits, false)
 	if err != nil {
 		return dst, err
 	}
@@ -389,10 +440,40 @@ func Decrypt(password []byte, keyBits int, nonce [NonceSize]byte, seq uint32, ds
 	return state.crypt(BuildIV(seq), dst, src), nil
 }
 
+// AESCTRRaw applies AES-CTR with the given raw AES key and 16-byte IV over src,
+// appending the result to dst and returning the extended slice. Unlike Encrypt /
+// Decrypt it does NOT run PBKDF2: key is used directly as the AES key (it must be
+// 16 or 32 bytes for AES-128 or AES-256), and iv is the full counter block. CTR
+// is symmetric, so this serves both encryption and decryption.
+//
+// It is the analog of libRIST's _librist_crypto_aes_ctr — the primitive used to
+// protect an explicit EAP-SRP passphrase carried in a PASSWORD_RESPONSE under the
+// SRP session key K (IV = 15 zero bytes then the EAP identifier). It is additive
+// to the GRE-IV-based PSK path and does not disturb it. It never panics; a
+// wrong-length key returns ErrInvalidKeySize.
+func AESCTRRaw(key []byte, iv [ivSize]byte, dst, src []byte) ([]byte, error) {
+	if len(key) != KeySize128/8 && len(key) != KeySize256/8 {
+		return dst, ErrInvalidKeySize
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return dst, err
+	}
+	state := ctrState{block: block}
+	return state.crypt(iv, dst, src), nil
+}
+
 // deriveBlock derives the AES key and wraps it in a cipher.Block. It centralizes
-// DeriveKey + aes.NewCipher so Key, Decryptor, and the one-shot path agree.
-func deriveBlock(password, nonce4 []byte, keyBits int) (cipher.Block, error) {
-	derived, err := DeriveKey(password, nonce4, keyBits)
+// DeriveKey + aes.NewCipher so Key, Decryptor, and the one-shot path agree. When
+// raw is set it uses DeriveKeyRaw (no NUL-truncation), for a K-derived key.
+func deriveBlock(password, nonce4 []byte, keyBits int, raw bool) (cipher.Block, error) {
+	var derived []byte
+	var err error
+	if raw {
+		derived, err = DeriveKeyRaw(password, nonce4, keyBits)
+	} else {
+		derived, err = DeriveKey(password, nonce4, keyBits)
+	}
 	if err != nil {
 		return nil, err
 	}

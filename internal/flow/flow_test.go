@@ -197,7 +197,9 @@ func TestFeedDedupOverwriteInsert(t *testing.T) {
 				{now: 10_000, path: 0, pkt: mkPkt(100, 0, []byte("orig"))},
 				{now: 12_000, path: 0, pkt: mkPkt(100, 0, []byte("orig")), retrans: true},
 			},
-			wantStats:   Stats{Received: 1, Duplicates: 1},
+			// The retransmit copy is counted in RetransmittedReceived before
+			// the dedup test sheds it as a duplicate.
+			wantStats:   Stats{Received: 1, Duplicates: 1, RetransmittedReceived: 1},
 			wantPayload: "orig",
 			wantPaths:   0b1,
 		},
@@ -755,28 +757,67 @@ func TestEchoResponseEchoesRequesterSSRC(t *testing.T) {
 	}
 }
 
-// TestSourceClockWrapReanchor verifies the receiver re-anchors its clock offset
-// when a fresh in-sequence packet's source time jumps far outside the recovery
-// window (a 32-bit RTP-timestamp wrap), instead of shedding every subsequent
-// packet as too-late and stalling the stream permanently.
-func TestSourceClockWrapReanchor(t *testing.T) {
+// TestSourceClockNoReanchorOnAnomalousTimestamp verifies the receiver does NOT
+// re-anchor on a single anomalous-but-not-wrapped timestamp. libRIST re-anchors
+// only on a true backward 32-bit wrap (source time falling by more than half the
+// 32-bit space); a modest backward step is ordinary jitter/reordering and must
+// never resync the clock — even once the dwell window has elapsed.
+func TestSourceClockNoReanchorOnAnomalousTimestamp(t *testing.T) {
 	f := New(RoleReceiver, testConfig())
+	// Run a steady in-order flow with source advancing in lockstep with now for
+	// longer than the dwell window (3*recoveryBuffer = 3s), so the dwell guard
+	// alone would not block a re-anchor — only the backward-wrap test does.
 	base := clock.Microseconds(10_000_000)
-	now := clock.Timestamp(10_000_000)
-	for i := 0; i < 3; i++ {
-		f.Feed(now, 0, mkPkt(uint32(100+i), base+clock.Microseconds(i)*1000, []byte{1}))
-		now += 1000
+	for i := 0; i < 5; i++ {
+		src := base + clock.Microseconds(i)*1_000_000
+		f.Feed(clock.Timestamp(src), 0, mkPkt(uint32(100+i), src, []byte{1}))
 	}
 	drainOutputs(f)
 	drainEvents(f)
 	before := f.Stats()
 
-	// Source time wraps to near zero while the sequence continues (seq 103).
-	now += 1000
-	f.Feed(now, 0, mkPkt(103, 5_000, []byte{2}))
+	// A successor whose source time steps modestly backward (100 ms below the
+	// newest source time of 4 s): a wrong reading, not a wrap. The backward
+	// delta is far below the ~6.6h half-span, so no resync. now stays within the
+	// recovery window of the mapped time, so the packet is also not shed.
+	now := clock.Timestamp(int64(base) + 4_100_000)
+	f.Feed(now, 0, mkPkt(105, base+3_900_000, []byte{2}))
+	if got := f.Stats().ClockResync; got != before.ClockResync {
+		t.Fatalf("ClockResync = %d, want %d (anomalous timestamp must not resync)", got, before.ClockResync)
+	}
+}
+
+// TestSourceClockWrapReanchor verifies the receiver re-anchors its clock offset
+// on a GENUINE backward 32-bit wrap of the source counter, bumping the offset by
+// one wrap period so playout continues, instead of shedding every subsequent
+// packet as too-late and stalling the stream permanently.
+func TestSourceClockWrapReanchor(t *testing.T) {
+	f := New(RoleReceiver, testConfig())
+	// One full 32-bit RTP-counter wrap spans srcWrapPeriodMicros of media time.
+	// Run the flow up to the wrap boundary with source == now (so the offset is
+	// ~0), advancing past the 3s dwell window, then feed the first post-wrap
+	// packet whose source time has dropped by one wrap period.
+	wrap := srcWrapPeriodMicros
+	step := clock.Microseconds(1_000_000)
+	startSrc := wrap - 4*step // start 4 s of media before the wrap boundary
+	f.Feed(clock.Timestamp(startSrc), 0, mkPkt(100, startSrc, []byte{0}))
+	for i := 1; i <= 4; i++ {
+		src := startSrc + clock.Microseconds(i)*step
+		f.Feed(clock.Timestamp(src), 0, mkPkt(uint32(100+i), src, []byte{byte(i)}))
+	}
+	drainOutputs(f)
+	drainEvents(f)
+	before := f.Stats()
+
+	// seq 105: now advances one step; the source counter wraps, so its source
+	// time is (previous source + step) - wrap, a small positive value. The
+	// offset bump of one wrap period maps it back onto ~now.
+	now := clock.Timestamp(startSrc + 5*step)
+	wrappedSrc := startSrc + 5*step - wrap
+	f.Feed(now, 0, mkPkt(105, wrappedSrc, []byte{5}))
 	after := f.Stats()
 	if after.ClockResync != before.ClockResync+1 {
-		t.Fatalf("ClockResync = %d, want %d (no re-anchor on wrap)", after.ClockResync, before.ClockResync+1)
+		t.Fatalf("ClockResync = %d, want %d (genuine wrap must re-anchor)", after.ClockResync, before.ClockResync+1)
 	}
 	if after.TooLate != before.TooLate {
 		t.Fatalf("wrapped packet shed as too-late (%d) instead of re-anchoring", after.TooLate)
@@ -786,8 +827,8 @@ func TestSourceClockWrapReanchor(t *testing.T) {
 	}
 
 	// The stream keeps flowing after the wrap (no permanent stall).
-	now += 1000
-	f.Feed(now, 0, mkPkt(104, 6_000, []byte{3}))
+	now = clock.Timestamp(startSrc + 6*step)
+	f.Feed(now, 0, mkPkt(106, wrappedSrc+step, []byte{6}))
 	if f.Stats().Received != after.Received+1 {
 		t.Fatalf("post-wrap packet not accepted; stream stalled")
 	}
@@ -797,7 +838,7 @@ func TestSourceClockWrapReanchor(t *testing.T) {
 // entries once the missing queue exceeds missing_counter_max (libRIST's
 // buffer-bloat / overflow guard), so a large gap cannot fill the ring.
 func TestMissingCounterMaxCaps(t *testing.T) {
-	cfg := testConfig() // default 100 Mbps / 1000 ms -> missing_counter_max = 4166
+	cfg := testConfig() // default 100 Mbps / 1000 ms -> missing_counter_max = 3571
 	f := New(RoleReceiver, cfg)
 	f.Feed(10_000, 0, mkPkt(100, 0, nil))
 	// A gap of 20000 (< MaxGap16) would mark ~20000 entries without the cap.
@@ -813,8 +854,11 @@ func TestMissingCounterMaxCaps(t *testing.T) {
 // TestDerivedCongestionConstants checks the libRIST-matching defaults.
 func TestDerivedCongestionConstants(t *testing.T) {
 	cfg := DefaultConfig()
-	if got := deriveMissingCounterMax(cfg); got != 4166 {
-		t.Errorf("missing_counter_max = %d, want 4166", got)
+	// missing_counter_max = recovery_buffer_ms * max(1, maxbitrate/1000) / 28
+	//                     = 1000 * 100 / 28 = 3571 (librist init_peer_settings,
+	//                     struct rist_gre_seq is 12 bytes -> divisor 28).
+	if got := deriveMissingCounterMax(cfg); got != 3571 {
+		t.Errorf("missing_counter_max = %d, want 3571", got)
 	}
 	if got := deriveMaxNacksPerLoop(cfg); got != 88 {
 		t.Errorf("max_nacksperloop = %d, want 88", got)

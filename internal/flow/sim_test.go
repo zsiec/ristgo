@@ -196,6 +196,80 @@ func TestPerfectLinkExactDelivery(t *testing.T) {
 	}
 }
 
+// newPairArrival builds a sender flow and an ARRIVAL-timing receiver flow (the
+// playout deadline is each packet's arrival instant + recoveryBuffer, not its
+// source-mapped time).
+func newPairArrival(startSeq uint32) (sender, receiver *flow.Flow) {
+	scfg := flow.DefaultConfig()
+	scfg.SSRC = senderSSRC
+	scfg.StartSeq = startSeq
+	rcfg := flow.DefaultConfig()
+	rcfg.TimingMode = flow.TimingArrival
+	return flow.New(flow.RoleSender, scfg), flow.New(flow.RoleReceiver, rcfg)
+}
+
+// TestArrivalTimingPerfectLink validates ARRIVAL-mode playout on a clean link:
+// every packet delivered once, in order, complete, and at uniform latency
+// (recoveryBuffer from arrival, no retransmits to perturb it).
+func TestArrivalTimingPerfectLink(t *testing.T) {
+	const n = 64
+	sender, receiver := newPairArrival(0)
+	fwd := simtest.NewLink[simtest.Datagram](simtest.PerfectLink(), 1)
+	back := simtest.NewLink[simtest.Datagram](simtest.PerfectLink(), 2)
+	fab := simtest.NewFabric(sender, receiver, []*simtest.Link[simtest.Datagram]{fwd}, []*simtest.Link[simtest.Datagram]{back})
+	fab.EnqueueCBR(0, clock.Millisecond, n, seqPayload)
+
+	if !fab.RunUntil(func(f *simtest.Fabric) bool { return len(f.DeliveredSeqs()) >= n }, 100_000) {
+		t.Fatalf("only %d/%d delivered", len(fab.DeliveredSeqs()), n)
+	}
+	if v := fab.CheckInvariants(simtest.InvariantOpts{RequireContiguous: true, MaxLatency: flow.DefaultConfig().RecoveryBuffer() + 10*clock.Millisecond}); len(v) != 0 {
+		t.Fatalf("arrival perfect-link invariant violations: %v", v)
+	}
+	if !equalSeqs(fab.DeliveredSeqs(), expectedSeqs(0, n)) {
+		t.Fatalf("arrival delivered %v, want full run", fab.DeliveredSeqs())
+	}
+	if rst := receiver.Stats(); rst.Recovered != 0 || rst.NacksSent != 0 {
+		t.Fatalf("arrival perfect link recovered/nacked = %d/%d, want 0/0", rst.Recovered, rst.NacksSent)
+	}
+}
+
+// TestArrivalTimingRecoverableLoss asserts the four invariants under recoverable
+// loss in ARRIVAL mode. Unlike SOURCE timing, arrival timing anchors each
+// packet's deadline to its own arrival, so a recovered packet — and the in-order
+// packets stalled behind it — are delivered later than the steady-state
+// delay+buffer (latency is NOT uniform). The structural invariants still hold:
+// no duplicate, in order, complete, and bounded by arrival + buffer + the NACK
+// round trip.
+func TestArrivalTimingRecoverableLoss(t *testing.T) {
+	const (
+		n    = 200
+		seed = uint64(7)
+	)
+	sender, receiver := newPairArrival(0)
+	fwd := simtest.NewLink[simtest.Datagram](simtest.LinkConfig{Delay: 10 * clock.Millisecond}, seed)
+	fwd.SetDropFilter(protectEndpoints(seed, 0, n-1, 0.2))
+	back := simtest.NewLink[simtest.Datagram](simtest.LinkConfig{Delay: 10 * clock.Millisecond}, seed^0x1234)
+	fab := simtest.NewFabric(sender, receiver, []*simtest.Link[simtest.Datagram]{fwd}, []*simtest.Link[simtest.Datagram]{back})
+	fab.EnqueueCBR(0, clock.Millisecond, n, seqPayload)
+
+	if !fab.RunUntil(func(f *simtest.Fabric) bool { return len(f.DeliveredSeqs()) >= n }, 400_000) {
+		t.Fatalf("only %d/%d delivered (Recovered=%d, Lost=%d)", len(fab.DeliveredSeqs()), n, receiver.Stats().Recovered, receiver.Stats().Lost)
+	}
+	// LatencyTolerance/MaxLatency are generous because arrival timing legitimately
+	// spikes latency around a recovered gap (the NACK round trip), unlike source
+	// timing's uniform latency.
+	maxLat := flow.DefaultConfig().RecoveryBuffer() + 200*clock.Millisecond
+	if v := fab.CheckInvariants(simtest.InvariantOpts{LatencyTolerance: 200 * clock.Millisecond, MaxLatency: maxLat, RequireContiguous: true}); len(v) != 0 {
+		t.Fatalf("arrival recoverable-loss invariant violations: %v", v)
+	}
+	if !equalSeqs(fab.DeliveredSeqs(), expectedSeqs(0, n)) {
+		t.Fatalf("arrival incomplete under recoverable loss: %v", fab.DeliveredSeqs())
+	}
+	if rst := receiver.Stats(); rst.Lost != 0 || rst.Discontinuities != 0 {
+		t.Fatalf("arrival lost/disc = %d/%d under recoverable loss, want 0/0", rst.Lost, rst.Discontinuities)
+	}
+}
+
 // TestSingleLossRecoveredWithOneRetransmit drops exactly the first
 // transmission of one interior packet (seed-free, via a one-shot drop filter)
 // and asserts it is recovered by a single retransmit — the canonical ARQ

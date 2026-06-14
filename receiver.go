@@ -74,6 +74,10 @@ func newSimpleReceiver(addr string, cfg Config) (*Receiver, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := joinReceiverMulticast(conn, cfg, host); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.AdaptLQM = cfg.SourceAdaptation
@@ -97,6 +101,10 @@ func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
 	}
 	conn, err := socket.ListenSingle(host, port)
 	if err != nil {
+		return nil, err
+	}
+	if err := joinReceiverMulticast(conn, cfg, host); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	if cfg.DTLS != nil {
@@ -129,6 +137,10 @@ func newAdvReceiver(addr string, cfg Config) (*Receiver, error) {
 	}
 	conn, err := socket.ListenSingle(host, port)
 	if err != nil {
+		return nil, err
+	}
+	if err := joinReceiverMulticast(conn, cfg, host); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	fc := toFlowConfig(cfg)

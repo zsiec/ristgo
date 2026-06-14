@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/subtle"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -134,8 +135,10 @@ func (c *Conn) serverHandshake() error {
 	var (
 		pms        []byte
 		master     []byte
-		clientLeaf *ecdsa.PublicKey
+		clientCert *x509.Certificate // parsed+verified client leaf, NOT yet authenticated
+		clientLeaf *ecdsa.PublicKey  // its ECDSA key, for the CertificateVerify check
 		gotCKE     bool
+		sawValidCV bool // a CertificateVerify whose signature verified was received
 	)
 	for {
 		msg, err = c.readHandshakeMessage(overall)
@@ -143,6 +146,15 @@ func (c *Conn) serverHandshake() error {
 			return err
 		}
 		if msg.typ == typeFinished {
+			// A Finished MUST arrive under epoch 1 (after ChangeCipherSpec):
+			// RFC 5246 §7.4.9 / RFC 6347. A Finished reassembled from epoch-0
+			// plaintext is rejected (L8 defense-in-depth — the verify_data already
+			// needs the master secret, but the epoch tag is a cheap, explicit
+			// guard against accepting an unprotected Finished).
+			if msg.epoch != 1 {
+				c.sendAlert(alertDecryptError)
+				return errors.New("rist: dtls: client Finished arrived unprotected (epoch 0)")
+			}
 			break
 		}
 		// Finished is the only message after CCS; everything here is epoch 0.
@@ -159,12 +171,19 @@ func (c *Conn) serverHandshake() error {
 					return errors.New("rist: dtls: client certificate required but none sent")
 				}
 			} else {
-				leaf, err := verifyPeerCertificate(cert.chain, cfg)
+				leaf, err := verifyPeerCertificate(cert.chain, cfg, verifyingClientCert)
 				if err != nil {
 					c.sendAlert(alertBadCertificate)
 					return err
 				}
-				c.peerLeaf = leaf
+				// Hold the leaf aside; it is NOT authenticated until a
+				// CertificateVerify proves possession of its private key
+				// (RFC 5246 §7.4.8). Do not expose it via c.peerLeaf yet — in
+				// ECDHE the client Finished MAC verifies without the cert's key,
+				// so CertificateVerify is the only proof of possession. Assigning
+				// c.peerLeaf here would let an attacker holding only the victim's
+				// public certificate (no private key) authenticate as the owner.
+				clientCert = leaf
 				clientLeaf, _ = leaf.PublicKey.(*ecdsa.PublicKey)
 			}
 		case typeClientKeyExchange:
@@ -218,6 +237,10 @@ func (c *Conn) serverHandshake() error {
 				c.sendAlert(alertDecryptError)
 				return errors.New("rist: dtls: client CertificateVerify invalid")
 			}
+			// Proof of possession established (RFC 5246 §7.4.8): the client holds
+			// the private key for clientCert. Only now may the leaf be treated as
+			// an authenticated peer identity.
+			sawValidCV = true
 		default:
 			return fmt.Errorf("rist: dtls: unexpected message %d in client flight", msg.typ)
 		}
@@ -228,9 +251,20 @@ func (c *Conn) serverHandshake() error {
 	if !c.peerCCS {
 		return errors.New("rist: dtls: client Finished without ChangeCipherSpec")
 	}
-	if cfg.RequireClientCert && c.peerLeaf == nil {
+	// Proof-of-possession gate (RFC 5246 §7.4.8). A client that presents a
+	// non-empty Certificate MUST follow it with a CertificateVerify signed by the
+	// matching private key; in ECDHE the Finished MAC alone proves nothing about
+	// the certificate, so without this check an attacker holding only a victim's
+	// public cert could impersonate the cert owner — defeating RequireClientCert
+	// and PeerCertFingerprint pinning. Require a verified CertificateVerify
+	// whenever a client certificate was presented or mutual auth is mandated, and
+	// only then promote the leaf to the authenticated c.peerLeaf.
+	if (clientLeaf != nil || cfg.RequireClientCert) && !sawValidCV {
 		c.sendAlert(alertBadCertificate)
-		return errors.New("rist: dtls: client did not authenticate")
+		return errors.New("rist: dtls: client did not authenticate (missing CertificateVerify)")
+	}
+	if sawValidCV {
+		c.peerLeaf = clientCert
 	}
 
 	// Verify the client Finished over the transcript through CertificateVerify /

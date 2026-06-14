@@ -226,6 +226,95 @@ func TestE2EMainEAPSRP(t *testing.T) {
 	}
 }
 
+// srpNoSecretConfig is a Main-profile config with SRP credentials and NO
+// pre-shared Secret: the use_key_as_passphrase mode, where the media AES key is
+// derived from the SRP session key K on a successful handshake.
+func srpNoSecretConfig(username, password string) ristgo.Config {
+	cfg := mainConfig("", 0) // no secret, cleartext until K-keying
+	cfg.Username = username
+	cfg.Password = password
+	cfg.BufferMin = 300 * time.Millisecond
+	cfg.BufferMax = 300 * time.Millisecond
+	return cfg
+}
+
+// TestE2EMainEAPSRPUseKeyAsPassphrase verifies the full authenticated Main flow
+// with SRP and NO pre-shared secret (use_key_as_passphrase): the sender and
+// receiver run the EAP-SRP handshake, derive the media PSK keys from the SRP
+// session key K (inline via the M1/M2 set_passphrase bit), install them into the
+// running codec, and then stream media that is delivered bit-exact — gated on
+// authentication, and actually encrypted under K (not cleartext).
+func TestE2EMainEAPSRPUseKeyAsPassphrase(t *testing.T) {
+	const totalBytes = 64 * 1024
+	const chunk = 1316
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+
+	rx, err := ristgo.NewReceiver(addr, srpNoSecretConfig("rist", "mainprofile"))
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewSender(addr, srpNoSecretConfig("rist", "mainprofile"))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+
+	payload := make([]byte, totalBytes)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	want := sha256.Sum256(payload)
+
+	done := make(chan [32]byte, 1)
+	go func() {
+		rx.SetReadDeadline(time.Now().Add(15 * time.Second))
+		got := make([]byte, 0, totalBytes)
+		buf := make([]byte, 4096)
+		h := sha256.New()
+		for len(got) < totalBytes {
+			n, rerr := rx.Read(buf)
+			if n > 0 {
+				h.Write(buf[:n])
+				got = append(got, buf[:n]...)
+			}
+			if rerr != nil {
+				done <- [32]byte{}
+				return
+			}
+		}
+		var sum [32]byte
+		copy(sum[:], h.Sum(nil))
+		done <- sum
+	}()
+
+	tx.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	for off := 0; off < totalBytes; off += chunk {
+		end := off + chunk
+		if end > totalBytes {
+			end = totalBytes
+		}
+		if _, werr := tx.Write(payload[off:end]); werr != nil {
+			t.Fatalf("Write at %d: %v", off, werr)
+		}
+		if off%(chunk*16) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	select {
+	case got := <-done:
+		if got != want {
+			t.Fatalf("use_key_as_passphrase Main delivery hash mismatch (delivered=%d)", rx.Stats().Delivered)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out on the use_key_as_passphrase Main stream")
+	}
+	if !rx.Authenticated() {
+		t.Fatal("receiver reports not authenticated after a complete delivery")
+	}
+}
+
 // TestE2EMainEAPSRPWrongPassword verifies that a sender with the wrong password
 // fails the EAP-SRP handshake: the data channel never opens, and the receiver's
 // Read surfaces ErrAuth rather than delivering anything.
@@ -451,4 +540,104 @@ simpleCheck:
 	if err := stx.WriteOOB([]byte("x")); !errors.Is(err, ristgo.ErrOOBUnsupported) {
 		t.Fatalf("Simple WriteOOB = %v, want ErrOOBUnsupported", err)
 	}
+}
+
+// streamSHA streams totalBytes of random media tx->rx in chunk-sized writes and
+// asserts byte-exact delivery via SHA-256. Shared by the timing-mode and
+// srp-compat end-to-end tests.
+func streamVerify(t *testing.T, tx *ristgo.Sender, rx *ristgo.Receiver, totalBytes, chunk int) {
+	t.Helper()
+	payload := make([]byte, totalBytes)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	want := sha256.Sum256(payload)
+
+	done := make(chan [32]byte, 1)
+	go func() {
+		rx.SetReadDeadline(time.Now().Add(10 * time.Second))
+		got := make([]byte, 0, totalBytes)
+		buf := make([]byte, 4096)
+		h := sha256.New()
+		for len(got) < totalBytes {
+			n, rerr := rx.Read(buf)
+			if n > 0 {
+				h.Write(buf[:n])
+				got = append(got, buf[:n]...)
+			}
+			if rerr != nil {
+				done <- [32]byte{}
+				return
+			}
+		}
+		var sum [32]byte
+		copy(sum[:], h.Sum(nil))
+		done <- sum
+	}()
+
+	tx.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	for off := 0; off < totalBytes; off += chunk {
+		end := off + chunk
+		if end > totalBytes {
+			end = totalBytes
+		}
+		if _, werr := tx.Write(payload[off:end]); werr != nil {
+			t.Fatalf("Write at %d: %v", off, werr)
+		}
+		if off%(chunk*16) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	select {
+	case got := <-done:
+		if got != want {
+			t.Fatalf("delivery hash mismatch (delivered=%d)", rx.Stats().Delivered)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatalf("timeout waiting for delivery (delivered=%d)", rx.Stats().Delivered)
+	}
+}
+
+// TestE2EMainArrivalTiming verifies a receiver configured for ARRIVAL timing
+// delivers a stream bit-exact — the public Config.TimingMode wiring through to
+// the flow core's arrival-paced playout. Arrival timing lives in the
+// profile-agnostic core, so the Main profile exercises the full public path.
+func TestE2EMainArrivalTiming(t *testing.T) {
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+	rxCfg := mainConfig("", 0)
+	rxCfg.TimingMode = ristgo.TimingArrival
+	rx, err := ristgo.NewReceiver(addr, rxCfg)
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewSender(addr, mainConfig("", 0))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+	streamVerify(t, tx, rx, 64*1024, 1316)
+}
+
+// TestE2EMainSRPCompat verifies a Main session authenticates and streams when
+// the receiver uses the legacy SRP mode (SRPCompat=true → the authenticator
+// advertises EAPOL version 2). The sender's authenticatee auto-negotiates the
+// advertised legacy version, so PSK media flows bit-exact after the legacy
+// handshake.
+func TestE2EMainSRPCompat(t *testing.T) {
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+	rxCfg := eapConfig("rist", "mainprofile")
+	rxCfg.SRPCompat = true // receiver acts as the legacy authenticator
+	rx, err := ristgo.NewReceiver(addr, rxCfg)
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewSender(addr, eapConfig("rist", "mainprofile"))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+	streamVerify(t, tx, rx, 64*1024, 1316)
 }

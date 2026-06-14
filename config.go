@@ -2,6 +2,8 @@ package ristgo
 
 import (
 	"errors"
+	"net"
+	"net/netip"
 	"time"
 )
 
@@ -118,6 +120,15 @@ type Config struct {
 	// Default: 100000 (100 Mbps). Must be positive.
 	MaxBitrate int
 
+	// ReturnBandwidth caps a receiver's outbound NACK channel in kbps (libRIST
+	// return-bandwidth), so its retransmission requests stay within an upstream
+	// budget on an asymmetric link. 0 (the default) means unlimited. Receiver-
+	// side only; must be >= 0. NOTE: libRIST v0.2.18 stores but does not enforce
+	// this value — ristgo enforces it as an interop-safe enhancement (the sender
+	// merely receives fewer NACKs, never a protocol violation); over-throttling
+	// only slows recovery, it never drops a still-recoverable packet.
+	ReturnBandwidth int
+
 	// MinBitrate is the floor, in kbps, below which source-adaptation rate
 	// control (OnRateAdapt) will not drive the encoder target. TR-06-4 Part 1
 	// §7 notes that for a given codec, resolution, and frame rate there is a
@@ -145,6 +156,18 @@ type Config struct {
 	// Default: NACKRange (the RIST and libRIST default).
 	NACKType NACKType
 
+	// CongestionControl selects how the sender paces retransmissions against
+	// MaxBitrate (libRIST congestion_control). The zero value is
+	// CongestionNormal, the libRIST default. Set via the rist:// URL with
+	// congestion-control=0|1|2 (off|normal|aggressive, libRIST's numbering).
+	CongestionControl CongestionControl
+
+	// TimingMode selects how a receiver schedules playout (libRIST timing_mode).
+	// The zero value is TimingSource, the libRIST default. Receiver-side; ignored
+	// on a sender. Set via the rist:// URL with timing-mode=0|1|2
+	// (source|arrival|rtc; rtc maps to arrival).
+	TimingMode TimingMode
+
 	// Secret is the pre-shared passphrase enabling PSK encryption
 	// (Main and Advanced profiles). Empty disables encryption.
 	// Maximum 127 bytes (libRIST RIST_MAX_STRING_SHORT).
@@ -152,8 +175,15 @@ type Config struct {
 
 	// AESKeyBits is the AES key size in bits: 128 or 256.
 	// Only meaningful when Secret is set; when Secret is set and
-	// AESKeyBits is 0, it defaults to 256 (matching libRIST, which
-	// assumes the maximum security level when aes-type is omitted).
+	// AESKeyBits is 0, it defaults to 128.
+	//
+	// 128 matches the libRIST command-line tools (ristsender/ristreceiver),
+	// which pre-set a 128-bit key when -e/--secret is given without an explicit
+	// size — so an omitted aes-type interoperates with the most common libRIST
+	// CLI invocation. (The libRIST *library* default is 256, but its tools
+	// override it to 128 before the library default applies.) The GRE H bit
+	// signals 128 vs 256 on the wire and both ends must agree, so set AESKeyBits
+	// explicitly when interoperating with a peer configured for 256.
 	// Setting AESKeyBits without Secret is an error.
 	AESKeyBits int
 
@@ -172,6 +202,14 @@ type Config struct {
 	// Must be set together with Username.
 	// Maximum 255 bytes (libRIST RIST_MAX_STRING_LONG).
 	Password string
+
+	// SRPCompat selects the legacy pre-0.2.16 SRP hashing mode (libRIST
+	// srp-compat=1: unpadded k/u, EAPOL version 2) for interop with old peers.
+	// It only affects a RECEIVER acting as the EAP authenticator (which then
+	// advertises legacy); a sender's authenticatee already auto-negotiates the
+	// peer's advertised version, so SRPCompat is a no-op on a sender. Default
+	// false (RFC-5054 PAD, the libRIST 0.2.16+ default).
+	SRPCompat bool
 
 	// Compression enables payload compression (Advanced profile only;
 	// libRIST compression). Receivers auto-detect. Default: false.
@@ -198,6 +236,40 @@ type Config struct {
 	// disables rate adaptation. The callback runs on the session's event loop, so
 	// it must not block. Supported on all three profiles (see SourceAdaptation).
 	OnRateAdapt func(targetKbps int)
+
+	// Interface is the name of the network interface used for multicast
+	// (libRIST "miface"): a sender's outbound multicast egress interface and a
+	// receiver's group-membership interface. Empty (the default) lets the OS
+	// choose the system default interface. It is consulted only when the
+	// destination (sender) or bind (receiver) address is a multicast group;
+	// unicast ignores it. When set it must resolve via net.InterfaceByName.
+	Interface string
+
+	// MulticastTTL is the IP multicast hop limit (TTL for IPv4, hop limit for
+	// IPv6) stamped on a sender's outbound multicast datagrams. 0 (the default)
+	// uses the OS default of 1, which restricts the traffic to the local link
+	// (it is never forwarded by a router). Real multicast distribution across
+	// router hops needs a higher value (e.g. 16, 32, or more, sized to the
+	// network diameter). Range: 0-255. It is consulted only when the destination
+	// is a multicast group; unicast ignores it.
+	MulticastTTL int
+
+	// MulticastSource, set on a Receiver whose bind address is a multicast group,
+	// selects source-specific multicast (SSM, RFC 4607): the receiver joins the
+	// group filtered to datagrams from this exact source IP, ignoring any other
+	// sender on the group. Empty (the default) is any-source multicast (ASM): the
+	// receiver accepts the group from any source. When set it must parse as an IP
+	// literal, and the bind address must be a multicast group (it is rejected on a
+	// unicast destination).
+	MulticastSource string
+
+	// MulticastLoopback controls whether a sender transmitting to a multicast
+	// group also receives its own datagrams on the same host (IP multicast
+	// loopback). false (the default) disables loopback, matching the common
+	// production case where the source host is not also a subscriber. It is
+	// consulted only when the destination is a multicast group; unicast ignores
+	// it. Multicast loopback is also what the multicast e2e test relies on.
+	MulticastLoopback bool
 
 	// DTLS, when non-nil, enables DTLS 1.2 transport security for the Main
 	// profile (VSF TR-06-2 §6), protecting the whole GRE tunnel. It is an
@@ -261,6 +333,7 @@ func DefaultConfig() Config {
 		VirtSrcPort:       DefaultVirtSrcPort,
 		VirtDstPort:       DefaultVirtDstPort,
 		NACKType:          NACKRange,
+		CongestionControl: CongestionNormal,
 	}
 }
 
@@ -398,6 +471,9 @@ func (cfg *Config) validate() error {
 	if cfg.MinBitrate < 0 {
 		return errors.New("rist: MinBitrate must be at least 0 (kbps; 0 = library floor)")
 	}
+	if cfg.ReturnBandwidth < 0 {
+		return errors.New("rist: ReturnBandwidth must be at least 0 (kbps; 0 = unlimited)")
+	}
 	if cfg.MinBitrate > cfg.MaxBitrate {
 		return errors.New("rist: MinBitrate must not exceed MaxBitrate")
 	}
@@ -417,19 +493,38 @@ func (cfg *Config) validate() error {
 		return errors.New("rist: NACKType must be NACKRange (0) or NACKBitmask (1)")
 	}
 
+	if cfg.CongestionControl != CongestionNormal && cfg.CongestionControl != CongestionAggressive && cfg.CongestionControl != CongestionOff {
+		return errors.New("rist: CongestionControl must be CongestionNormal, CongestionAggressive, or CongestionOff")
+	}
+
+	if cfg.TimingMode != TimingSource && cfg.TimingMode != TimingArrival {
+		return errors.New("rist: TimingMode must be TimingSource or TimingArrival")
+	}
+
 	if len(cfg.Secret) > maxShortString {
 		return errors.New("rist: Secret must be at most 127 bytes")
 	}
 	if cfg.Secret != "" && cfg.AESKeyBits == 0 {
-		cfg.AESKeyBits = 256 // libRIST: maximum security level when aes-type omitted
+		// Match the libRIST CLI tools, which set a 128-bit key when a secret is
+		// given without an explicit aes-type; the library's own 256 default never
+		// fires there. Set AESKeyBits explicitly to interoperate with a 256 peer.
+		cfg.AESKeyBits = 128
+	} else if cfg.Secret == "" && cfg.Username != "" && cfg.AESKeyBits == 0 {
+		// SRP without a Secret = use_key_as_passphrase: the media key is derived
+		// from the SRP session key K. libRIST's _librist_crypto_psk_set_passphrase
+		// defaults key_size to 256 when it is unset (which it is when the tools are
+		// given no aes-type), so default to 256 here to interoperate.
+		cfg.AESKeyBits = 256
 	}
 	switch cfg.AESKeyBits {
 	case 0, 128, 256:
 	default:
 		return errors.New("rist: AESKeyBits must be 0, 128, or 256")
 	}
-	if cfg.AESKeyBits != 0 && cfg.Secret == "" {
-		return errors.New("rist: AESKeyBits requires a Secret")
+	// AESKeyBits requires either a Secret (PSK keying) or SRP credentials
+	// (use_key_as_passphrase keying from K). It is meaningless without a key.
+	if cfg.AESKeyBits != 0 && cfg.Secret == "" && cfg.Username == "" {
+		return errors.New("rist: AESKeyBits requires a Secret or SRP credentials")
 	}
 	if cfg.KeyRotation < 0 {
 		return errors.New("rist: KeyRotation must be at least 0 (packets per key)")
@@ -444,11 +539,50 @@ func (cfg *Config) validate() error {
 	if len(cfg.Password) > maxLongString {
 		return errors.New("rist: Password must be at most 255 bytes")
 	}
+	// SRP credentials WITHOUT a pre-shared Secret select libRIST's
+	// use_key_as_passphrase mode: the media AES key is derived from the SRP
+	// session key K on a successful handshake (so the channel is still encrypted,
+	// keyed by the mutually-authenticated K — no confidentiality downgrade), and
+	// both GRE directions key from K. This is valid and interoperates with a
+	// libRIST peer given username/password and no secret. SRP WITH an explicit
+	// Secret keeps using the Secret-derived PSK (SRP only gates the channel).
+	// Both forms are accepted here; no rejection.
+	//
+	// AESKeyBits without a Secret is the use_key_as_passphrase key size (128/256);
+	// the AESKeyBits-requires-Secret check above would have rejected it, so allow
+	// it here when SRP credentials are present (see the AESKeyBits block below,
+	// which now permits it under SRP).
 
 	if cfg.Weight < 0 {
 		return errors.New("rist: Weight must be at least 0 (0 = duplicate)")
 	}
 
+	if err := cfg.validateMulticast(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateMulticast checks the IP-multicast configuration fields (Interface,
+// MulticastTTL, MulticastSource, MulticastLoopback). The destination-address
+// dependent checks (e.g. rejecting MulticastSource on a unicast bind) happen in
+// the constructor, where the address is known; these are the field-level
+// constraints that hold regardless of address.
+func (cfg *Config) validateMulticast() error {
+	if cfg.MulticastTTL < 0 || cfg.MulticastTTL > 255 {
+		return errors.New("rist: MulticastTTL must be between 0 and 255 (0 = OS default of 1)")
+	}
+	if cfg.Interface != "" {
+		if _, err := net.InterfaceByName(cfg.Interface); err != nil {
+			return errors.New("rist: Interface " + cfg.Interface + " not found: " + err.Error())
+		}
+	}
+	if cfg.MulticastSource != "" {
+		if _, err := netip.ParseAddr(cfg.MulticastSource); err != nil {
+			return errors.New("rist: MulticastSource must be an IP address: " + err.Error())
+		}
+	}
 	return nil
 }
 

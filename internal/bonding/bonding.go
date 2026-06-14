@@ -98,6 +98,11 @@ func (g *Group) AddPath(index uint8, weight int, priority uint32) *Path {
 	return p
 }
 
+// HasPath reports whether a path with the given index is already registered.
+// The host uses it to avoid overwriting a path's priority/weight that was
+// configured before the session was built.
+func (g *Group) HasPath(index uint8) bool { return g.path(index) != nil }
+
 // path returns the registered Path with the given index, or nil.
 func (g *Group) path(index uint8) *Path {
 	for _, p := range g.paths {
@@ -164,10 +169,17 @@ func (g *Group) Tick(now clock.Timestamp) []uint8 {
 // path is live it falls back to the path that died most recently (best chance of
 // having recovered), so retransmission requests are not silently abandoned while
 // a path flaps. ok is false only when no path is registered.
-func (g *Group) SelectNackPath(now clock.Timestamp) (index uint8, ok bool) {
+//
+// addrKnown, when non-nil, reports whether a path's return address has been
+// learned; paths for which it returns false are skipped in BOTH the live and the
+// fallback selection, so SelectNackPath never returns a path the caller cannot
+// actually send on (which would silently drop the NACK). A nil predicate treats
+// every path as addressable.
+func (g *Group) SelectNackPath(now clock.Timestamp, addrKnown func(index uint8) bool) (index uint8, ok bool) {
+	usable := func(p *Path) bool { return addrKnown == nil || addrKnown(p.Index) }
 	var best *Path
 	for _, p := range g.paths {
-		if !g.Alive(p.Index, now) {
+		if !g.Alive(p.Index, now) || !usable(p) {
 			continue
 		}
 		if best == nil || preferred(p, best, g) {
@@ -177,15 +189,15 @@ func (g *Group) SelectNackPath(now clock.Timestamp) (index uint8, ok bool) {
 	if best != nil {
 		return best.Index, true
 	}
-	// No live path: fall back to a SEEN path, the one observed most recently
-	// (best chance of having recovered), so a NACK is still routed somewhere
-	// while paths flap. A never-seen path is never chosen — there is no address
-	// to send to and no evidence it can answer (mirrors libRIST gating its
-	// fallback on dead_since > 0). With Tick declaring a batch of paths dead in
-	// a single call they share no per-path death instant, so lastSeen — which
-	// does differ per path — is the meaningful "most recently usable" key.
+	// No live path: fall back to a SEEN path with a known return address, the one
+	// observed most recently (best chance of having recovered), so a NACK is still
+	// routed somewhere sendable while paths flap. A never-seen path — or one whose
+	// return address is not yet learned — is never chosen (mirrors libRIST gating
+	// its fallback on dead_since > 0). With Tick declaring a batch of paths dead in
+	// a single call they share no per-path death instant, so lastSeen — which does
+	// differ per path — is the meaningful "most recently usable" key.
 	for _, p := range g.paths {
-		if !p.seen {
+		if !p.seen || !usable(p) {
 			continue
 		}
 		if best == nil || p.lastSeen.After(best.lastSeen) {

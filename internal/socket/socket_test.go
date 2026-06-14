@@ -2,6 +2,7 @@ package socket
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -63,8 +64,8 @@ func TestMediaAndRTCPRoundTrip(t *testing.T) {
 	}
 	defer tx.Close()
 
-	mediaDst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
-	rtcpDst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port + 1}
+	mediaDst := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(port))
+	rtcpDst := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(port+1))
 
 	if err := tx.WriteMedia([]byte("media"), mediaDst); err != nil {
 		t.Fatalf("WriteMedia: %v", err)
@@ -81,8 +82,8 @@ func TestMediaAndRTCPRoundTrip(t *testing.T) {
 	if err != nil || string(buf[:n]) != "media" {
 		t.Fatalf("ReadMedia = %q, %v, %v", buf[:n], src, err)
 	}
-	if src == nil {
-		t.Fatal("ReadMedia returned nil source address")
+	if !src.IsValid() {
+		t.Fatal("ReadMedia returned invalid source address")
 	}
 	n, _, err = rx.ReadRTCP(buf)
 	if err != nil || string(buf[:n]) != "rtcp" {

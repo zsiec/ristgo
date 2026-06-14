@@ -166,10 +166,17 @@ const (
 	srpSubtypePassword  uint8 = 0x10
 )
 
-// eapVersion3 is the EAPOL version this implementation emits: 3 signals RFC
-// 5054 PAD-compliant SRP hashing (ctx->eapversion3 ? 3 : 2). libRIST
-// 0.2.16+ always uses 3 for new contexts.
+// eapVersion3 is the EAPOL version this implementation emits by default: 3
+// signals RFC 5054 PAD-compliant SRP hashing (ctx->eapversion3 ? 3 : 2). libRIST
+// 0.2.16+ uses 3 for new contexts.
 const eapVersion3 uint8 = 3
+
+// eapVersion2 is the legacy (pre-0.2.16, srp-compat=1) EAPOL version: 2 signals
+// the unpadded k/u SRP hashing. ristgo drives the SRP hashing mode entirely from
+// this on-wire version byte, so a legacy authenticator advertises version 2 in
+// every REQUEST it originates and the authenticatee echoes it (negotiatedVersion),
+// switching both sides to the legacy SRP math for interop with old peers.
+const eapVersion2 uint8 = 2
 
 // Header sizes.
 const (
@@ -181,12 +188,37 @@ const (
 	// the EAP header, i.e. the offset of an EAP body within an EAPOL frame.
 	hdrsOffset = eapolHdrSize + eapHdrSize
 
-	// proofLen is the SHA-256 proof size for M1/M2 (DIGEST_LENGTH).
+	// proofLen is the SHA-256 proof size for M1/M2 (DIGEST_LENGTH). It is also
+	// the length of the SRP session key K (SHA256_DIGEST_LENGTH).
 	proofLen = 32
+
+	// sessionKeyLen is the length in bytes of the SRP session key K used as the
+	// data-channel passphrase (SHA256_DIGEST_LENGTH).
+	sessionKeyLen = 32
 
 	// validatorFlagsLen is the 4-byte flags word that prefixes M1 in
 	// CLIENT_VALIDATOR and M2 in SERVER_VALIDATOR.
 	validatorFlagsLen = 4
+
+	// setPassphraseBit is bit 0 of the 4th byte (index 3) of a validator's
+	// 4-byte flags word. The authenticatee sets it in its M1 (CLIENT_VALIDATOR)
+	// and the authenticator sets it in its M2 (SERVER_VALIDATOR) to signal
+	// "I installed the SRP session key K as my passphrase for this direction;
+	// you install it as yours for the reverse" — the use_key_as_passphrase
+	// inline data-channel keying (SET_BIT(pkt[3], 0); CHECK_BIT(pkt[3], 0)).
+	// Index into the flags word is setPassphraseByte.
+	setPassphraseByte = 3
+	setPassphraseBit  = 0
+
+	// pwUseSessionKeyBit is bit 7 of a PASSWORD-RESPONSE flag byte: set means
+	// "use the SRP session key K as the passphrase" with no encrypted payload
+	// (the use_key_as_passphrase case, SET_BIT(pkt[0], 7)).
+	pwUseSessionKeyBit = 7
+	// pwExplicitBit is bit 6 of a PASSWORD-RESPONSE flag byte: set means an
+	// explicit passphrase follows, AES-CTR-encrypted under K (SET_BIT(pkt[0], 6)).
+	// On receive libRIST also reads it as the AES key size selector
+	// (CHECK_BIT(pkt[0], 6) ? 256 : 128); the encrypt side always uses 256.
+	pwExplicitBit = 6
 )
 
 // Code identifies an EAP packet's code field.
@@ -205,7 +237,7 @@ const (
 type Kind uint8
 
 // Frame kinds. KindUnknown covers EAP bodies this package parses structurally
-// but does not act on (e.g. the password push messages).
+// but does not act on.
 const (
 	KindUnknown Kind = iota
 	KindStart
@@ -219,6 +251,15 @@ const (
 	KindServerValidator
 	KindSuccess
 	KindFailure
+	// KindPasswordRequest is the EAP REQUEST subtype 0x10 (PASSWORD_REQUEST):
+	// the post-SUCCESS solicitation for the data-channel passphrase
+	// (eap_request_passphrase). It carries no body beyond the SRP header.
+	KindPasswordRequest
+	// KindPasswordResponse is the EAP RESPONSE subtype 0x10
+	// (PASSWORD_REQUEST_RESPONSE): the reply to a PASSWORD_REQUEST, or an
+	// unsolicited passphrase push (eap_srp_send_password). Its body is a flags
+	// byte optionally followed by an AES-CTR-encrypted passphrase.
+	KindPasswordResponse
 )
 
 // String returns a human-readable name for the kind.
@@ -246,6 +287,10 @@ func (k Kind) String() string {
 		return "SUCCESS"
 	case KindFailure:
 		return "FAILURE"
+	case KindPasswordRequest:
+		return "PASSWORD-REQUEST"
+	case KindPasswordResponse:
+		return "PASSWORD-RESPONSE"
 	default:
 		return "UNKNOWN"
 	}
@@ -280,8 +325,50 @@ type Frame struct {
 	// Proof carries M1 (CLIENT-VALIDATOR) or M2 (SERVER-VALIDATOR).
 	Proof []byte
 
-	// Flags is the 4-byte flags word of a validator message (zero here).
+	// Flags is the 4-byte flags word of a validator message. Its only defined
+	// bit is bit 0 of Flags[setPassphraseByte] (the use_key_as_passphrase
+	// set_passphrase signal); all other bytes are zero. SetPassphrase /
+	// setSetPassphrase manipulate it.
 	Flags [validatorFlagsLen]byte
+
+	// PwFlags is the single flag byte of a PASSWORD-RESPONSE (bit 7 = use
+	// session key, bit 6 = explicit passphrase follows). Meaningful only for
+	// KindPasswordResponse.
+	PwFlags byte
+
+	// PwPayload is the raw (AES-CTR-encrypted, when present) explicit-passphrase
+	// bytes of a PASSWORD-RESPONSE, i.e. everything after the flag byte. It is
+	// nil for the use-session-key case. The host decrypts it under K.
+	PwPayload []byte
+}
+
+// SetPassphrase reports whether the validator's set_passphrase bit is set
+// (CHECK_BIT(flags[3], 0)) — the use_key_as_passphrase signal carried in a
+// CLIENT-VALIDATOR (M1) or SERVER-VALIDATOR (M2).
+func (f Frame) SetPassphrase() bool {
+	return f.Flags[setPassphraseByte]&(1<<setPassphraseBit) != 0
+}
+
+// setSetPassphrase sets or clears the validator set_passphrase bit
+// (SET_BIT(flags[3], 0)).
+func (f *Frame) setSetPassphrase(v bool) {
+	if v {
+		f.Flags[setPassphraseByte] |= 1 << setPassphraseBit
+	} else {
+		f.Flags[setPassphraseByte] &^= 1 << setPassphraseBit
+	}
+}
+
+// PwUseSessionKey reports whether a PASSWORD-RESPONSE selects the SRP session
+// key K as the passphrase (CHECK_BIT(pwflags, 7)).
+func (f Frame) PwUseSessionKey() bool {
+	return f.PwFlags&(1<<pwUseSessionKeyBit) != 0
+}
+
+// PwHasExplicit reports whether a PASSWORD-RESPONSE carries an explicit
+// AES-CTR-encrypted passphrase (CHECK_BIT(pwflags, 6)).
+func (f Frame) PwHasExplicit() bool {
+	return f.PwFlags&(1<<pwExplicitBit) != 0
 }
 
 // startFrame builds the EAPOL-START frame, which carries no EAP payload
@@ -379,6 +466,14 @@ func (f Frame) encodeBody() []byte {
 	case KindFailure:
 		// FAILURE carries no body.
 		return nil
+	case KindPasswordRequest:
+		// PASSWORD_REQUEST: just the SRP header, no body (eap_request_passphrase).
+		return []byte{eapTypeSRPSHA1, srpSubtypePassword}
+	case KindPasswordResponse:
+		// PASSWORD_REQUEST_RESPONSE: SRP header, one flag byte, then the optional
+		// (already-encrypted) explicit-passphrase payload (eap_srp_send_password).
+		out := []byte{eapTypeSRPSHA1, srpSubtypePassword, f.PwFlags}
+		return append(out, f.PwPayload...)
 	default:
 		return nil
 	}
@@ -508,9 +603,20 @@ func parseSRP(f Frame, code, subtype uint8, payload []byte) (Frame, error) {
 			return f, nil
 		}
 		return parseValidator(f, KindServerValidator, payload)
-	case subtype == srpSubtypePassword:
-		// Password push/response; parsed structurally but not acted on here.
-		f.Kind = KindUnknown
+	case subtype == srpSubtypePassword && code == eapCodeRequest:
+		// PASSWORD_REQUEST: the post-SUCCESS solicitation for the data-channel
+		// passphrase. It carries no body beyond the SRP header.
+		f.Kind = KindPasswordRequest
+		return f, nil
+	case subtype == srpSubtypePassword && code == eapCodeResponse:
+		// PASSWORD_REQUEST_RESPONSE: a flag byte then the optional (encrypted)
+		// explicit-passphrase payload. libRIST requires len >= 1 here.
+		if len(payload) < 1 {
+			return Frame{}, ErrShortBuffer
+		}
+		f.Kind = KindPasswordResponse
+		f.PwFlags = payload[0]
+		f.PwPayload = cloneBytes(payload[1:])
 		return f, nil
 	default:
 		return Frame{}, ErrUnsupportedType

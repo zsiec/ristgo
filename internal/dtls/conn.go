@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -40,6 +41,15 @@ type Config struct {
 	// client that does not authenticate with a certificate.
 	RequireClientCert bool
 
+	// RequireExtendedMasterSecret, when set on a client, aborts the handshake
+	// with a fatal alert if the server's ServerHello omits the
+	// extended_master_secret extension (RFC 7627). It defends against a
+	// downgrade in which an attacker strips the extension to force the legacy
+	// master-secret derivation. The client always offers EMS; this only changes
+	// whether a stripped ServerHello is tolerated. Default off (a non-EMS server
+	// is accepted, preserving interop with peers that lack RFC 7627).
+	RequireExtendedMasterSecret bool
+
 	// Peer-certificate verification (cert mode). Checked in this order:
 	// InsecureSkipVerify accepts any; a non-zero PeerCertFingerprint pins the
 	// peer's leaf SHA-256; otherwise the chain is verified against RootCAs.
@@ -47,6 +57,17 @@ type Config struct {
 	RootCAs             *x509.CertPool
 	PeerCertFingerprint [32]byte
 	pinnedFingerprint   bool
+
+	// PeerName, when non-empty, additionally requires the peer's leaf
+	// certificate to be valid for this DNS name or IP (matched against the
+	// certificate's Subject Alternative Names via the standard x509 hostname
+	// check). It applies only on the RootCAs chain-verification path: without it,
+	// RootCAs authenticates "some certificate issued under this CA," not a
+	// specific peer — any leaf the CA signed is accepted. Empty preserves that
+	// chain-of-trust-only behavior. It is ignored on the InsecureSkipVerify and
+	// PeerCertFingerprint paths (a fingerprint pin already authenticates the
+	// exact key).
+	PeerName string
 
 	// Rand supplies randomness (randoms, ECDHE keys, cookies); defaults to
 	// crypto/rand.Reader.
@@ -97,14 +118,29 @@ const maxDatagram = 1200
 // readBufSize bounds an inbound datagram read.
 const readBufSize = 1 << 16
 
-// Conn is a DTLS 1.2 connection over a datagram transport. It is not safe for
-// concurrent Read/Write with itself except that one goroutine may Read while
-// another Writes after the handshake completes (each direction has its own
-// record-sequence state); the handshake itself must run on a single goroutine.
+// Conn is a DTLS 1.2 connection over a datagram transport.
+//
+// Concurrency (post-handshake): one goroutine may Read while another Writes.
+// The two directions decrypt/encrypt with independent halfConns, and ALL
+// outbound record emission — application-data Writes and the Read path's
+// RFC 6347 §4.2.4 last-flight resend — is serialized by sendMu so the shared
+// epoch-1 record sequence (c.sendSeq[1]) is never advanced concurrently. That
+// serialization is mandatory, not merely tidy: the AES-GCM nonce is
+// salt||epoch<<48|seq, so two epoch-1 records sharing a sequence number would
+// reuse a nonce under one key — a catastrophic AEAD failure (keystream XOR
+// disclosure plus GHASH authentication-key recovery). The handshake itself must
+// still run on a single goroutine; sendMu only governs post-handshake emission.
 type Conn struct {
 	transport Transport
 	cfg       *Config
 	isClient  bool
+
+	// sendMu serializes all outbound record emission after the handshake: it
+	// guards each (allocate record seq, seal, transport.Write) unit so the
+	// concurrent post-handshake Read and Write goroutines cannot interleave two
+	// epoch-1 records onto the same sequence number (and thus the same GCM
+	// nonce). It is uncontended during the single-goroutine handshake.
+	sendMu sync.Mutex
 
 	sendEpoch uint16
 	sendSeq   [2]uint64 // per-epoch outgoing record sequence
@@ -188,7 +224,12 @@ func (c *Conn) Write(p []byte) (int, error) {
 			return 0, err
 		}
 	}
-	if err := c.writeRecord(recordApplicationData, c.sendEpoch, p); err != nil {
+	// Serialize with the Read path's last-flight resend: both emit epoch-1
+	// records and must not share an epoch-1 record sequence (GCM nonce).
+	c.sendMu.Lock()
+	err := c.writeRecord(recordApplicationData, c.sendEpoch, p)
+	c.sendMu.Unlock()
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -290,7 +331,13 @@ func (c *Conn) readAppRecords() error {
 				(r.typ == recordHandshake || r.typ == recordChangeCipherSpec) &&
 				c.finalFlightResends < maxFinalFlightResends {
 				c.finalFlightResends++
-				if err := c.transmit(c.lastFlight); err != nil {
+				// The final flight carries an epoch-1 Finished. Serialize with a
+				// concurrent application-data Write so the two cannot allocate the
+				// same epoch-1 record sequence (and thus reuse a GCM nonce).
+				c.sendMu.Lock()
+				err := c.transmit(c.lastFlight)
+				c.sendMu.Unlock()
+				if err != nil {
 					return err
 				}
 			}

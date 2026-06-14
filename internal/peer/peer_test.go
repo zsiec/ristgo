@@ -1,7 +1,7 @@
 package peer
 
 import (
-	"net"
+	"net/netip"
 	"testing"
 
 	"github.com/zsiec/ristgo/internal/clock"
@@ -39,10 +39,15 @@ func TestExpiry(t *testing.T) {
 	}
 }
 
+// ap builds a netip.AddrPort from an IPv4 quad and port.
+func ap(a, b, c, d byte, port uint16) netip.AddrPort {
+	return netip.AddrPortFrom(netip.AddrFrom4([4]byte{a, b, c, d}), port)
+}
+
 func TestLearnAddressesOnce(t *testing.T) {
 	p := New(clock.Second)
-	a := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 100}
-	b := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 200}
+	a := ap(10, 0, 0, 1, 100)
+	b := ap(10, 0, 0, 2, 200)
 
 	p.LearnMedia(a)
 	p.LearnMedia(b) // must not overwrite
@@ -51,8 +56,8 @@ func TestLearnAddressesOnce(t *testing.T) {
 	}
 	// RTCP candidates must share the media host (10.0.0.1); LearnRTCP rejects a
 	// foreign host once media is known (see TestLearnRTCPRejectsForeignHost).
-	rtcp1 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 200}
-	rtcp2 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 300}
+	rtcp1 := ap(10, 0, 0, 1, 200)
+	rtcp2 := ap(10, 0, 0, 1, 300)
 	p.LearnRTCP(rtcp1)
 	p.LearnRTCP(rtcp2)
 	if p.RTCP != rtcp1 {
@@ -65,15 +70,15 @@ func TestLearnAddressesOnce(t *testing.T) {
 // reflection guard), while a same-host RTCP source on a different port is
 // accepted.
 func TestLearnRTCPRejectsForeignHost(t *testing.T) {
-	media := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5000}
-	attacker := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 5001}
-	legit := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5001}
+	media := ap(192, 0, 2, 10, 5000)
+	attacker := ap(198, 51, 100, 9, 5001)
+	legit := ap(192, 0, 2, 10, 5001)
 
 	p := New(2000)
 	p.LearnMedia(media)
 	p.LearnRTCP(attacker)
-	if p.RTCP != nil {
-		t.Fatalf("RTCP = %v, want nil (foreign-host spoof rejected)", p.RTCP)
+	if p.RTCP.IsValid() {
+		t.Fatalf("RTCP = %v, want invalid (foreign-host spoof rejected)", p.RTCP)
 	}
 	p.LearnRTCP(legit)
 	if p.RTCP != legit {
@@ -85,5 +90,21 @@ func TestLearnRTCPRejectsForeignHost(t *testing.T) {
 	q.LearnRTCP(attacker)
 	if q.RTCP != attacker {
 		t.Fatalf("RTCP = %v, want %v (first-wins before media known)", q.RTCP, attacker)
+	}
+}
+
+// TestLearnRTCPUnmapsIPv4in6 verifies the anti-spoof host check treats an IPv4
+// source seen as 4-in-6 (dual-stack socket) as the same host as its plain IPv4
+// media address — the net.IP.Equal semantics the netip migration preserves.
+func TestLearnRTCPUnmapsIPv4in6(t *testing.T) {
+	media := netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 10}), 5000)
+	// Same host, but expressed as an IPv4-mapped IPv6 address on a different port.
+	mapped := netip.AddrPortFrom(netip.AddrFrom16(netip.AddrFrom4([4]byte{192, 0, 2, 10}).As16()), 5001)
+
+	p := New(2000)
+	p.LearnMedia(media)
+	p.LearnRTCP(mapped)
+	if !p.RTCP.IsValid() {
+		t.Fatal("RTCP = invalid, want accepted (4-in-6 same host must match plain IPv4)")
 	}
 }

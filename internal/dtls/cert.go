@@ -111,12 +111,26 @@ func parseECKey(block *pem.Block) (*ecdsa.PrivateKey, error) {
 // errBadCertificate is returned when peer-certificate verification fails.
 var errBadCertificate = errors.New("rist: dtls: peer certificate verification failed")
 
+// peerRole is which side's certificate is being verified, used to constrain the
+// accepted ExtKeyUsage on the RootCAs path: a client verifies the server's leaf
+// (server_auth), a server verifies the client's leaf (client_auth).
+type peerRole int
+
+const (
+	verifyingServerCert peerRole = iota // local endpoint is the client
+	verifyingClientCert                 // local endpoint is the server
+)
+
 // verifyPeerCertificate validates a received certificate chain per cfg: skip when
 // InsecureSkipVerify; match the pinned SHA-256 fingerprint when one is set;
 // otherwise verify the chain against RootCAs (or, when none are configured,
 // require the pin — an unpinned, unrooted peer is rejected rather than trusted).
-// It returns the parsed leaf for downstream signature checks.
-func verifyPeerCertificate(chain [][]byte, cfg *Config) (*x509.Certificate, error) {
+// On the RootCAs path it constrains the accepted ExtKeyUsage to the peer's role
+// and, when cfg.PeerName is set, additionally requires the leaf to be valid for
+// that name (RFC 6125 SAN matching) — without a name, RootCAs authenticates only
+// that the leaf chains to a trusted CA, not that it is a specific peer. It
+// returns the parsed leaf for downstream signature checks.
+func verifyPeerCertificate(chain [][]byte, cfg *Config, role peerRole) (*x509.Certificate, error) {
 	if len(chain) == 0 {
 		return nil, fmt.Errorf("%w: empty chain", errBadCertificate)
 	}
@@ -154,10 +168,19 @@ func verifyPeerCertificate(chain [][]byte, cfg *Config) (*x509.Certificate, erro
 			intermediates.AddCert(ic)
 		}
 	}
+	// Constrain the key usage to the peer's role rather than accepting any usage,
+	// so a client-auth-only certificate cannot pose as a server (and vice versa).
+	usage := x509.ExtKeyUsageServerAuth
+	if role == verifyingClientCert {
+		usage = x509.ExtKeyUsageClientAuth
+	}
 	if _, err := leaf.Verify(x509.VerifyOptions{
+		// DNSName drives the standard library's hostname/SAN check when set; an
+		// empty DNSName skips it, keeping the chain-of-trust-only default.
+		DNSName:       cfg.PeerName,
 		Roots:         cfg.RootCAs,
 		Intermediates: intermediates,
-		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		KeyUsages:     []x509.ExtKeyUsage{usage},
 	}); err != nil {
 		return nil, fmt.Errorf("%w: %v", errBadCertificate, err)
 	}

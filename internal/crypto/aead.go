@@ -25,20 +25,24 @@
 //  1. The 12-byte AEAD nonce (GCM / ChaCha20-Poly1305). TR-06-3 §8 / Figure 19
 //     specifies only the 128-bit AES-CTR IV as [IV field (4 B, big-endian) |
 //     12 zero bytes] (the same construction as Main / crypto.BuildIV). It does
-//     NOT specify a 12-byte AEAD nonce. We use the most analogous layout:
-//     12-byte nonce = [IV field (4 B, big-endian) | 8 zero bytes] (aeadNonce).
-//     The 4-byte IV field increments per packet, so within one key epoch (one
-//     PSK Nonce, i.e. one PBKDF2-derived key) every (key, nonce) pair is unique
-//     — the non-negotiable uniqueness requirement for both GCM and
-//     ChaCha20-Poly1305. INTERPRETED.
+//     NOT specify a 12-byte AEAD nonce. We bind BOTH the key epoch and the
+//     per-packet counter into the nonce: 12-byte nonce = [PSK Nonce (4 B) |
+//     IV field (4 B, big-endian) | 4 zero bytes] (aeadNonce). Folding the PSK
+//     Nonce into the nonce — not only into the PBKDF2 key derivation — makes
+//     every key epoch structurally distinct in the nonce as well, so two epochs
+//     can never collide on (key, nonce) even if their per-packet IV ranges
+//     overlap. The 4-byte IV field increments per packet, so within one epoch
+//     every (key, nonce) pair is unique — the non-negotiable uniqueness
+//     requirement for both GCM and ChaCha20-Poly1305. INTERPRETED.
 //
-//     CALLER CONTRACT (security-load-bearing): SealAdvanced takes iv4 as an
-//     opaque counter and cannot enforce uniqueness itself. The host MUST issue a
-//     fresh PSK Nonce (re-derive the key) before the IV field wraps past 2^32,
-//     exactly as the Main path rotates the nonce on IV wrap (ORCHESTRATION.md).
-//     A repeated (key, nonce) under GCM or ChaCha20-Poly1305 is catastrophic —
-//     it enables tag forgery via authentication-key recovery as well as
-//     keystream reuse, materially worse than the AES-CTR-only case.
+//     SAFE-BY-CONSTRUCTION: SealAdvanced is a stateless primitive and takes iv4
+//     as an opaque counter, so it cannot enforce non-wrap itself. Use
+//     AdvancedSealer (this package) for the production send path: it owns the IV
+//     counter and returns ErrIVExhausted rather than letting the IV field wrap
+//     within one PSK Nonce, forcing the host to rotate the nonce (re-derive the
+//     key) instead of silently reusing a (key, nonce) pair — which under GCM or
+//     ChaCha20-Poly1305 is catastrophic (tag forgery via authentication-key
+//     recovery plus keystream reuse, materially worse than the AES-CTR case).
 //
 //  2. The AEAD AAD scope / the AES-CTR-HMAC authenticated region. TR-06-3
 //     §8/§8.1 says authentication covers the whole RTP packet (first byte of the
@@ -111,6 +115,14 @@ var (
 	// key size other than 256 bits. ChaCha20-Poly1305 has only a 256-bit key
 	// variant (RFC 8439); a 128-bit request is a configuration error.
 	ErrChaChaKeySize = errors.New("rist: crypto: ChaCha20-Poly1305 requires a 256-bit key")
+
+	// ErrIVExhausted is returned by AdvancedSealer.Seal when the 32-bit IV field
+	// would wrap within the current PSK Nonce. Continuing would reuse a
+	// (key, nonce) pair — catastrophic for AES-GCM and ChaCha20-Poly1305 — so the
+	// sealer refuses and the host must rotate the PSK Nonce (re-derive the key
+	// with fresh randomness, which is the host's job: this package is sans-I/O)
+	// and build a new AdvancedSealer before sealing again.
+	ErrIVExhausted = errors.New("rist: crypto: Advanced PSK IV field exhausted; rotate the PSK Nonce")
 )
 
 // PSKMode identifies one of the RIST Advanced Profile PSK encryption modes.
@@ -151,17 +163,21 @@ const (
 )
 
 // aeadNonce builds the INTERPRETED 12-byte AEAD nonce for GCM and
-// ChaCha20-Poly1305 from the 4-byte IV field: the IV field big-endian in bytes
-// [0:4], then eight zero bytes. This mirrors crypto.BuildIV's 16-byte AES-CTR
-// IV layout (IV field high, zeros low) truncated to 12 bytes.
+// ChaCha20-Poly1305: the 4-byte PSK Nonce (the key epoch) in bytes [0:4], the
+// 4-byte IV field big-endian in [4:8], then four zero bytes. Binding the PSK
+// Nonce into the nonce — not only into the PBKDF2 key derivation — makes every
+// key epoch structurally distinct, so two epochs can never present the same
+// (key, nonce) pair even if their per-packet IV ranges overlap. Within one
+// epoch the per-packet IV field supplies uniqueness; AdvancedSealer enforces
+// that the IV field cannot wrap within an epoch.
 //
 // INTERPRETED (interop-unvalidated; pending a reference or the full TR-06-3
 // §5.2.5 detail): TR-06-3 specifies only the 16-byte AES-CTR IV, not the
-// 12-byte AEAD nonce. The per-packet IV increment makes (key, nonce) unique
-// within a key epoch, satisfying the GCM/ChaCha uniqueness requirement.
-func aeadNonce(iv4 uint32) [aeadNonceSize]byte {
+// 12-byte AEAD nonce.
+func aeadNonce(nonce4 [NonceSize]byte, iv4 uint32) [aeadNonceSize]byte {
 	var n [aeadNonceSize]byte
-	binary.BigEndian.PutUint32(n[0:4], iv4)
+	copy(n[0:NonceSize], nonce4[:])
+	binary.BigEndian.PutUint32(n[NonceSize:NonceSize+4], iv4)
 	return n
 }
 
@@ -201,9 +217,9 @@ func SealAdvanced(mode PSKMode, password []byte, keyBits int, nonce4 [NonceSize]
 		hash = hmacTag(macKey, aad, ct)
 		return ct, hash, nil
 	case PSKModeAESGCM:
-		return sealGCM(key, aeadNonce(iv4), aad, plaintext)
+		return sealGCM(key, aeadNonce(nonce4, iv4), aad, plaintext)
 	case PSKModeChaCha20Poly1305:
-		return sealChaCha(key, aeadNonce(iv4), aad, plaintext)
+		return sealChaCha(key, aeadNonce(nonce4, iv4), aad, plaintext)
 	default:
 		return nil, hash, ErrUnknownPSKMode
 	}
@@ -239,12 +255,64 @@ func OpenAdvanced(mode PSKMode, password []byte, keyBits int, nonce4 [NonceSize]
 		}
 		return ctrXOR(key, BuildIV(iv4), ciphertext)
 	case PSKModeAESGCM:
-		return openGCM(key, aeadNonce(iv4), aad, ciphertext, hash)
+		return openGCM(key, aeadNonce(nonce4, iv4), aad, ciphertext, hash)
 	case PSKModeChaCha20Poly1305:
-		return openChaCha(key, aeadNonce(iv4), aad, ciphertext, hash)
+		return openChaCha(key, aeadNonce(nonce4, iv4), aad, ciphertext, hash)
 	default:
 		return nil, ErrUnknownPSKMode
 	}
+}
+
+// AdvancedSealer is a stateful, single-epoch wrapper around SealAdvanced that
+// owns the per-packet IV field and makes the security-load-bearing
+// (key, nonce)-uniqueness requirement structural rather than a caller
+// obligation. It issues a fresh, monotonically increasing IV field for each
+// Seal and refuses with ErrIVExhausted once the 32-bit IV field would wrap
+// within the current PSK Nonce — so the wrap-without-rotation foot-gun (a
+// repeated nonce under GCM/ChaCha) cannot happen silently. Construct one sealer
+// per PSK Nonce epoch; on ErrIVExhausted the host rotates the PSK Nonce
+// (re-derives the key) and builds a fresh sealer.
+//
+// It is sans-I/O and is NOT safe for concurrent use; the session host must
+// serialize Seal calls from its single send goroutine.
+type AdvancedSealer struct {
+	mode      PSKMode
+	password  []byte
+	keyBits   int
+	nonce4    [NonceSize]byte
+	iv        uint32 // next IV field to issue
+	exhausted bool   // the last representable IV has been issued
+}
+
+// NewAdvancedSealer creates a sealer for one PSK Nonce epoch. startIV is the
+// first IV field value to issue (typically 0); successive Seal calls issue
+// startIV, startIV+1, … and the sealer refuses once the field reaches its
+// maximum, never wrapping the 32-bit counter within the epoch.
+func NewAdvancedSealer(mode PSKMode, password []byte, keyBits int, nonce4 [NonceSize]byte, startIV uint32) *AdvancedSealer {
+	return &AdvancedSealer{mode: mode, password: password, keyBits: keyBits, nonce4: nonce4, iv: startIV}
+}
+
+// Seal encrypts plaintext with the next IV field and returns the wire
+// ciphertext, the 16-byte Hash-field value, and the IV field used — which the
+// codec writes into the packet header so the receiver can OpenAdvanced. It
+// returns ErrIVExhausted instead of reusing a nonce once the IV field is spent;
+// the host must then rotate the PSK Nonce and build a new sealer. aad and the
+// per-mode semantics are exactly those of SealAdvanced.
+func (s *AdvancedSealer) Seal(aad, plaintext []byte) (ciphertext []byte, hash [HashSize]byte, iv4 uint32, err error) {
+	if s.exhausted {
+		return nil, hash, 0, ErrIVExhausted
+	}
+	iv4 = s.iv
+	ct, h, serr := SealAdvanced(s.mode, s.password, s.keyBits, s.nonce4, iv4, aad, plaintext)
+	if serr != nil {
+		return nil, hash, 0, serr
+	}
+	if s.iv == ^uint32(0) {
+		s.exhausted = true // issued the last representable IV; the next call must rotate
+	} else {
+		s.iv++
+	}
+	return ct, h, iv4, nil
 }
 
 // deriveAEADKey derives the symmetric key for the given Advanced PSK mode from

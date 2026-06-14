@@ -17,8 +17,11 @@ and fills a real gap: the reference RIST implementation is the C library
 alternative. ristgo offers a small, io-native `Sender`/`Receiver` API over a
 deterministic, sans-I/O protocol core — so the timing-critical parts (ARQ,
 reordering, the SMPTE 2022-7 multipath merge, RTT/NACK cadence) are exhaustively
-testable on a fake clock — with **zero runtime dependencies beyond the standard
-library and `golang.org/x/crypto`**.
+testable on a fake clock — with a **tiny dependency set beyond the standard
+library: only the Go team's `golang.org/x/crypto` and `golang.org/x/net`** (the
+latter for IP multicast — group membership, multicast TTL, and interface
+selection, which the standard library does not expose). No third-party or pion
+dependencies.
 
 ## Install
 

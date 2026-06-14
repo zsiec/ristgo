@@ -22,6 +22,28 @@ const (
 )
 
 // Cipher suites (the two this package supports), AES-128-GCM + SHA-256.
+//
+// Deferred deviation from RFC 7525 §4.2 / RFC 8422 mandatory-to-implement set
+// (finding L7): of the five suites RFC 7525 §6.2 recommends, only
+// ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 is implemented (plus the PSK suite RIST
+// actually uses). The omissions are deliberate:
+//
+//   - ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 is NOT a clean extension of the
+//     existing machinery: it changes BOTH the bulk key length (AES-256) and the
+//     PRF/Finished/transcript hash (SHA-384). The PRF (prf/pHash) and the
+//     handshake transcript hash (transcriptHash) are fixed to SHA-256 and woven
+//     through the master-secret/EMS derivation, CertificateVerify, and both
+//     Finished computations; parametrizing the hash would touch the entire key
+//     schedule and every transcript consumer in both handshake drivers. Given no
+//     interop oracle (see below), AES-128-GCM/SHA-256 — itself a recommended,
+//     128-bit-secure AEAD suite — is the single supported GCM strength.
+//   - The ECDHE_RSA_* and DHE_RSA_* suites need an RSA certificate/signature
+//     path distinct from the ECDSA one and are out of scope.
+//
+// There is no interop cost: libRIST ships no DTLS, so there is no reference peer
+// whose suite list ristgo must match; the supported suites are validated against
+// OpenSSL (see doc.go). Adding AES-256-GCM/SHA-384 is tracked as future work
+// behind a hash-parametrized PRF and transcript.
 const (
 	tlsPSKWithAES128GCMSHA256        uint16 = 0x00A8 // RFC 5487
 	tlsECDHEECDSAWithAES128GCMSHA256 uint16 = 0xC02B // RFC 5289

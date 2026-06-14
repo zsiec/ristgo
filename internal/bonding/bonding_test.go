@@ -35,6 +35,35 @@ func TestAddPathUpdate(t *testing.T) {
 	}
 }
 
+// TestHasPathPreservesPriority checks HasPath reports registration and that the
+// "register only if absent" pattern the session uses preserves a priority the
+// host pre-set, rather than overwriting it with the default.
+func TestHasPathPreservesPriority(t *testing.T) {
+	g := newGroup()
+	if g.HasPath(0) {
+		t.Fatal("HasPath(0) true before any AddPath")
+	}
+	g.AddPath(0, WeightDuplicate, 7) // host pre-registers path 0 with priority 7
+	if !g.HasPath(0) {
+		t.Fatal("HasPath(0) false after AddPath")
+	}
+	// The session registers each path only if absent, so the pre-set priority
+	// survives.
+	if !g.HasPath(0) {
+		g.AddPath(0, WeightDuplicate, 0)
+	}
+	if p := g.path(0); p.Priority != 7 {
+		t.Fatalf("priority = %d, want 7 (HasPath guard must preserve it)", p.Priority)
+	}
+	// An absent path is registered with the default.
+	if !g.HasPath(1) {
+		g.AddPath(1, WeightDuplicate, 0)
+	}
+	if p := g.path(1); p == nil || p.Priority != 0 {
+		t.Fatalf("path 1 = %v, want priority 0", p)
+	}
+}
+
 // TestLiveness checks Observe marks a path alive, Tick declares it dead after
 // the session timeout (reporting the transition once), and a later Observe
 // resurrects it.
@@ -95,7 +124,7 @@ func TestSelectNackPathPriority(t *testing.T) {
 	for i := uint8(0); i < 3; i++ {
 		g.Observe(i, now)
 	}
-	if idx, ok := g.SelectNackPath(now); !ok || idx != 1 {
+	if idx, ok := g.SelectNackPath(now, nil); !ok || idx != 1 {
 		t.Fatalf("SelectNackPath = %d (ok=%v), want 1 (highest priority)", idx, ok)
 	}
 }
@@ -119,7 +148,7 @@ func TestSelectNackPathRTTTieBreak(t *testing.T) {
 	}
 	g.ObserveRTT(0, 300*clock.Millisecond) // path 0: last 300ms, EWMA still low
 	g.ObserveRTT(1, 20*clock.Millisecond)  // path 1: last 20ms, EWMA still high
-	if idx, ok := g.SelectNackPath(now); !ok || idx != 1 {
+	if idx, ok := g.SelectNackPath(now, nil); !ok || idx != 1 {
 		t.Fatalf("SelectNackPath = %d (ok=%v), want 1 (raw last RTT 20ms < 300ms; the smoothed EWMA would wrongly pick 0)", idx, ok)
 	}
 }
@@ -137,7 +166,7 @@ func TestSelectNackPathSkipsDead(t *testing.T) {
 	if g.Alive(0, now) {
 		t.Fatal("path 0 should be dead")
 	}
-	if idx, ok := g.SelectNackPath(now); !ok || idx != 1 {
+	if idx, ok := g.SelectNackPath(now, nil); !ok || idx != 1 {
 		t.Fatalf("SelectNackPath = %d (ok=%v), want 1 (path 0 dead despite higher priority)", idx, ok)
 	}
 }
@@ -157,8 +186,38 @@ func TestSelectNackPathAllDeadFallback(t *testing.T) {
 	if g.Alive(0, late) || g.Alive(1, late) {
 		t.Fatal("both paths should be dead")
 	}
-	if idx, ok := g.SelectNackPath(late); !ok || idx != 1 {
+	if idx, ok := g.SelectNackPath(late, nil); !ok || idx != 1 {
 		t.Fatalf("all-dead fallback = %d (ok=%v), want 1 (seen most recently)", idx, ok)
+	}
+}
+
+// TestSelectNackPathAddrKnownPredicate checks that a path whose return address
+// is not yet known is excluded from BOTH the live selection and the all-dead
+// fallback, so a NACK is never routed to an unaddressable path.
+func TestSelectNackPathAddrKnownPredicate(t *testing.T) {
+	g := newGroup()
+	g.AddPath(0, WeightDuplicate, 0) // higher-priority candidate, but address unknown
+	g.AddPath(1, WeightDuplicate, 0)
+	g.Observe(0, at(0))
+	g.Observe(1, at(0))
+	// Only path 1 has a known return address.
+	known := func(i uint8) bool { return i == 1 }
+
+	// Live selection skips path 0 (unaddressable) and picks path 1.
+	if idx, ok := g.SelectNackPath(at(10*clock.Millisecond), known); !ok || idx != 1 {
+		t.Fatalf("live select with addrKnown = %d (ok=%v), want 1 (path 0 has no address)", idx, ok)
+	}
+
+	// All dead: the fallback also honors the predicate (path 0 excluded).
+	late := clock.Timestamp(testTimeout + 1)
+	g.Tick(late)
+	if idx, ok := g.SelectNackPath(late, known); !ok || idx != 1 {
+		t.Fatalf("all-dead fallback with addrKnown = %d (ok=%v), want 1", idx, ok)
+	}
+
+	// If the only seen path is unaddressable, no path is selected.
+	if idx, ok := g.SelectNackPath(late, func(i uint8) bool { return false }); ok {
+		t.Fatalf("SelectNackPath returned (%d, true) with no addressable path; want ok=false", idx)
 	}
 }
 
@@ -168,7 +227,7 @@ func TestSelectNackPathAllNeverSeen(t *testing.T) {
 	g := newGroup()
 	g.AddPath(3, WeightDuplicate, 0)
 	g.AddPath(7, WeightDuplicate, 0)
-	if idx, ok := g.SelectNackPath(at(1000 * clock.Millisecond)); ok {
+	if idx, ok := g.SelectNackPath(at(1000*clock.Millisecond), nil); ok {
 		t.Fatalf("SelectNackPath returned (%d, true) with only never-seen paths; want ok=false", idx)
 	}
 }
@@ -210,7 +269,7 @@ func equalU8(a, b []uint8) bool {
 // TestSelectNackPathNoPaths checks ok=false when no path is registered.
 func TestSelectNackPathNoPaths(t *testing.T) {
 	g := newGroup()
-	if _, ok := g.SelectNackPath(0); ok {
+	if _, ok := g.SelectNackPath(0, nil); ok {
 		t.Fatal("SelectNackPath ok=true with no paths registered")
 	}
 }

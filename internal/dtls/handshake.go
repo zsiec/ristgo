@@ -30,11 +30,16 @@ const maxHandshakeBody = 1 << 16
 // at maxPendingMessages * maxHandshakeBody.
 const maxPendingMessages = 8
 
-// handshakeMessage is one fully reassembled handshake message.
+// handshakeMessage is one fully reassembled handshake message. epoch records the
+// record-layer epoch its fragments arrived under (0 = plaintext, 1 = encrypted),
+// so the handshake can reject a message that must be protected — notably a
+// Finished, which RFC 5246 §7.4.9 / RFC 6347 require to follow ChangeCipherSpec
+// and therefore arrive under epoch 1.
 type handshakeMessage struct {
-	typ  handshakeType
-	seq  uint16
-	body []byte
+	typ   handshakeType
+	seq   uint16
+	body  []byte
+	epoch uint16
 }
 
 // marshal frames the message as a single unfragmented handshake record body
@@ -85,13 +90,16 @@ func fragmentMessage(typ handshakeType, seq int, body []byte, maxFragment int) [
 	return out
 }
 
-// parsedFragment is one decoded handshake fragment header plus its slice.
+// parsedFragment is one decoded handshake fragment header plus its slice. epoch
+// is the record-layer epoch the fragment arrived under, carried so the
+// reassembled message can be epoch-checked (e.g. a Finished must be epoch 1).
 type parsedFragment struct {
 	typ      handshakeType
 	totalLen int
 	seq      uint16
 	fragOff  int
 	frag     []byte
+	epoch    uint16
 }
 
 // parseHandshakeFragment decodes one handshake fragment from the front of b,
@@ -136,6 +144,7 @@ type partialMessage struct {
 	body     []byte
 	received []bool // per-byte coverage
 	have     int    // count of covered bytes
+	epoch    uint16 // record epoch of the first fragment seen for this message
 }
 
 func newReassembler() *reassembler {
@@ -162,6 +171,7 @@ func (r *reassembler) accept(f parsedFragment) error {
 			totalLen: f.totalLen,
 			body:     make([]byte, f.totalLen),
 			received: make([]bool, f.totalLen),
+			epoch:    f.epoch,
 		}
 		r.pending[f.seq] = p
 	}
@@ -186,7 +196,7 @@ func (r *reassembler) nextMessage() (handshakeMessage, bool) {
 	if p == nil || p.have != p.totalLen {
 		return handshakeMessage{}, false
 	}
-	msg := handshakeMessage{typ: p.typ, seq: r.next, body: p.body}
+	msg := handshakeMessage{typ: p.typ, seq: r.next, body: p.body, epoch: p.epoch}
 	delete(r.pending, r.next)
 	r.next++
 	return msg, true

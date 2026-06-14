@@ -25,9 +25,12 @@ const (
 // libRIST congestion-control constants.
 const (
 	// ristHeaderOverheadBytes is sizeof(rist_gre_seq)+sizeof(rist_rtp_hdr)+
-	// sizeof(uint32) = 8+12+4, the per-packet overhead libRIST divides by when
-	// sizing missing_counter_max and estimating wire bytes.
-	ristHeaderOverheadBytes = 24
+	// sizeof(uint32) = 12+12+4, the per-packet overhead libRIST divides by when
+	// sizing missing_counter_max and estimating wire bytes. struct rist_gre_seq
+	// is 12 bytes (it omits the 4-byte checksum_reserved1 of the plain GRE
+	// header), so the divisor is 28, not 24 — matching libRIST's
+	// init_peer_settings.
+	ristHeaderOverheadBytes = 28
 
 	// ristNackMtuAssumed is the fixed MTU libRIST assumes in the
 	// max_nacksperloop derivation.
@@ -41,6 +44,13 @@ const (
 	// emitted NackRequest (libRIST's receiver_nack_output maxcounter).
 	ristMaxNacks = 200
 
+	// ristNackBytesPerSeq is the conservative on-the-wire cost, in bytes, charged
+	// to one NACKed sequence number by the return-bandwidth limiter — a range
+	// NACK record (start+count) or a bitmask FCI (PID+BLP) is 4 bytes; charging 4
+	// bytes per seq is the worst case (all-isolated losses), so the limiter is a
+	// true upper bound on return-channel NACK bandwidth.
+	ristNackBytesPerSeq = 4
+
 	// bitrateSlowWindowUs / bitrateFastWindowUs are the EWMA window lengths
 	// (1 s and 100 ms) libRIST uses for eight_times_bitrate / _fast.
 	bitrateSlowWindowUs = 1_000_000
@@ -49,12 +59,13 @@ const (
 
 // deriveMissingCounterMax replicates libRIST init_peer_settings:
 //
-//	missing_counter_max = recovery_buffer_ms * max(1, recovery_maxbitrate/1000) / 24
+//	missing_counter_max = recovery_buffer_ms * max(1, recovery_maxbitrate/1000) / 28
 //
-// (recovery_maxbitrate is in kbps, so /1000 is kbps->Mbps floored at 1). With
-// the defaults (1000 ms, 100000 kbps) this is 1000*100/24 = 4166. It bounds how
-// many missing entries the receiver queues before it stops marking new gaps —
-// the buffer-bloat / overflow guard.
+// (recovery_maxbitrate is in kbps, so /1000 is kbps->Mbps floored at 1; the 28
+// is ristHeaderOverheadBytes, sizeof(rist_gre_seq)+sizeof(rist_rtp_hdr)+4 =
+// 12+12+4). With the defaults (1000 ms, 100000 kbps) this is 1000*100/28 = 3571.
+// It bounds how many missing entries the receiver queues before it stops marking
+// new gaps — the buffer-bloat / overflow guard.
 func deriveMissingCounterMax(cfg Config) uint32 {
 	recoveryMs := int64(cfg.RecoveryBuffer()) / int64(clock.Millisecond)
 	mbps := int64(cfg.RecoveryMaxBitrate) / 1000

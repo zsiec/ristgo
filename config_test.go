@@ -35,6 +35,8 @@ func TestDefaultConfig(t *testing.T) {
 		{"VirtSrcPort", cfg.VirtSrcPort, uint16(1971)},                        // RIST_DEFAULT_VIRT_SRC_PORT (1971)
 		{"VirtDstPort", cfg.VirtDstPort, uint16(1968)},                        // RIST_DEFAULT_VIRT_DST_PORT (1968)
 		{"NACKType", cfg.NACKType, NACKRange},                                 // default NACK type = RANGE
+		{"CongestionControl", cfg.CongestionControl, CongestionNormal},        // default congestion_control = NORMAL
+		{"TimingMode", cfg.TimingMode, TimingSource},                          // default timing_mode = SOURCE
 		{"CNAME", cfg.CNAME, ""},
 		{"Secret", cfg.Secret, ""},
 		{"AESKeyBits", cfg.AESKeyBits, 0},
@@ -378,6 +380,12 @@ func TestConfigValidate(t *testing.T) {
 			"rist: NACKType must be NACKRange (0) or NACKBitmask (1)"},
 		{"nack negative", func(c *Config) { c.NACKType = NACKType(-1) },
 			"rist: NACKType must be NACKRange (0) or NACKBitmask (1)"},
+		{"congestion invalid", func(c *Config) { c.CongestionControl = CongestionControl(9) },
+			"rist: CongestionControl must be CongestionNormal, CongestionAggressive, or CongestionOff"},
+		{"timing-mode invalid", func(c *Config) { c.TimingMode = TimingMode(9) },
+			"rist: TimingMode must be TimingSource or TimingArrival"},
+		{"return-bandwidth negative", func(c *Config) { c.ReturnBandwidth = -1 },
+			"rist: ReturnBandwidth must be at least 0 (kbps; 0 = unlimited)"},
 
 		// Secret / AESKeyBits / KeyRotation (require Main or Advanced)
 		{"secret with aes 128", func(c *Config) {
@@ -407,10 +415,10 @@ func TestConfigValidate(t *testing.T) {
 			c.Secret = "opensesame"
 			c.AESKeyBits = 192
 		}, "rist: AESKeyBits must be 0, 128, or 256"},
-		{"aes bits without secret", func(c *Config) {
+		{"aes bits without secret or srp", func(c *Config) {
 			c.Profile = ProfileMain
 			c.AESKeyBits = 128
-		}, "rist: AESKeyBits requires a Secret"},
+		}, "rist: AESKeyBits requires a Secret or SRP credentials"},
 		{"key rotation with secret", func(c *Config) {
 			c.Profile = ProfileMain
 			c.Secret = "opensesame"
@@ -435,6 +443,12 @@ func TestConfigValidate(t *testing.T) {
 		// Username / Password (require Main)
 		{"srp credentials", func(c *Config) {
 			c.Profile = ProfileMain
+			c.Secret = "opensesame"
+			c.Username = "user"
+			c.Password = "pass"
+		}, ""},
+		{"srp without secret accepted (use_key_as_passphrase)", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Username = "user"
 			c.Password = "pass"
 		}, ""},
@@ -448,6 +462,7 @@ func TestConfigValidate(t *testing.T) {
 		}, "rist: Username and Password must be set together"},
 		{"username boundary 255 bytes", func(c *Config) {
 			c.Profile = ProfileMain
+			c.Secret = "opensesame"
 			c.Username = strings.Repeat("u", 255)
 			c.Password = "pass"
 		}, ""},
@@ -485,6 +500,18 @@ func TestConfigValidate(t *testing.T) {
 		{"weight positive", func(c *Config) { c.Weight = 5 }, ""},
 		{"weight negative", func(c *Config) { c.Weight = -1 },
 			"rist: Weight must be at least 0 (0 = duplicate)"},
+
+		// Multicast: MulticastTTL range (0..255), MulticastLoopback always OK.
+		{"multicast ttl zero (OS default)", func(c *Config) { c.MulticastTTL = 0 }, ""},
+		{"multicast ttl mid", func(c *Config) { c.MulticastTTL = 32 }, ""},
+		{"multicast ttl max", func(c *Config) { c.MulticastTTL = 255 }, ""},
+		{"multicast ttl too large", func(c *Config) { c.MulticastTTL = 256 },
+			"rist: MulticastTTL must be between 0 and 255 (0 = OS default of 1)"},
+		{"multicast ttl negative", func(c *Config) { c.MulticastTTL = -1 },
+			"rist: MulticastTTL must be between 0 and 255 (0 = OS default of 1)"},
+		{"multicast loopback set", func(c *Config) { c.MulticastLoopback = true }, ""},
+		{"multicast source valid ip", func(c *Config) { c.MulticastSource = "10.0.0.1" }, ""},
+		{"multicast source valid ipv6", func(c *Config) { c.MulticastSource = "fe80::1" }, ""},
 	}
 
 	for _, tt := range tests {
@@ -506,6 +533,33 @@ func TestConfigValidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateMulticastInterfaceAndSource verifies the multicast field checks
+// whose error text is OS/input-dependent: a non-existent Interface name and a
+// MulticastSource that is not a valid IP are both rejected with a "rist: "-
+// prefixed error.
+func TestValidateMulticastInterfaceAndSource(t *testing.T) {
+	t.Run("bad interface", func(t *testing.T) {
+		cfg := Config{Interface: "no-such-iface-xyz-12345"}
+		err := cfg.validate()
+		if err == nil {
+			t.Fatal("validate() = nil, want an interface-not-found error")
+		}
+		if !strings.HasPrefix(err.Error(), "rist: Interface ") {
+			t.Fatalf("validate() = %q, want a \"rist: Interface \" error", err.Error())
+		}
+	})
+	t.Run("bad multicast source", func(t *testing.T) {
+		cfg := Config{MulticastSource: "not-an-ip"}
+		err := cfg.validate()
+		if err == nil {
+			t.Fatal("validate() = nil, want a MulticastSource parse error")
+		}
+		if !strings.HasPrefix(err.Error(), "rist: MulticastSource must be an IP address") {
+			t.Fatalf("validate() = %q, want a \"rist: MulticastSource...\" error", err.Error())
+		}
+	})
 }
 
 // TestValidateErrorPrefix verifies every validation error carries the
@@ -538,15 +592,16 @@ func TestValidateErrorPrefix(t *testing.T) {
 	}
 }
 
-// TestSecretDefaultsAESKeyBits verifies the libRIST behavior of assuming
-// the maximum key size when a secret is supplied without aes-type.
+// TestSecretDefaultsAESKeyBits verifies that a secret without an explicit
+// aes-type defaults to 128, matching the libRIST CLI tools (which override the
+// library's 256 default to 128 when -e is given without a size).
 func TestSecretDefaultsAESKeyBits(t *testing.T) {
 	cfg := Config{Profile: ProfileMain, Secret: "opensesame"}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	if cfg.AESKeyBits != 256 {
-		t.Errorf("AESKeyBits: got %d, want 256 (libRIST default when aes-type omitted)", cfg.AESKeyBits)
+	if cfg.AESKeyBits != 128 {
+		t.Errorf("AESKeyBits: got %d, want 128 (libRIST CLI default when aes-type omitted)", cfg.AESKeyBits)
 	}
 
 	// An explicit value must be preserved.

@@ -192,6 +192,9 @@ func (c *Conn) processHandshakeRecord(r record) error {
 			if err != nil {
 				return nil // ignore malformed trailing bytes
 			}
+			// Tag the fragment with the record epoch it arrived under so the
+			// handshake can require a Finished to be epoch-1 protected (L8).
+			pf.epoch = r.epoch
 			if err := c.reasm.accept(pf); err != nil {
 				return nil
 			}
