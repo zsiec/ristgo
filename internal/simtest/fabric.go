@@ -64,6 +64,13 @@ type Fabric struct {
 	sendTime        map[uint32]clock.Timestamp
 	deliverInstant  map[uint32]clock.Timestamp
 	discontinuities int
+
+	// dupTx models the bonding/SMPTE-2022-7 sender: when set, each media
+	// datagram the (single-path) sender flow emits is duplicated across EVERY
+	// forward path with identical seq/source_time, and the receiver merges the
+	// copies. The flow core stays single-path (txPath 0); duplication is the
+	// host's job, which this flag stands in for.
+	dupTx bool
 }
 
 // NewFabric wires a sender and receiver flow to N forward and N back links
@@ -102,6 +109,25 @@ func (f *Fabric) EnqueueCBR(start clock.Timestamp, interval clock.Microseconds, 
 		f.EnqueueSource(at, payloadFn(i))
 		at = at.Add(interval)
 	}
+}
+
+// SetDuplicateTx enables (or disables) bonded duplicate transmission: every
+// media datagram the sender emits is sent on all forward paths, modeling the
+// SMPTE 2022-7 full-redundancy sender. The receiver's (seq, source_time) dedup
+// merges the copies. Off by default (single-path, routed by SendMedia.Path).
+func (f *Fabric) SetDuplicateTx(on bool) { f.dupTx = on }
+
+// DegradePath replaces path i's forward and back links with freshly seeded
+// Links of the given configurations, effective immediately. In-flight datagrams
+// on the old links are discarded — modeling a path going down, recovering, or
+// changing characteristics mid-run. Use a config with Loss: 1.0 to kill a path;
+// a normal config to restore it.
+func (f *Fabric) DegradePath(i int, fwd, back LinkConfig, seed uint64) {
+	if i < 0 || i >= len(f.fwd) {
+		panic("simtest: DegradePath index out of range")
+	}
+	f.fwd[i] = NewLink[Datagram](fwd, seed)
+	f.back[i] = NewLink[Datagram](back, seed^0x5555555555555555)
 }
 
 // Now returns the current mock-clock instant.
@@ -243,10 +269,17 @@ func (f *Fabric) drainSender() {
 		case flow.ClearTimer:
 			f.sTimers.Clear(TimerID(o.ID))
 		case flow.SendMedia:
-			if int(o.Path) < len(f.fwd) {
-				if !o.Pkt.Retransmit {
+			if !o.Pkt.Retransmit {
+				if _, seen := f.sendTime[o.Pkt.Seq]; !seen {
 					f.sendTime[o.Pkt.Seq] = f.now
 				}
+			}
+			if f.dupTx {
+				// Bonded sender: duplicate the datagram across every path.
+				for _, l := range f.fwd {
+					l.Send(f.now, Datagram{Media: true, Pkt: o.Pkt})
+				}
+			} else if int(o.Path) < len(f.fwd) {
 				f.fwd[o.Path].Send(f.now, Datagram{Media: true, Pkt: o.Pkt})
 			}
 		case flow.SendFeedback:
