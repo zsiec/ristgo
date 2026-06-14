@@ -11,10 +11,11 @@ import (
 	"time"
 )
 
-// datagramConn is the carrier DTLS runs over: a connected datagram conn (a
-// *net.UDPConn dialed to one peer, or an in-memory pipe in tests). DTLS needs
-// read deadlines to drive flight retransmission (RFC 6347 §4.2.4).
-type datagramConn interface {
+// Transport is the carrier DTLS runs over: a datagram conn delivering whole
+// records to one peer (a *net.UDPConn filtered to one address, or an in-memory
+// pipe in tests). DTLS needs read deadlines to drive flight retransmission
+// (RFC 6347 §4.2.4); a zero deadline means block indefinitely.
+type Transport interface {
 	Read(p []byte) (int, error)
 	Write(p []byte) (int, error)
 	SetReadDeadline(t time.Time) error
@@ -101,7 +102,7 @@ const readBufSize = 1 << 16
 // another Writes after the handshake completes (each direction has its own
 // record-sequence state); the handshake itself must run on a single goroutine.
 type Conn struct {
-	transport datagramConn
+	transport Transport
 	cfg       *Config
 	isClient  bool
 
@@ -124,7 +125,6 @@ type Conn struct {
 
 	// records left over from the last datagram read during the handshake.
 	pendingRecords []record
-	readScratch    []byte
 
 	// handshake-only state.
 	transcript []byte        // running transcript hash input (RFC 6347 §4.2.6)
@@ -137,17 +137,14 @@ type Conn struct {
 
 // Client wraps transport as the DTLS client side. The handshake runs on the
 // first Read/Write or an explicit Handshake call.
-func Client(transport datagramConn, cfg *Config) *Conn {
+func Client(transport Transport, cfg *Config) *Conn {
 	return &Conn{transport: transport, cfg: cfg.normalize(), isClient: true}
 }
 
 // Server wraps transport as the DTLS server side.
-func Server(transport datagramConn, cfg *Config) *Conn {
+func Server(transport Transport, cfg *Config) *Conn {
 	return &Conn{transport: transport, cfg: cfg.normalize(), isClient: false}
 }
-
-// errHandshakeNotDone guards Read/Write before a successful handshake.
-var errHandshakeNotDone = errors.New("rist: dtls: handshake not completed")
 
 // Handshake runs the DTLS handshake to completion. It is idempotent.
 func (c *Conn) Handshake() error {
@@ -229,10 +226,7 @@ func (c *Conn) writeRecord(typ contentType, epoch uint16, payload []byte) error 
 		fragment = c.sealHalf(epoch).seal(epoch, seq, typ, versionDTLS12, payload)
 	}
 	rec := record{typ: typ, version: versionDTLS12, epoch: epoch, seq: seq, fragment: fragment}
-	_, err := c.transport.Write(rec.marshal(c.readScratch[:0]))
-	if c.readScratch == nil {
-		c.readScratch = make([]byte, 0, maxDatagram)
-	}
+	_, err := c.transport.Write(rec.marshal(nil))
 	return err
 }
 
@@ -254,10 +248,12 @@ func (c *Conn) openHalf(uint16) *halfConn {
 }
 
 // readAppRecords reads one datagram and queues its application-data records,
-// decrypting them. Non-app records after the handshake (e.g. a retransmitted
-// peer Finished, or an alert) are handled or ignored.
+// decrypting them. It blocks indefinitely (zero read deadline): post-handshake
+// idle is normal for a media stream, and session-level liveness/timeout is the
+// host's concern, not DTLS's. Non-app records (a retransmitted peer Finished, an
+// alert) are handled or ignored.
 func (c *Conn) readAppRecords() error {
-	recs, err := c.readDatagram(time.Now().Add(c.cfg.HandshakeTimeout))
+	recs, err := c.readDatagram(time.Time{})
 	if err != nil {
 		return err
 	}

@@ -108,6 +108,14 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.DTLS != nil {
+		dcfg, err := buildDTLSConfig(cfg.DTLS, true)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn.EnableDTLSClient(remote, dcfg)
+	}
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc

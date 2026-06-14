@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
@@ -64,6 +65,48 @@ func GenerateSelfSigned(commonName string) (*Certificate, error) {
 // Fingerprint returns the SHA-256 fingerprint of the leaf certificate DER, the
 // value used for fingerprint pinning.
 func (c *Certificate) Fingerprint() [32]byte { return sha256.Sum256(c.DER[0]) }
+
+// CertificateFromPEM builds a Certificate from PEM-encoded certificate and EC
+// private key blocks. The certificate must be ECDSA P-256 (the suite's key type).
+func CertificateFromPEM(certPEM, keyPEM []byte) (*Certificate, error) {
+	cBlock, _ := pem.Decode(certPEM)
+	if cBlock == nil || cBlock.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("rist: dtls: no CERTIFICATE PEM block")
+	}
+	leaf, err := x509.ParseCertificate(cBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("rist: dtls: parse cert: %w", err)
+	}
+	kBlock, _ := pem.Decode(keyPEM)
+	if kBlock == nil {
+		return nil, fmt.Errorf("rist: dtls: no private key PEM block")
+	}
+	key, err := parseECKey(kBlock)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok {
+		return nil, fmt.Errorf("rist: dtls: certificate is not ECDSA")
+	}
+	return &Certificate{DER: [][]byte{cBlock.Bytes}, Leaf: leaf, PrivateKey: key}, nil
+}
+
+// parseECKey decodes an EC private key from either an "EC PRIVATE KEY" (SEC1) or
+// "PRIVATE KEY" (PKCS#8) PEM block.
+func parseECKey(block *pem.Block) (*ecdsa.PrivateKey, error) {
+	if k, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
+		return k, nil
+	}
+	k8, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("rist: dtls: parse EC key: %w", err)
+	}
+	ec, ok := k8.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("rist: dtls: private key is not ECDSA")
+	}
+	return ec, nil
+}
 
 // errBadCertificate is returned when peer-certificate verification fails.
 var errBadCertificate = errors.New("rist: dtls: peer certificate verification failed")

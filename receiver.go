@@ -82,6 +82,14 @@ func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.DTLS != nil {
+		dcfg, err := buildDTLSConfig(cfg.DTLS, false)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn.EnableDTLSServer(dcfg)
+	}
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.Main = mp

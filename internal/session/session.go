@@ -158,6 +158,11 @@ type Session struct {
 	sender bool // role
 	mdec   mediaDecoder
 
+	// dtlsReady is closed by loop after the optional Main-profile DTLS handshake
+	// completes (or fails), gating the reader goroutine so it never touches the
+	// socket while the handshake owns it.
+	dtlsReady chan struct{}
+
 	// main is the Main-profile codec, non-nil in Main mode. When set, the
 	// session reads/writes one GRE-tunnelled socket and demuxes media vs
 	// feedback by the inner payload-type byte instead of by socket.
@@ -338,6 +343,7 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		readWake:  make(chan struct{}, 1),
 		writeWake: make(chan struct{}, 1),
 		done:      make(chan struct{}),
+		dtlsReady: make(chan struct{}),
 	}
 	if sender {
 		s.appIn = make(chan []byte, 64)
@@ -407,6 +413,30 @@ func (s *Session) start() {
 // drains the resulting effects after each.
 func (s *Session) loop() {
 	defer s.wg.Done()
+	// Backstop: guarantee dtlsReady is closed on every exit path so the reader
+	// goroutine (which waits on it) can never block forever — even if a future
+	// edit adds an early return before the explicit closes below.
+	dtlsReadyClosed := false
+	closeDTLSReady := func() {
+		if !dtlsReadyClosed {
+			dtlsReadyClosed = true
+			close(s.dtlsReady)
+		}
+	}
+	defer closeDTLSReady()
+
+	// Optional Main-profile DTLS: establish the secure channel before any socket
+	// I/O. The reader goroutine waits on dtlsReady, so the handshake (which reads
+	// and writes the socket itself) runs without contention.
+	if s.conn.DTLSEnabled() {
+		if err := s.conn.Handshake(); err != nil {
+			s.shutdown(s.cfg.ErrAuth)
+			closeDTLSReady()
+			s.logf("dtls: handshake failed: %v", err)
+			return
+		}
+	}
+	closeDTLSReady()
 
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
@@ -938,6 +968,14 @@ func (s *Session) readMedia() {
 // byte. It is the Main-profile counterpart of readMedia + readRTCP.
 func (s *Session) readMain() {
 	defer s.wg.Done()
+	// Wait for the optional DTLS handshake (driven by loop) before touching the
+	// socket; bail out if the session was torn down during it.
+	<-s.dtlsReady
+	select {
+	case <-s.done:
+		return
+	default:
+	}
 	for {
 		buf := make([]byte, maxDatagram)
 		n, src, err := s.conn.ReadMedia(buf) // single GRE socket

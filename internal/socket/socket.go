@@ -22,6 +22,8 @@ package socket
 import (
 	"fmt"
 	"net"
+
+	"github.com/zsiec/ristgo/internal/dtls"
 )
 
 // Conn is a RIST UDP transport. For the Simple profile it holds a media socket
@@ -31,6 +33,16 @@ type Conn struct {
 	media  *net.UDPConn
 	rtcp   *net.UDPConn
 	single bool // Main profile: media == rtcp, one socket carries everything
+
+	// DTLS transport security (Main profile, optional): when dtlsCfg is set,
+	// Handshake establishes a DTLS 1.2 session over the single socket and
+	// ReadMedia/WriteMedia carry the GRE tunnel as DTLS application records. See
+	// dtls.go.
+	dtlsCfg    *dtls.Config
+	dtlsClient bool
+	dtlsRemote *net.UDPAddr // client role: the peer to converse with
+	dtls       *dtls.Conn   // established by Handshake
+	dtlsPeer   *net.UDPAddr // known (client) or learned (server) peer address
 }
 
 // Listen binds the media socket to host:port and the RTCP socket to
@@ -117,8 +129,14 @@ func bind(host string, port int) (*net.UDPConn, error) {
 func (c *Conn) MediaPort() int { return c.media.LocalAddr().(*net.UDPAddr).Port }
 
 // ReadMedia reads one media (RTP) datagram into buf, returning the byte count
-// and the source address (the sender's media address, for a receiver).
+// and the source address (the sender's media address, for a receiver). When DTLS
+// is enabled (Main profile), it returns the next decrypted application record and
+// the established peer's address.
 func (c *Conn) ReadMedia(buf []byte) (int, *net.UDPAddr, error) {
+	if c.dtls != nil {
+		n, err := c.dtls.Read(buf)
+		return n, c.dtlsPeer, err
+	}
 	return c.media.ReadFromUDP(buf)
 }
 
@@ -128,8 +146,14 @@ func (c *Conn) ReadRTCP(buf []byte) (int, *net.UDPAddr, error) {
 	return c.rtcp.ReadFromUDP(buf)
 }
 
-// WriteMedia sends a media (RTP) datagram to dst.
+// WriteMedia sends a media (RTP) datagram to dst. When DTLS is enabled (Main
+// profile) it seals b as a DTLS application record to the established peer and
+// dst is ignored (the DTLS session is bound to one peer).
 func (c *Conn) WriteMedia(b []byte, dst *net.UDPAddr) error {
+	if c.dtls != nil {
+		_, err := c.dtls.Write(b)
+		return err
+	}
 	_, err := c.media.WriteToUDP(b, dst)
 	return err
 }

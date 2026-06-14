@@ -190,9 +190,45 @@ type Config struct {
 	// it must not block. Supported on all three profiles (see SourceAdaptation).
 	OnRateAdapt func(targetKbps int)
 
+	// DTLS, when non-nil, enables DTLS 1.2 transport security for the Main
+	// profile (VSF TR-06-2 §6), protecting the whole GRE tunnel. It is an
+	// alternative to the GRE PSK-AES-CTR encryption — setting both Secret and
+	// DTLS is rejected by validation. The RIST sender is the DTLS client and the
+	// receiver is the DTLS server. Requires Profile == ProfileMain.
+	//
+	// DTLS adds ~37 bytes of per-packet overhead (record header, explicit nonce,
+	// GCM tag); leave headroom in the media payload to avoid IP fragmentation of
+	// the resulting datagram.
+	DTLS *DTLSConfig
+
 	// Logger receives diagnostic log messages. When nil (the default),
 	// no logging occurs and there is zero performance overhead.
 	Logger Logger
+}
+
+// DTLSConfig selects the DTLS 1.2 mode and credentials for Main-profile
+// transport security. Set exactly one of PSK or the certificate fields.
+type DTLSConfig struct {
+	// PSK enables TLS_PSK_WITH_AES_128_GCM_SHA256: a shared secret on both ends.
+	// PSKIdentity is the identity hint exchanged (informational).
+	PSK         []byte
+	PSKIdentity string
+
+	// CertPEM and KeyPEM enable TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 with a
+	// supplied ECDSA P-256 certificate and key (PEM). On a receiver they are the
+	// presented server certificate; if omitted on a receiver, a self-signed
+	// certificate is generated. On a sender they are sent only for mutual auth.
+	CertPEM []byte
+	KeyPEM  []byte
+
+	// PeerFingerprint, when non-zero, pins the peer leaf certificate's SHA-256
+	// (the recommended way to authenticate a self-signed RIST peer). On a sender
+	// it pins the receiver's certificate.
+	PeerFingerprint [32]byte
+
+	// InsecureSkipVerify disables peer-certificate verification (cert mode). Use
+	// only for testing; prefer PeerFingerprint.
+	InsecureSkipVerify bool
 }
 
 // DefaultConfig returns a Config with default values matching libRIST's
@@ -223,6 +259,18 @@ func DefaultConfig() Config {
 func (cfg *Config) validate() error {
 	if cfg.Profile < ProfileSimple || cfg.Profile > ProfileAdvanced {
 		return errors.New("rist: Profile must be ProfileSimple (0), ProfileMain (1), or ProfileAdvanced (2)")
+	}
+
+	if cfg.DTLS != nil {
+		if cfg.Profile != ProfileMain {
+			return errors.New("rist: DTLS transport security requires ProfileMain")
+		}
+		if cfg.Secret != "" {
+			return errors.New("rist: DTLS and Secret (GRE PSK encryption) are mutually exclusive; DTLS already protects the whole tunnel")
+		}
+		if cfg.DTLS.PSK == nil && len(cfg.DTLS.CertPEM) == 0 && !cfg.DTLS.InsecureSkipVerify && cfg.DTLS.PeerFingerprint == [32]byte{} {
+			return errors.New("rist: DTLS requires a PSK, a certificate, or peer verification")
+		}
 	}
 
 	if cfg.BufferMin == 0 {

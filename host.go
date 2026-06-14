@@ -11,11 +11,41 @@ import (
 	"github.com/zsiec/ristgo/internal/adapt"
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
+	"github.com/zsiec/ristgo/internal/dtls"
 	"github.com/zsiec/ristgo/internal/eap"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/session"
 	"github.com/zsiec/ristgo/internal/srp"
 )
+
+// buildDTLSConfig maps the public DTLSConfig to the internal dtls.Config for one
+// role (the RIST sender is the DTLS client, the receiver the DTLS server). PSK
+// mode reuses the shared key; cert mode parses a supplied certificate or, for a
+// server with none, generates a self-signed one. Peer verification (fingerprint
+// pin or InsecureSkipVerify) applies to the verifying side.
+func buildDTLSConfig(dc *DTLSConfig, isClient bool) (*dtls.Config, error) {
+	out := &dtls.Config{
+		PSK:                 dc.PSK,
+		PSKIdentity:         []byte(dc.PSKIdentity),
+		InsecureSkipVerify:  dc.InsecureSkipVerify,
+		PeerCertFingerprint: dc.PeerFingerprint,
+	}
+	if len(dc.CertPEM) > 0 || len(dc.KeyPEM) > 0 {
+		cert, err := dtls.CertificateFromPEM(dc.CertPEM, dc.KeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		}
+		out.Certificate = cert
+	} else if !isClient && dc.PSK == nil {
+		// A cert-mode server with no supplied certificate self-signs.
+		cert, err := dtls.GenerateSelfSigned("ristgo-dtls")
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		}
+		out.Certificate = cert
+	}
+	return out, nil
+}
 
 // wrapInvalid wraps a validation error so callers can match it with
 // errors.Is(err, ErrInvalidConfig), per the WP4 binding. The redundant
