@@ -29,18 +29,50 @@
 //     timers, and UDP sockets; pumps packets and effects between the wire
 //     and the deterministic core.
 //
-// # Status
+// # Getting started
 //
-// ristgo is in active development. The Simple profile (VSF TR-06-1) is
-// implemented end to end: the io-native Sender and Receiver, ARQ recovery
-// over the even/odd RTP/RTCP UDP port pair, and rist:// URL parsing. Still to
-// come are the Main profile (GRE tunneling + PSK encryption + SRP), the
-// Advanced profile, and SMPTE 2022-7 bonding; see Config.Profile for the
-// interim default and the per-profile constructors' errors.
+// A Sender reads media (e.g. MPEG-TS) and transmits it; a Receiver recovers and
+// delivers the in-order stream. Both are io-native and take a context plus
+// functional options:
+//
+//	tx, err := ristgo.Dial(ctx, "203.0.113.7:5000")
+//	if err != nil { ... }
+//	defer tx.Close()
+//	tx.Write(mpegtsChunk) // up to MaxMediaPayload bytes per call
+//
+//	rx, err := ristgo.Listen(ctx, ":5000")
+//	if err != nil { ... }
+//	defer rx.Close()
+//	n, err := rx.Read(buf) // in-order, ARQ-recovered media
+//
+// Cancelling ctx closes the session (aborting a pending handshake and unblocking
+// Read/Write). Options configure the common knobs — for example
+// ristgo.WithProfile(ristgo.ProfileMain), ristgo.WithSecret("…"),
+// ristgo.WithDTLS(…) — and WithConfig passes a full [Config] for anything else.
+// The Config-based [NewSender]/[NewReceiver] constructors remain for callers who
+// prefer the struct; either form also accepts a rist:// URL as the address,
+// configuring from its query string.
+//
+// # Profiles and features
+//
+// All three RIST profiles are implemented and interoperate with libRIST:
+//
+//   - Simple (VSF TR-06-1): RTP media with compound RTCP on an even/odd UDP port
+//     pair.
+//   - Main (VSF TR-06-2): GRE-over-UDP on a single port, PSK AES-CTR encryption,
+//     EAP-SRP authentication, null-packet deletion, and optional pure-Go DTLS 1.2
+//     transport security ([Config.DTLS]).
+//   - Advanced (VSF TR-06-3): compact RTP-based framing with AEAD ciphers and LZ4
+//     payload compression.
+//
+// Across every profile: NACK-based ARQ retransmission (range or bitmask), SMPTE
+// 2022-7 link bonding ([BondedSender]/[BondedReceiver]) for seamless multipath
+// reconstruction, and source adaptation (VSF TR-06-4 Part 1) that feeds link
+// quality back to an encoder-rate callback.
 package ristgo
 
 // Version is the ristgo library version.
-const Version = "0.0.1"
+const Version = "0.1.0"
 
 // Profile selects the RIST wire profile. The numeric values match
 // libRIST's enum rist_profile so configurations translate directly.
@@ -57,8 +89,7 @@ const (
 	ProfileMain Profile = 1
 
 	// ProfileAdvanced is the Advanced profile (VSF TR-06-3): a compact
-	// header with AEAD ciphers, payload compression, and per-fragment
-	// retransmission.
+	// RTP-based header with AEAD ciphers and LZ4 payload compression.
 	ProfileAdvanced Profile = 2
 )
 

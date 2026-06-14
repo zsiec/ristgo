@@ -1,18 +1,23 @@
-// Command receiver is a minimal RIST receiver example: it receives a stream
-// and writes the recovered, in-order media to stdout.
+// Command receiver is a minimal RIST receiver example: it receives a stream and
+// writes the recovered, in-order media to stdout. Ctrl-C shuts it down cleanly.
 //
 // Usage:
 //
-//	receiver 'rist://@:5000?profile=0&buffer=1000' > out.ts
-//	receiver 127.0.0.1:5000 | ffplay -
+//	receiver ':5000' > out.ts
+//	receiver 'rist://:5000?profile=1&secret=passphrase' | ffplay -
 //
-// The address is the even media port; RTCP is bound on port+1.
+// The address is the even media port (RTCP binds on port+1) for the Simple
+// profile, or the single port for Main/Advanced. Query parameters on a rist://
+// URL override the defaults.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 
 	ristgo "github.com/zsiec/ristgo"
 )
@@ -22,17 +27,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage: %s <addr|rist://url>\n", os.Args[0])
 		os.Exit(2)
 	}
-	cfg := ristgo.DefaultConfig()
-	cfg.Logger = ristgo.StdLogger(os.Stderr)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
-	rx, err := ristgo.NewReceiver(os.Args[1], cfg)
+	rx, err := ristgo.Listen(ctx, os.Args[1], ristgo.WithLogger(ristgo.StdLogger(os.Stderr)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "receiver: %v\n", err)
 		os.Exit(1)
 	}
 	defer rx.Close()
 
-	if _, err := io.Copy(os.Stdout, rx); err != nil {
+	// Cancelling ctx (Ctrl-C) closes rx, so Read returns ErrClosed — a clean stop.
+	if _, err := io.Copy(os.Stdout, rx); err != nil && !errors.Is(err, ristgo.ErrClosed) {
 		fmt.Fprintf(os.Stderr, "receiver: %v\n", err)
 		os.Exit(1)
 	}

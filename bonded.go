@@ -20,15 +20,17 @@ import (
 //
 // Like Receiver it is an io.ReadCloser with single-consumer stream semantics.
 type BondedReceiver struct {
-	sess *session.Session
+	sess    *session.Session
+	ctxStop func() // ends the context watcher (set by ListenBonded)
 }
 
 // BondedSender transmits one media flow redundantly across several receiver
 // addresses (full SMPTE 2022-7 duplication): every payload is sent on every
 // path with identical sequence and timestamp, so the receiver can merge them.
 type BondedSender struct {
-	sess   *session.Session
-	remote *net.UDPAddr // the first path, for RemoteAddr
+	sess    *session.Session
+	remote  *net.UDPAddr // the first path, for RemoteAddr
+	ctxStop func()       // ends the context watcher (set by DialBonded)
 }
 
 // newBondingGroup builds the per-flow bonding group from cfg's liveness and RTT
@@ -45,6 +47,8 @@ func newBondingGroup(cfg Config) *bonding.Group {
 // even/odd media/RTCP socket pair per path (so each addr's port must be even) —
 // merging all paths into one flow. At least one address is required; two or more
 // gives 2022-7 redundancy.
+//
+// See [ListenBonded] for the context-aware constructor with functional options.
 func NewBondedReceiver(addrs []string, cfg Config) (*BondedReceiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
@@ -75,6 +79,8 @@ func NewBondedReceiver(addrs []string, cfg Config) (*BondedReceiver, error) {
 // NewBondedSender dials a bonded sender to addrs — each a receiver's even
 // media port (RTCP on port+1) — duplicating every payload to all of them. At
 // least one address is required; two or more gives 2022-7 redundancy.
+//
+// See [DialBonded] for the context-aware constructor with functional options.
 func NewBondedSender(addrs []string, cfg Config) (*BondedSender, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
@@ -133,7 +139,12 @@ func (r *BondedReceiver) SetReadDeadline(t time.Time) error {
 func (r *BondedReceiver) Stats() Stats { return toStats(r.sess.Stats()) }
 
 // Close stops the receiver and releases every path's sockets and goroutines.
-func (r *BondedReceiver) Close() error { return r.sess.Close() }
+func (r *BondedReceiver) Close() error {
+	if r.ctxStop != nil {
+		r.ctxStop()
+	}
+	return r.sess.Close()
+}
 
 // Write submits one media payload, duplicated to every path. It returns len(p).
 // The payload must be at most MaxMediaPayload bytes.
@@ -161,4 +172,9 @@ func (s *BondedSender) Stats() Stats { return toStats(s.sess.Stats()) }
 func (s *BondedSender) RemoteAddr() net.Addr { return s.remote }
 
 // Close stops the sender and releases its socket and goroutines.
-func (s *BondedSender) Close() error { return s.sess.Close() }
+func (s *BondedSender) Close() error {
+	if s.ctxStop != nil {
+		s.ctxStop()
+	}
+	return s.sess.Close()
+}

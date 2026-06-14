@@ -30,11 +30,13 @@ Requires Go 1.24+.
 
 ## Quick start
 
+`Dial` a sender, `Listen` for a receiver. Both take a `context.Context`
+(cancelling it closes the session) and functional options.
+
 Sender — read MPEG-TS from stdin, transmit to a receiver (Simple profile):
 
 ```go
-cfg := ristgo.DefaultConfig() // ProfileSimple, 1 s recovery buffer, libRIST defaults
-tx, err := ristgo.NewSender("127.0.0.1:5000", cfg)
+tx, err := ristgo.Dial(ctx, "127.0.0.1:5000")
 if err != nil {
 	log.Fatal(err)
 }
@@ -57,8 +59,7 @@ for {
 Receiver — recover the stream and write it to stdout:
 
 ```go
-cfg := ristgo.DefaultConfig()
-rx, err := ristgo.NewReceiver("127.0.0.1:5000", cfg)
+rx, err := ristgo.Listen(ctx, ":5000")
 if err != nil {
 	log.Fatal(err)
 }
@@ -76,27 +77,43 @@ for {
 }
 ```
 
-Runnable versions are in [`examples/sender`](examples/sender) and
-[`examples/receiver`](examples/receiver); both accept a plain `host:port` or a
-`rist://host:port?profile=…&secret=…&…` URL.
+Runnable versions are in [`examples/sender`](examples/sender),
+[`examples/receiver`](examples/receiver), and
+[`examples/bonded-sender`](examples/bonded-sender); each accepts a plain
+`host:port` or a `rist://host:port?profile=…&secret=…&…` URL.
 
 ### Profiles, encryption, bonding
 
-Select a profile and options through `Config` (or the URL form):
+Configure with options (or `WithConfig` for the full [`Config`](https://pkg.go.dev/github.com/zsiec/ristgo#Config)):
+
+```go
+// Main profile with PSK encryption:
+tx, _ := ristgo.Dial(ctx, "host:5000",
+	ristgo.WithProfile(ristgo.ProfileMain),  // GRE tunnel; ProfileAdvanced for TR-06-3
+	ristgo.WithSecret("shared-passphrase"),  // PSK AES-CTR
+	ristgo.WithAESKeyBits(256))
+
+// DTLS transport security (Main profile) — alternative to a secret:
+rx, _ := ristgo.Listen(ctx, ":5000",
+	ristgo.WithProfile(ristgo.ProfileMain),
+	ristgo.WithDTLS(ristgo.DTLSConfig{PSK: []byte("shared-dtls-key")})) // or CertPEM/KeyPEM + PeerFingerprint
+
+// SMPTE 2022-7 bonding: feed several paths from one source.
+bx, _ := ristgo.DialBonded(ctx, []string{"a.example:5000", "b.example:5000"})
+```
+
+Prefer a struct? The config-based constructors are still available and take the
+same `Config` underneath:
 
 ```go
 cfg := ristgo.DefaultConfig()
-cfg.Profile = ristgo.ProfileMain      // GRE tunnel; ProfileAdvanced for TR-06-3
-cfg.Secret = "shared-passphrase"      // PSK AES-CTR (Main/Advanced)
-cfg.AESKeyBits = 256
-
-// DTLS transport security (Main profile) — alternative to Secret:
-cfg.Secret = ""
-cfg.DTLS = &ristgo.DTLSConfig{PSK: []byte("shared-dtls-key")} // or CertPEM/KeyPEM + PeerFingerprint
-
-// SMPTE 2022-7 bonding: feed several paths from one source.
-bx, _ := ristgo.NewBondedSender([]string{"a.example:5000", "b.example:5000"}, cfg)
+cfg.Profile = ristgo.ProfileMain
+cfg.Secret = "shared-passphrase"
+tx, _ := ristgo.NewSender("host:5000", cfg) // or ristgo.Dial(ctx, "host:5000", ristgo.WithConfig(cfg))
 ```
+
+Either form accepts a `rist://host:port?profile=…&secret=…` URL whose query
+parameters override the config.
 
 ## Features
 

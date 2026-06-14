@@ -28,8 +28,9 @@ const MaxMediaPayload = 1460
 // the sender's internal goroutines, but Write is not safe to call from
 // multiple goroutines at once.
 type Sender struct {
-	sess   *session.Session
-	remote *net.UDPAddr
+	sess    *session.Session
+	remote  *net.UDPAddr
+	ctxStop func() // ends the context watcher (set by Dial); nil for New* constructors
 }
 
 // NewSender dials a RIST receiver at addr ("host:port" or a rist:// URL whose
@@ -37,6 +38,8 @@ type Sender struct {
 // profile the port is the receiver's even media port and RTCP feedback flows on
 // port+1; for the Main and Advanced profiles a single port carries the flow
 // (GRE-tunnelled for Main, RTP-based with native control for Advanced).
+//
+// See [Dial] for the context-aware constructor with functional options.
 func NewSender(addr string, cfg Config) (*Sender, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -193,4 +196,9 @@ func (s *Sender) Authenticated() bool { return s.sess.Authenticated() }
 func (s *Sender) RemoteAddr() net.Addr { return s.remote }
 
 // Close stops the sender and releases its sockets and goroutines.
-func (s *Sender) Close() error { return s.sess.Close() }
+func (s *Sender) Close() error {
+	if s.ctxStop != nil {
+		s.ctxStop()
+	}
+	return s.sess.Close()
+}

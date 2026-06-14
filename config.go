@@ -52,10 +52,10 @@ type Config struct {
 	// Profile selects the RIST wire profile.
 	// Default: ProfileSimple.
 	//
-	// NOTE: this deviates from libRIST, whose RIST_DEFAULT_PROFILE is
-	// RIST_PROFILE_MAIN. ristgo defaults to ProfileSimple until the Main
-	// profile (GRE tunneling + PSK) is implemented; the default will
-	// switch to ProfileMain in a later release to match libRIST.
+	// NOTE: this deviates from libRIST, whose default profile is Main. ristgo
+	// defaults to ProfileSimple — the simplest interoperable profile — so a
+	// zero-value Config needs no tunnelling or keys; set ProfileMain or
+	// ProfileAdvanced explicitly for those profiles.
 	Profile Profile
 
 	// BufferMin is the minimum recovery (retransmission) buffer length

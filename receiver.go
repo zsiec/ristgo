@@ -18,7 +18,8 @@ import (
 // but Read itself is not safe to call from multiple goroutines at once (it is
 // a single-consumer stream, like a net.Conn).
 type Receiver struct {
-	sess *session.Session
+	sess    *session.Session
+	ctxStop func() // ends the context watcher (set by Listen); nil for New* constructors
 }
 
 // NewReceiver binds a RIST receiver at addr ("host:port" or a rist:// URL
@@ -26,6 +27,8 @@ type Receiver struct {
 // even media port and RTCP is bound on port+1; for the Main and Advanced
 // profiles a single port carries the flow (GRE-tunnelled for Main, RTP-based
 // with native control for Advanced).
+//
+// See [Listen] for the context-aware constructor with functional options.
 func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -146,4 +149,9 @@ func (r *Receiver) Stats() Stats { return toStats(r.sess.Stats()) }
 func (r *Receiver) Authenticated() bool { return r.sess.Authenticated() }
 
 // Close stops the receiver and releases its sockets and goroutines.
-func (r *Receiver) Close() error { return r.sess.Close() }
+func (r *Receiver) Close() error {
+	if r.ctxStop != nil {
+		r.ctxStop()
+	}
+	return r.sess.Close()
+}
