@@ -151,6 +151,116 @@ func newAdvReceiver(addr string, cfg Config) (*Receiver, error) {
 	return &Receiver{sess: sess}, nil
 }
 
+// NewReceiverCaller dials a listening RIST sender at addr ("host:port" or a
+// rist:// URL) and returns a Receiver that pulls media from it — the RIST
+// caller-receive (pull) mode. Unlike [NewReceiver], which binds addr and waits
+// for a sender to connect, this binds an ephemeral local socket and announces
+// itself to addr, so a sender running in listener mode (see [NewListenerSender])
+// learns this receiver and begins streaming.
+//
+// DTLS and EAP-SRP authentication are not yet supported in caller-receive mode;
+// PSK (Secret) encryption on the Main and Advanced profiles is. See
+// [DialReceiver] for the context-aware constructor with functional options.
+func NewReceiverCaller(addr string, cfg Config) (*Receiver, error) {
+	addr, cfg, err := ParseURL(addr, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, wrapInvalid(err)
+	}
+	if cfg.DTLS != nil || cfg.Username != "" {
+		return nil, fmt.Errorf("%w: DTLS and EAP-SRP are not yet supported in caller-receive mode", ErrInvalidConfig)
+	}
+	switch cfg.Profile {
+	case ProfileSimple:
+		return newSimpleReceiverCaller(addr, cfg)
+	case ProfileMain:
+		return newMainReceiverCaller(addr, cfg)
+	case ProfileAdvanced:
+		return newAdvReceiverCaller(addr, cfg)
+	default:
+		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
+	}
+}
+
+// newSimpleReceiverCaller dials a Simple-profile listener-sender: it binds an
+// ephemeral even/odd pair and addresses the sender's RTCP port (addr's even
+// media port + 1) with its Receiver Reports.
+func newSimpleReceiverCaller(addr string, cfg Config) (*Receiver, error) {
+	host, port, err := resolveMediaPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	peerRTCP, err := resolveAddrPort(host, port+1)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve rtcp address: %w", ErrInvalidConfig, err)
+	}
+	conn, err := socket.ListenEphemeralEvenOdd("")
+	if err != nil {
+		return nil, err
+	}
+	fc := toFlowConfig(cfg)
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
+	sc.AdaptLQM = cfg.SourceAdaptation
+	sess := session.NewReceiverCaller(conn, peerRTCP, sc)
+	return &Receiver{sess: sess}, nil
+}
+
+// newMainReceiverCaller dials a Main-profile listener-sender over a single
+// ephemeral GRE socket.
+func newMainReceiverCaller(addr string, cfg Config) (*Receiver, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := resolveAddrPort(host, port)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve address: %w", ErrInvalidConfig, err)
+	}
+	mp, err := buildMainParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenEphemeralSingle("")
+	if err != nil {
+		return nil, err
+	}
+	fc := toFlowConfig(cfg)
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
+	sc.Main = mp
+	sc.AdaptLQM = cfg.SourceAdaptation
+	sess := session.NewMainReceiverCaller(conn, remote, sc)
+	return &Receiver{sess: sess}, nil
+}
+
+// newAdvReceiverCaller dials an Advanced-profile listener-sender over a single
+// ephemeral socket.
+func newAdvReceiverCaller(addr string, cfg Config) (*Receiver, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := resolveAddrPort(host, port)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve address: %w", ErrInvalidConfig, err)
+	}
+	ap, err := buildAdvParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenEphemeralSingle("")
+	if err != nil {
+		return nil, err
+	}
+	fc := toFlowConfig(cfg)
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
+	sc.Adv = ap
+	sc.AdaptLQM = cfg.SourceAdaptation
+	sess := session.NewAdvReceiverCaller(conn, remote, sc)
+	return &Receiver{sess: sess}, nil
+}
+
 // Read returns the next in-order media payload. It blocks until data is
 // available, the read deadline passes (ErrTimeout), or the stream ends. A clean
 // Close ends the stream with io.EOF (so io.Copy returns nil); an abnormal

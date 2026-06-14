@@ -186,7 +186,13 @@ type Session struct {
 	flow   *flow.Flow
 	peer   *peer.Peer
 	sender bool // role
-	mdec   mediaDecoder
+	// announce makes a receiver send an immediate startup keepalive (a Receiver
+	// Report) to its seeded peer.RTCP — the caller-receive (pull) mode, where the
+	// receiver dials a listening sender and must announce itself so that sender
+	// learns its return address and begins streaming. A normal (listening)
+	// receiver leaves this false and stays silent until it has heard the sender.
+	announce bool
+	mdec     mediaDecoder
 
 	// dtlsReady is closed by loop after the optional Main-profile DTLS handshake
 	// completes (or fails), gating the reader goroutine so it never touches the
@@ -406,6 +412,79 @@ func NewAdvReceiver(conn *socket.Conn, cfg Config) *Session {
 	return s
 }
 
+// NewReceiverCaller builds a Simple-profile caller-receiver: a receiver that
+// dials a listening sender instead of binding a well-known port. It is seeded
+// with the sender's RTCP address (peerRTCP) and announces itself immediately and
+// every keepalive interval; the listening sender learns this receiver from those
+// Receiver Reports and starts streaming. conn is an ephemeral even/odd socket
+// pair so the sender can infer this receiver's media port as its RTCP port − 1.
+func NewReceiverCaller(conn *socket.Conn, peerRTCP netip.AddrPort, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.peer.RTCP = peerRTCP
+	s.announce = true
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewMainReceiverCaller builds a Main-profile caller-receiver that dials remote
+// over the single GRE socket, announcing itself until the listening sender
+// streams. cfg.Main must be set.
+func NewMainReceiverCaller(conn *socket.Conn, remote netip.AddrPort, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.peer.Media = remote
+	s.peer.RTCP = remote
+	s.announce = true
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewAdvReceiverCaller builds an Advanced-profile caller-receiver that dials
+// remote over the single UDP socket, announcing itself until the listening
+// sender streams. cfg.Adv must be set.
+func NewAdvReceiverCaller(conn *socket.Conn, remote netip.AddrPort, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.peer.Media = remote
+	s.peer.RTCP = remote
+	s.announce = true
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewListenerSender builds a Simple-profile listener-sender: a sender that binds
+// a well-known port and waits for a caller-receiver to announce itself, then
+// streams. The peer is not seeded — peer.RTCP is learned from the receiver's
+// inbound RTCP and peer.Media is inferred as its RTCP port − 1 (the even/odd
+// rule) — so sendMedia holds the stream until a receiver is known.
+func NewListenerSender(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, true)
+	s.flow = flow.New(flow.RoleSender, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewMainListenerSender builds a Main-profile listener-sender that binds the
+// single GRE port and learns the receiver from its inbound traffic. cfg.Main
+// must be set.
+func NewMainListenerSender(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, true)
+	s.flow = flow.New(flow.RoleSender, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewAdvListenerSender builds an Advanced-profile listener-sender that binds the
+// single UDP port and learns the receiver from its inbound traffic. cfg.Adv must
+// be set.
+func NewAdvListenerSender(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, true)
+	s.flow = flow.New(flow.RoleSender, cfg.Flow)
+	s.start()
+	return s
+}
+
 func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	s := &Session{
 		cfg:       cfg,
@@ -545,8 +624,10 @@ func (s *Session) loop() {
 
 	// A sender knows the peer's RTCP address from the start; an immediate
 	// keepalive lets the receiver learn the sender's return address (and thus
-	// send NACKs) without waiting a full keepalive interval.
-	if s.sender {
+	// send NACKs) without waiting a full keepalive interval. A caller-receiver
+	// (s.announce) does the symmetric thing: it announces itself to its seeded
+	// peer.RTCP so a listening sender learns this receiver and starts streaming.
+	if s.sender || s.announce {
 		s.sendKeepalive(s.clk.Now())
 	}
 	// Anchor the LQM reporting period at start-up so the first report covers a
@@ -580,6 +661,7 @@ func (s *Session) loop() {
 		case r := <-s.rtcpIn:
 			now := s.clk.Now()
 			s.peer.LearnRTCP(r.src)
+			s.inferSenderMediaFromRTCP()
 			s.peer.Observe(now)
 			if fbs, err := decodeFeedback(r.data, s.highestSent); err == nil {
 				s.feedFeedback(now, fbs)
@@ -806,6 +888,26 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		s.logAt(LogWarning, CatSocket, "write media: %v", err)
 	}
 	s.lastTx = now
+}
+
+// inferSenderMediaFromRTCP gives a Simple-profile listener-sender its media
+// destination once it has learned the receiver's RTCP source. The Simple profile
+// puts media on an even port and RTCP on the adjacent odd port, so the receiver's
+// media address is its RTCP address with the port decremented by one (the libRIST
+// even/odd rule). A sender only reads its RTCP socket (never its media socket),
+// so without this it would learn peer.RTCP but never peer.Media and sendMedia
+// would hold forever. It is a no-op for a normal (dialing) sender, whose
+// peer.Media is configured and thus already valid, and for the single-socket
+// Main/Advanced profiles, whose inbound handlers learn both addresses at once.
+func (s *Session) inferSenderMediaFromRTCP() {
+	if !s.sender || s.peer.Media.IsValid() || !s.peer.RTCP.IsValid() {
+		return
+	}
+	rt := s.peer.RTCP
+	if rt.Port() == 0 {
+		return
+	}
+	s.peer.Media = netip.AddrPortFrom(rt.Addr(), rt.Port()-1)
 }
 
 // sendFeedback builds one compound RTCP datagram from the drained feedback and

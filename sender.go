@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/zsiec/ristgo/internal/session"
+	"github.com/zsiec/ristgo/internal/socket"
 )
 
 // MaxMediaPayload is the largest payload a single Write may submit. The Simple
@@ -177,6 +178,113 @@ func newAdvSender(addr string, cfg Config) (*Sender, error) {
 	applyRateAdapt(&sc, cfg)
 	sess := session.NewAdvSender(conn, remote, sc)
 	return &Sender{sess: sess, remote: remote}, nil
+}
+
+// NewListenerSender binds addr ("host:port" or a rist:// URL) and returns a
+// Sender that streams to a caller-mode receiver once it connects — the RIST
+// listener-send mode. Unlike [NewSender], which dials a receiver at addr, this
+// binds the well-known port(s) and waits: the receiver's address is learned from
+// its inbound RTCP, so until a receiver appears RemoteAddr is unspecified and
+// submitted media is held (the recovery buffer) or dropped rather than sent.
+//
+// DTLS and EAP-SRP are not yet supported in listener-send mode; PSK (Secret)
+// encryption on the Main and Advanced profiles is. See [ListenSender] for the
+// context-aware constructor with functional options.
+func NewListenerSender(addr string, cfg Config) (*Sender, error) {
+	addr, cfg, err := ParseURL(addr, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, wrapInvalid(err)
+	}
+	if cfg.DTLS != nil || cfg.Username != "" {
+		return nil, fmt.Errorf("%w: DTLS and EAP-SRP are not yet supported in listener-send mode", ErrInvalidConfig)
+	}
+	switch cfg.Profile {
+	case ProfileSimple:
+		return newSimpleListenerSender(addr, cfg)
+	case ProfileMain:
+		return newMainListenerSender(addr, cfg)
+	case ProfileAdvanced:
+		return newAdvListenerSender(addr, cfg)
+	default:
+		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
+	}
+}
+
+// newSimpleListenerSender binds the Simple-profile even/odd pair at addr and
+// waits for a caller-receiver. peer.RTCP is learned from the receiver's reports
+// and peer.Media inferred from it (even/odd), so media flows once it connects.
+func newSimpleListenerSender(addr string, cfg Config) (*Sender, error) {
+	host, port, err := resolveMediaPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.Listen(host, port)
+	if err != nil {
+		return nil, err
+	}
+	ssrc := randomEvenSSRC()
+	fc := toFlowConfig(cfg)
+	fc.SSRC = ssrc
+	fc.StartSeq = randomStartSeq()
+	sc := toSessionConfig(cfg, fc, ssrc)
+	applyRateAdapt(&sc, cfg)
+	sess := session.NewListenerSender(conn, sc)
+	return &Sender{sess: sess}, nil
+}
+
+// newMainListenerSender binds the Main-profile single GRE port at addr and waits
+// for a caller-receiver.
+func newMainListenerSender(addr string, cfg Config) (*Sender, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	mp, err := buildMainParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenSingle(host, port)
+	if err != nil {
+		return nil, err
+	}
+	ssrc := randomEvenSSRC()
+	fc := toFlowConfig(cfg)
+	fc.SSRC = ssrc
+	fc.StartSeq = randomStartSeq()
+	sc := toSessionConfig(cfg, fc, ssrc)
+	sc.Main = mp
+	applyRateAdapt(&sc, cfg)
+	sess := session.NewMainListenerSender(conn, sc)
+	return &Sender{sess: sess}, nil
+}
+
+// newAdvListenerSender binds the Advanced-profile single port at addr and waits
+// for a caller-receiver.
+func newAdvListenerSender(addr string, cfg Config) (*Sender, error) {
+	host, port, err := resolveSinglePort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ap, err := buildAdvParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := socket.ListenSingle(host, port)
+	if err != nil {
+		return nil, err
+	}
+	ssrc := randomEvenSSRC()
+	fc := toFlowConfig(cfg)
+	fc.SSRC = ssrc
+	fc.StartSeq = randomStartSeq()
+	sc := toSessionConfig(cfg, fc, ssrc)
+	sc.Adv = ap
+	applyRateAdapt(&sc, cfg)
+	sess := session.NewAdvListenerSender(conn, sc)
+	return &Sender{sess: sess}, nil
 }
 
 // Write submits one media payload for transmission and returns len(p). The

@@ -109,3 +109,23 @@ func TestCloseUnblocksRead(t *testing.T) {
 		t.Fatal("Close did not unblock a pending ReadMedia")
 	}
 }
+
+// TestListenEphemeralEvenOdd checks the caller-receiver socket constructor binds
+// an even media port with the adjacent odd RTCP port, the invariant a Simple
+// listener-sender relies on to infer the receiver's media address (rtcp-1).
+func TestListenEphemeralEvenOdd(t *testing.T) {
+	c, err := ListenEphemeralEvenOdd("127.0.0.1")
+	if err != nil {
+		t.Fatalf("ListenEphemeralEvenOdd: %v", err)
+	}
+	defer c.Close()
+
+	mp := c.media.LocalAddr().(*net.UDPAddr).Port
+	rp := c.rtcp.LocalAddr().(*net.UDPAddr).Port
+	if mp%2 != 0 {
+		t.Errorf("media port %d is not even", mp)
+	}
+	if rp != mp+1 {
+		t.Errorf("rtcp port %d, want media+1 (%d)", rp, mp+1)
+	}
+}

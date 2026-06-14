@@ -82,6 +82,49 @@ func ListenEphemeral(host string) (*Conn, error) {
 	return &Conn{media: media, rtcp: rtcp}, nil
 }
 
+// ListenEphemeralEvenOdd binds an OS-chosen even media port and the adjacent odd
+// RTCP port on host (empty host binds all interfaces). It is the Simple-profile
+// caller-receiver constructor: a receiver that dials a listening sender still
+// needs a local even/odd pair, because a Simple listener-sender infers the
+// receiver's media address as its RTCP source port − 1 (the even/odd rule). A
+// probe bind picks a free port; if it is odd the even neighbour below is tried,
+// then port+1. The small TOCTOU window between probe and the real binds is
+// tolerated by retrying.
+func ListenEphemeralEvenOdd(host string) (*Conn, error) {
+	var lastErr error
+	for i := 0; i < 100; i++ {
+		probe, err := bind(host, 0)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		p := probe.LocalAddr().(*net.UDPAddr).Port
+		probe.Close()
+		if p%2 != 0 {
+			p--
+		}
+		if p <= 0 {
+			continue
+		}
+		media, err := bind(host, p)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		rtcp, err := bind(host, p+1)
+		if err != nil {
+			media.Close()
+			lastErr = err
+			continue
+		}
+		return &Conn{media: media, rtcp: rtcp}, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no free even/odd port pair after 100 tries")
+	}
+	return nil, fmt.Errorf("rist: socket: bind ephemeral even/odd pair: %w", lastErr)
+}
+
 // ListenEphemeralFamily is ListenEphemeral with an explicit address family
 // ("udp4" or "udp6"). A multicast sender must bind its egress socket in the
 // group's family: a dual-stack ("udp", [::]) socket cannot have an IPv4

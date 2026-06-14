@@ -147,6 +147,33 @@ func Listen(ctx context.Context, addr string, opts ...Option) (*Receiver, error)
 	return r, nil
 }
 
+// DialReceiver dials a listening RIST sender at addr ("host:port" or a rist://
+// URL) and returns a Receiver that pulls media from it — the caller-receive
+// (pull) mode, the receive-side counterpart to a sender in listener mode. It
+// binds an ephemeral local socket and announces itself so the listening sender
+// begins streaming. Cancelling ctx closes the Receiver.
+func DialReceiver(ctx context.Context, addr string, opts ...Option) (*Receiver, error) {
+	r, err := NewReceiverCaller(addr, applyOptions(opts))
+	if err != nil {
+		return nil, err
+	}
+	r.ctxStop = watchContext(ctx, r)
+	return r, nil
+}
+
+// ListenSender binds addr ("host:port" or a rist:// URL) and returns a Sender
+// that streams to a caller-mode receiver once it connects — the listener-send
+// mode, the send-side counterpart to a receiver in caller mode. Cancelling ctx
+// closes the Sender.
+func ListenSender(ctx context.Context, addr string, opts ...Option) (*Sender, error) {
+	s, err := NewListenerSender(addr, applyOptions(opts))
+	if err != nil {
+		return nil, err
+	}
+	s.ctxStop = watchContext(ctx, s)
+	return s, nil
+}
+
 // DialBonded connects a SMPTE 2022-7 bonded Sender across several receiver
 // addresses with the given options. Cancelling ctx closes the Sender.
 func DialBonded(ctx context.Context, addrs []string, opts ...Option) (*BondedSender, error) {
