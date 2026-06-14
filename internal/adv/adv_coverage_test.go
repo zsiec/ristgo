@@ -382,3 +382,26 @@ func TestParseCSRCTruncation(t *testing.T) {
 		t.Errorf("err = %v, want ErrShortBuffer", err)
 	}
 }
+
+// TestEncodeRangeNACKCapAndWrap verifies a run is split so no emitted NALP
+// reaches maxNACKDecodeRange (which a libRIST receiver would leave 1 packet
+// un-recovered), and that a consecutive run straddling the 2^32 sequence wrap
+// coalesces into one range rather than two distant entries.
+func TestEncodeRangeNACKCapAndWrap(t *testing.T) {
+	n := maxNACKDecodeRange + 2
+	missing := make([]uint32, n)
+	for i := range missing {
+		missing[i] = uint32(i)
+	}
+	for _, r := range EncodeRangeNACK(1, missing) {
+		if r.NALP >= maxNACKDecodeRange {
+			t.Fatalf("emitted NALP=%d, want < %d", r.NALP, maxNACKDecodeRange)
+		}
+	}
+
+	wrap := []uint32{0xFFFFFFFE, 0xFFFFFFFF, 0x00000000, 0x00000001}
+	got := EncodeRangeNACK(1, wrap)
+	if len(got) != 1 || got[0].PSS != 0xFFFFFFFE || got[0].NALP != 3 {
+		t.Fatalf("wrap run = %+v, want one range {PSS:0xFFFFFFFE, NALP:3}", got)
+	}
+}

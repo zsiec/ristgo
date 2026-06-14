@@ -23,3 +23,37 @@ jobs:
       - run: make test
       - run: make check-deps
       - run: make check-flow-imports
+
+  # interop runs the //go:build interop suite against the libRIST reference CLI
+  # tools, so a regression in on-the-wire compatibility (e.g. the Advanced
+  # RTT-echo interaction) is caught in CI rather than only by a manual run. It is
+  # a separate, best-effort job: if the libRIST build is unavailable the suite
+  # t.Skips (RISTGO_LIBRIST_TOOLS points at the built tools), so this job does
+  # not falsely fail the build.
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Install libRIST build dependencies
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build nasm
+      - name: Cache libRIST build
+        id: librist-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/librist
+          key: librist-${{ runner.os }}-v0.2.18
+      - name: Build libRIST reference tools
+        if: steps.librist-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://code.videolan.org/rist/librist.git /tmp/librist
+          meson setup /tmp/librist/build /tmp/librist
+          ninja -C /tmp/librist/build
+      - name: Run interop suite
+        run: |
+          RISTGO_LIBRIST_TOOLS=/tmp/librist/build/tools \
+            go test -tags interop -run TestInterop -count=1 -timeout 600s ./...
+      - name: Allocation benchmarks (smoke)
+        run: make bench

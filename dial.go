@@ -95,6 +95,11 @@ func WithSessionTimeout(d time.Duration) Option { return func(c *Config) { c.Ses
 // WithMaxBitrate sets the maximum recovery bandwidth in kbps.
 func WithMaxBitrate(kbps int) Option { return func(c *Config) { c.MaxBitrate = kbps } }
 
+// WithMinBitrate sets the floor in kbps below which source-adaptation rate
+// control will not drive the encoder target (TR-06-4 Part 1 §7). Set it to the
+// encoder's minimum viable rate; 0 keeps the library's built-in 500 kbps floor.
+func WithMinBitrate(kbps int) Option { return func(c *Config) { c.MinBitrate = kbps } }
+
 // WithCNAME sets the canonical name advertised in RTCP SDES.
 func WithCNAME(name string) Option { return func(c *Config) { c.CNAME = name } }
 

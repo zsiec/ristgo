@@ -133,7 +133,17 @@ type Conn struct {
 	lastFlight *flight       // our last outgoing flight, for retransmission
 	curRetrans time.Duration // current retransmission timer (doubles per resend)
 	sendMsgSeq uint16        // our next outgoing handshake message_seq
+
+	// finalFlightResends counts post-handshake retransmissions of the server's
+	// final flight (RFC 6347 §4.2.4), bounded by maxFinalFlightResends so a
+	// misbehaving peer cannot make the server resend forever.
+	finalFlightResends int
 }
+
+// maxFinalFlightResends bounds how many times the server resends its final
+// flight (CCS + Finished) in response to a retransmitted client flight after the
+// handshake has completed (RFC 6347 §4.2.4 last-flight handling).
+const maxFinalFlightResends = 8
 
 // Client wraps transport as the DTLS client side. The handshake runs on the
 // first Read/Write or an explicit Handshake call.
@@ -269,7 +279,21 @@ func (c *Conn) readAppRecords() error {
 			// A close_notify (or any fatal alert) ends the stream.
 			return io.EOF
 		default:
-			// Ignore retransmitted handshake / CCS records post-handshake.
+			// RFC 6347 §4.2.4 last-flight handling: a retransmitted peer
+			// handshake or CCS record after we finished means our final flight
+			// was lost in transit. The server MUST resend its last flight (CCS +
+			// Finished) — without this, a single dropped server-Finished datagram
+			// permanently fails the handshake under loss instead of recovering.
+			// The client has no post-Finished flight to lose, so it does not
+			// resend. Bounded by maxFinalFlightResends.
+			if !c.isClient && c.lastFlight != nil &&
+				(r.typ == recordHandshake || r.typ == recordChangeCipherSpec) &&
+				c.finalFlightResends < maxFinalFlightResends {
+				c.finalFlightResends++
+				if err := c.transmit(c.lastFlight); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil

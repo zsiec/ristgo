@@ -24,6 +24,7 @@ import (
 	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/eap"
 	"github.com/zsiec/ristgo/internal/flow"
+	"github.com/zsiec/ristgo/internal/gre"
 	"github.com/zsiec/ristgo/internal/peer"
 	"github.com/zsiec/ristgo/internal/rtcp"
 	"github.com/zsiec/ristgo/internal/socket"
@@ -65,6 +66,9 @@ type Config struct {
 	// ErrAuth is returned to the caller when the Main-profile EAP-SRP handshake
 	// fails (wrong credentials or a refused proof). Supplied by the public layer.
 	ErrAuth error
+	// ErrOOBUnsupported is returned by WriteOOB/ReadOOB when the session has no
+	// out-of-band channel (the Simple profile). Supplied by the public layer.
+	ErrOOBUnsupported error
 
 	// Main, when non-nil, selects the Main profile (VSF TR-06-2): the flow is
 	// tunnelled over a single GRE port instead of the Simple even/odd RTP/RTCP
@@ -168,6 +172,19 @@ type Session struct {
 	// feedback by the inner payload-type byte instead of by socket.
 	main *mainCodec
 
+	// Main-profile GRE keepalive negotiation state (loop-owned). greVersion is
+	// the monotonically-upgraded negotiated GRE version (starts at VersionMin);
+	// localMAC is this node's MAC advertised in keepalives; remoteCaps/remoteMAC
+	// are what the peer last advertised; senderMaxBufferMs is the buffer the peer
+	// allows as a sender (from buffer negotiation, observe-only). greBurstSent
+	// guards the one-shot connect burst.
+	greVersion        uint8
+	localMAC          [6]byte
+	remoteCaps        gre.Capabilities
+	remoteMAC         [6]byte
+	senderMaxBufferMs uint16
+	greBurstSent      bool
+
 	// adv is the Advanced-profile codec, non-nil in Advanced mode. Like main it
 	// reads/writes one UDP socket, demuxing media vs control by the
 	// encapsulation Type field rather than by socket.
@@ -237,6 +254,13 @@ type Session struct {
 	bondIn  chan bondInbound // bonded multipath: per-path media/RTCP, tagged
 	appIn   chan []byte
 
+	// Out-of-band side channel (Main/Advanced only). oobIn carries application
+	// WriteOOB payloads to the loop; oobOut carries received OOB datagrams to
+	// ReadOOB. OOB bypasses the flow core entirely (no ARQ/reorder/dedup), like
+	// EAPOL — it is purely a host concern.
+	oobIn  chan []byte
+	oobOut chan []byte
+
 	// delivery to Read
 	delivery chan []byte
 	leftover []byte // partially-read payload (stream semantics)
@@ -245,7 +269,14 @@ type Session struct {
 	mediaBuf []byte
 	rtcpBuf  []byte
 
-	stats atomic.Pointer[flow.Stats]
+	// statsVal is the published flow-stats snapshot, refreshed after every loop
+	// input by the loop goroutine and read by the public Stats(). It is guarded
+	// by statsMu rather than an atomic.Pointer so the per-input refresh reuses
+	// the same struct (a 144-byte copy under an uncontended lock) instead of
+	// heap-allocating a fresh snapshot on every media packet — the hot path
+	// CLAUDE.md requires to stay alloc-free.
+	statsMu  sync.Mutex
+	statsVal flow.Stats
 
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
@@ -351,10 +382,17 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		s.delivery = make(chan []byte, 4096)
 	}
 	s.authed.Store(true) // no EAP gate by default (Simple, or Main without auth)
+	if cfg.Main != nil || cfg.Adv != nil {
+		// OOB side channel is available on the Main and Advanced profiles only.
+		s.oobIn = make(chan []byte, 16)
+		s.oobOut = make(chan []byte, 16)
+	}
 	if cfg.Main != nil {
 		mp := cfg.Main
 		s.main = newMainCodec(mp.SendKey, mp.RecvKey, mp.KeySize256, mp.VirtSrcPort, mp.VirtDstPort, mp.NPD, cfg.SSRC, cfg.CNAME, cfg.Bitmask)
 		s.mainIn = make(chan inbound, 256)
+		s.greVersion = gre.VersionMin // negotiated up to VersionCur on receiving a v2 frame
+		s.localMAC = localHardwareMAC()
 		s.eapClient = mp.EAPClient
 		s.eapServer = mp.EAPServer
 		if s.eapClient != nil || s.eapServer != nil {
@@ -376,8 +414,6 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 			s.mediaIn = make(chan inbound, 256)
 		}
 	}
-	var zero flow.Stats
-	s.stats.Store(&zero)
 	return s
 }
 
@@ -500,9 +536,33 @@ func (s *Session) loop() {
 			s.peer.LearnMedia(d.src)
 			s.peer.LearnRTCP(d.src)
 			s.peer.Observe(now)
-			if eapPayload, ok := s.main.peekEAPOL(d.data); ok {
+			// Probe the GRE version with a dual-version keepalive burst the
+			// instant the peer is learned, so a v2-capable peer can upgrade.
+			if !s.greBurstSent && s.peer.RTCP != nil {
+				s.greBurstSent = true
+				s.sendGREKeepaliveBurst()
+			}
+			// Apply the monotonic GRE-version upgrade from every datagram's
+			// header version, and learn capabilities/MAC from a v1 keepalive.
+			kind, ka, ver, cerr := s.main.peekControl(d.data)
+			s.upgradeGREVersion(ver)
+			if kind == controlKeepalive {
+				if cerr != nil {
+					s.logf("main: drop undecodable GRE keepalive: %v", cerr)
+				} else {
+					s.handleGREControl(ka)
+				}
+			} else if eapPayload, ok := s.main.peekEAPOL(d.data); ok {
 				// Authentication frame: route to the EAP state machine.
 				s.handleEAP(now, eapPayload)
+			} else if oob, ok, oerr := s.main.peekOOB(d.data); ok {
+				// Out-of-band data (GRE FULL framing): deliver via ReadOOB,
+				// bypassing the media flow entirely.
+				if oerr != nil {
+					s.logf("main: drop undecodable OOB (%d bytes): %v", len(d.data), oerr)
+				} else {
+					s.deliverOOB(oob)
+				}
 			} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
 				if isMedia {
 					s.observeRxBytes(len(d.data))
@@ -545,6 +605,10 @@ func (s *Session) loop() {
 			now := s.clk.Now()
 			s.flow.PushApp(now, p)
 			s.afterInput(now, timer)
+		case p := <-s.oobIn:
+			now := s.clk.Now()
+			s.sendOOB(now, p)
+			s.afterInput(now, timer)
 		case <-timer.C:
 			now := s.clk.Now()
 			s.fireTimers(now)
@@ -567,6 +631,13 @@ func (s *Session) loop() {
 			} else if s.peer.RTCP != nil && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
 				s.sendKeepalive(now)
 			}
+			// Main profile (non-bonded): also emit the periodic GRE keepalive (the
+			// node-MAC + capability beacon), at the negotiated GRE version. It is
+			// distinct from the RTCP keepalive above (libRIST runs both timers).
+			// Bonded sessions drive their own per-path keepalives.
+			if s.main != nil && s.bond == nil && s.peer.RTCP != nil {
+				s.sendGREKeepalive(s.greVersion)
+			}
 			// A receiver that opted into source adaptation emits a Link Quality
 			// Message each interval (TR-06-4 Part 1).
 			if s.adaptEmitsLQM() {
@@ -581,7 +652,17 @@ func (s *Session) loop() {
 func (s *Session) afterInput(now clock.Timestamp, timer *time.Timer) {
 	s.drain(now)
 	s.rearm(timer, now)
-	s.stats.Store(ptr(s.flow.Stats()))
+	s.publishStats()
+}
+
+// publishStats copies the flow's current counters into the published snapshot
+// for the public Stats() reader. It runs on the loop goroutine after every
+// input and allocates nothing: the snapshot struct is reused under statsMu.
+func (s *Session) publishStats() {
+	v := s.flow.Stats()
+	s.statsMu.Lock()
+	s.statsVal = v
+	s.statsMu.Unlock()
 }
 
 // fireTimers delivers every due declarative timer to the flow in deadline
@@ -686,12 +767,11 @@ func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 	}
 	var lead rtcp.Packet
 	if s.sender {
-		// SR fields are session-relative (the receiver ignores SR contents
-		// this stage — SR-based playout-offset refinement is deferred). NTP
-		// and the RTP timestamp are taken from the same instant.
+		// The SR NTP field is absolute wall-clock NTP (RFC 3550); the RTP
+		// timestamp is taken from the same instant. See wallNTP.
 		lead = rtcp.SenderReport{
 			SSRC:    s.cfg.SSRC,
-			NTP:     uint64(clock.NTPTimeFromTimestamp(now)),
+			NTP:     s.wallNTP(now),
 			RTPTime: uint32(rtpTicksFromMicros(int64(now))),
 		}
 	} else {
@@ -708,6 +788,19 @@ func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 		s.logf("write rtcp: %v", err)
 	}
 	s.lastTx = now
+}
+
+// wallNTP returns the absolute wall-clock NTP-64 value for instant now, for the
+// RTCP Sender Report's NTP field (RFC 3550): a libRIST receiver in RTC timing
+// mode derives time_offset from it, so a session-relative value would corrupt
+// its playout (off by ~70 years). Deterministic test clocks that cannot report
+// wall time fall back to the session-relative form (harmless: the receiver
+// ignores SR contents at this stage and echo timestamps cancel the epoch).
+func (s *Session) wallNTP(now clock.Timestamp) uint64 {
+	if wc, ok := s.clk.(clock.WallClocker); ok {
+		return uint64(wc.WallNTP(now))
+	}
+	return uint64(clock.NTPTimeFromTimestamp(now))
 }
 
 // encodeCompound builds one compound-RTCP datagram for the configured profile:
@@ -819,7 +912,7 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 						s.flow.Feed(now, 0, pkt)
 						s.observeRx(now, pkt)
 					} else {
-						s.feedFeedback(now, fbs)
+						s.feedAdvFeedback(now, fbs)
 					}
 				} else {
 					s.logf("adv: drop undecodable adv datagram (%d bytes): %v", len(data), derr)
@@ -839,6 +932,14 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 // (they served their handshake/liveness purpose at the peer layer). A decode
 // error (e.g. a GRE keepalive, whose protocol type is not REDUCED) is ignored.
 func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
+	if oob, ok, oerr := s.advGRE.peekOOB(data); ok {
+		if oerr != nil {
+			s.logf("adv: drop undecodable OOB: %v", oerr)
+		} else {
+			s.deliverOOB(oob)
+		}
+		return
+	}
 	isMedia, pkt, fbs, err := s.advGRE.decodeMain(data, s.highestSent)
 	if err != nil {
 		return // keepalive or otherwise not a GRE media/RTCP datagram; ignore
@@ -851,7 +952,182 @@ func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
 		s.observeRx(now, pkt)
 		return
 	}
-	s.feedFeedback(now, fbs)
+	s.feedAdvFeedback(now, fbs)
+}
+
+// feedAdvFeedback feeds decoded feedback to the flow on the Advanced path,
+// dropping any inbound RTT-echo *request* first (see dropAdvEchoRequests).
+func (s *Session) feedAdvFeedback(now clock.Timestamp, fbs []wire.Feedback) {
+	s.feedFeedback(now, dropAdvEchoRequests(fbs))
+}
+
+// dropAdvEchoRequests removes inbound RTT-echo requests from an Advanced-path
+// feedback slice so the flow never generates a response to them. Echoing such a
+// request verbatim is spec-correct, but libRIST's Advanced-profile RTT-echo
+// response handler mis-scales the NTP-64 round-trip — it shifts the fractional
+// diff by 16 instead of 32, inflating the measured RTT by 2^16. A response from
+// us therefore poisons libRIST's peer last_rtt to hundreds of seconds, which
+// jams its own retransmit re-queue gate (it refuses a re-NACK while delta <
+// rtt), so a single dropped retransmit is never re-sent and one packet is
+// permanently lost under loss. Not answering keeps libRIST's last_rtt at its
+// sane default and recovery works; ristgo still originates its own RTT-echo
+// requests (scaled correctly by both ends), so this does not affect ristgo's
+// RTT estimation. Advanced-only — the Main/Simple RTT echo uses libRIST's
+// correct path and must keep answering for those estimators to converge. It
+// reuses the input backing array (the caller does not retain fbs).
+func dropAdvEchoRequests(fbs []wire.Feedback) []wire.Feedback {
+	filtered := fbs[:0]
+	for _, fb := range fbs {
+		if _, isEchoReq := fb.(wire.RttEchoRequest); isEchoReq {
+			continue
+		}
+		filtered = append(filtered, fb)
+	}
+	return filtered
+}
+
+// sendOOB encodes one out-of-band datagram (GRE FULL framing, PSK-encrypted when
+// configured) and writes it to the learned peer. OOB is a Main/Advanced-only
+// side channel that bypasses the flow core (no ARQ); it is dropped, with a log,
+// before the peer's address is known.
+func (s *Session) sendOOB(now clock.Timestamp, payload []byte) {
+	if s.peer.Media == nil {
+		s.logf("oob: peer not learned yet, dropping %d-byte datagram", len(payload))
+		return
+	}
+	var (
+		b   []byte
+		err error
+	)
+	switch {
+	case s.main != nil:
+		b, err = s.main.encodeOOB(nil, payload)
+	case s.advGRE != nil:
+		b, err = s.advGRE.encodeOOB(nil, payload)
+	default:
+		return // not a Main/Advanced session
+	}
+	if err != nil {
+		s.logf("oob: encode: %v", err)
+		return
+	}
+	if err := s.conn.WriteMedia(b, s.peer.Media); err != nil {
+		s.logf("oob: write: %v", err)
+		return
+	}
+	s.lastTx = now
+}
+
+// deliverOOB queues a received OOB payload for ReadOOB, copying it (the decode
+// buffer is reused downstream) and dropping it non-blocking if the consumer is
+// too slow — OOB is best-effort and must never stall the media event loop.
+func (s *Session) deliverOOB(oob []byte) {
+	cp := append([]byte(nil), oob...)
+	select {
+	case s.oobOut <- cp:
+	default:
+		s.logf("oob: receive queue full, dropping %d-byte datagram", len(oob))
+	}
+}
+
+// localHardwareMAC returns this host's first non-zero, non-loopback hardware
+// (MAC) address for the GRE keepalive node-MAC field, or all-zeros if none is
+// found. The MAC is informational in libRIST (it logs it and detects keepalive
+// changes by it); it never drives routing or identity, so a zero MAC is harmless.
+func localHardwareMAC() [6]byte {
+	var mac [6]byte
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return mac
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagLoopback != 0 || len(ifc.HardwareAddr) != 6 {
+			continue
+		}
+		var cand [6]byte
+		copy(cand[:], ifc.HardwareAddr)
+		if cand != ([6]byte{}) {
+			return cand
+		}
+	}
+	return mac
+}
+
+// sendGREKeepalive emits one GRE keepalive advertising this node's MAC and
+// capability bits at the given GRE version (libRIST
+// _librist_proto_gre_send_keepalive). It is the Main-profile capability/liveness
+// beacon, distinct from the periodic RTCP. A no-op until the peer is learned.
+func (s *Session) sendGREKeepalive(version uint8) {
+	if s.main == nil || s.peer.RTCP == nil {
+		return
+	}
+	ka := gre.Keepalive{MAC: s.localMAC, Caps: gre.StandardCapabilities()}
+	b, err := s.main.encodeKeepalive(nil, ka, version)
+	if err != nil {
+		s.logf("gre keepalive encode: %v", err)
+		return
+	}
+	if err := s.conn.WriteMedia(b, s.peer.RTCP); err != nil {
+		s.logf("gre keepalive write: %v", err)
+	}
+}
+
+// sendGREKeepaliveBurst sends the connect-time probe: three version-2
+// (VSF-wrapped) keepalives then three version-1 keepalives, so a v2-capable peer
+// upgrades while a v1-only peer still hears us (libRIST's dual-version probe). A
+// sender also advertises its max buffer via buffer negotiation.
+func (s *Session) sendGREKeepaliveBurst() {
+	if s.main == nil || s.peer.RTCP == nil {
+		return
+	}
+	for i := 0; i < 3; i++ {
+		s.sendGREKeepalive(gre.VersionCur)
+	}
+	for i := 0; i < 3; i++ {
+		s.sendGREKeepalive(gre.VersionMin)
+	}
+	if s.sender {
+		s.sendBufferNegotiation()
+	}
+}
+
+// sendBufferNegotiation advertises this sender's maximum buffer (recovery window
+// + 2*rtt_min, libRIST sender_recover_min_time), three times for datagram
+// redundancy. Version 2 only.
+func (s *Session) sendBufferNegotiation() {
+	if s.main == nil || s.peer.RTCP == nil || !s.sender {
+		return
+	}
+	maxMs := uint16((s.cfg.Flow.RecoveryBufferMax + 2*s.cfg.Flow.RTTMin) / clock.Millisecond)
+	bn := gre.BufferNegotiation{SenderMaxMs: maxMs}
+	for i := 0; i < 3; i++ {
+		if b, err := s.main.encodeBufferNeg(nil, bn); err == nil {
+			_ = s.conn.WriteMedia(b, s.peer.RTCP)
+		}
+	}
+}
+
+// handleGREControl records the peer's capabilities and MAC from an inbound GRE
+// keepalive. (The monotonic version upgrade is driven separately from every
+// datagram's GRE-header version; see upgradeGREVersion.)
+func (s *Session) handleGREControl(ka gre.Keepalive) {
+	s.remoteCaps = ka.Caps
+	s.remoteMAC = ka.MAC
+}
+
+// upgradeGREVersion applies libRIST's monotonic version-upgrade rule: adopt a
+// higher GRE version observed from the peer (never downgrade), and on the first
+// crossing past VersionMin kick off buffer negotiation on a sender.
+func (s *Session) upgradeGREVersion(version uint8) {
+	if version <= s.greVersion || version > gre.VersionCur {
+		return
+	}
+	crossing := s.greVersion == gre.VersionMin
+	s.greVersion = version
+	s.logf("gre: negotiated up to version %d", version)
+	if crossing && s.sender {
+		s.sendBufferNegotiation()
+	}
 }
 
 // handleEAP drives the Main-profile EAP-SRP handshake for one received EAPOL
@@ -1031,8 +1307,6 @@ func (s *Session) logf(format string, args ...any) {
 		s.cfg.Logf(format, args...)
 	}
 }
-
-func ptr(v flow.Stats) *flow.Stats { return &v }
 
 // seqAfter reports whether a is circularly after b (wrap-aware).
 func seqAfter(a, b uint32) bool {

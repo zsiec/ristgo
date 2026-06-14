@@ -208,6 +208,20 @@ func preferred(cand, best *Path, g *Group) bool {
 	return cand.nackRTT(g) < best.nackRTT(g)
 }
 
+// ShouldDuplicate reports whether a bonded sender should still fan a media
+// datagram to the given path: the per-path, allocation-free form of
+// DuplicateTargets for the per-packet send loop. It is true for a
+// duplication-mode path (Weight == WeightDuplicate) that is not proven dead
+// (never-seen included; only a path seen and then silent past the session
+// timeout is dropped — libRIST's hard-dead duplicate-peer prune).
+func (g *Group) ShouldDuplicate(index uint8, now clock.Timestamp) bool {
+	p := g.path(index)
+	if p == nil || p.Weight != WeightDuplicate {
+		return false
+	}
+	return !(p.seen && now.Sub(p.lastSeen) > g.timeout)
+}
+
 // DuplicateTargets returns the indices of the paths a bonded sender fans each
 // media datagram across in SMPTE 2022-7 full-redundancy mode: the paths
 // configured for duplication (Weight == WeightDuplicate) that are not currently

@@ -253,3 +253,40 @@ func TestRangeNACKDecodeRecordCount(t *testing.T) {
 		}
 	}
 }
+
+// TestRangeNACKExpansionBounded verifies a crafted range NACK whose records
+// each request a full 16-bit run cannot expand into a multi-million-entry slice
+// on the sender (memory/CPU amplification guard, see maxNackExpand).
+func TestRangeNACKExpansionBounded(t *testing.T) {
+	// 370 records, each spanning the whole 16-bit ring (Extra=0xFFFF): a naive
+	// expansion would be 370*65536 = ~24M entries.
+	ranges := make([]NackRange, 370)
+	for i := range ranges {
+		ranges[i] = NackRange{Start: uint16(i), Extra: 0xFFFF}
+	}
+	pkt := RangeNACK{MediaSSRC: 1, Ranges: ranges}
+	got := pkt.MissingSeqs()
+	if len(got) > maxNackExpand {
+		t.Fatalf("MissingSeqs expanded to %d, want <= %d (amplification guard)", len(got), maxNackExpand)
+	}
+
+	// A conforming small request is never truncated.
+	small := RangeNACK{MediaSSRC: 1, Ranges: []NackRange{{Start: 100, Extra: 4}, {Start: 200, Extra: 0}}}
+	if seqs := small.MissingSeqs(); len(seqs) != 6 {
+		t.Fatalf("small request expanded to %d seqs, want 6 (no truncation)", len(seqs))
+	}
+}
+
+// TestBitmaskNACKExpansionBounded verifies the bitmask path is likewise bounded.
+func TestBitmaskNACKExpansionBounded(t *testing.T) {
+	fcis := make([]NackPair, 5000)
+	for i := range fcis {
+		fcis[i] = NackPair{PID: uint16(i), BLP: 0xFFFF}
+	}
+	pkt := BitmaskNACK{MediaSSRC: 1, FCIs: fcis}
+	// Each FCI appends up to 17 seqs after the cap check, so the bound is
+	// maxNackExpand rounded up by at most one FCI window.
+	if got := pkt.MissingSeqs(); len(got) > maxNackExpand+17 {
+		t.Fatalf("MissingSeqs expanded to %d, want <= %d", len(got), maxNackExpand+17)
+	}
+}

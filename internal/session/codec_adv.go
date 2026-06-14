@@ -72,12 +72,13 @@ import (
 const advClockShift = 16
 
 // maxAdvDecompressed bounds the output of an LZ4 decompression on the receive
-// path, mirroring libRIST's RIST_MAX_PACKET_SIZE decompress bound
-// so a hostile compressed payload cannot force an
-// unbounded allocation. Legitimate media payloads are far smaller (LZ4 is
-// applied on send only when it shrinks the payload, so the decompressed size
-// never exceeds the original ~MTU-sized packet).
-const maxAdvDecompressed = 65536
+// path, matching libRIST's RIST_MAX_PACKET_SIZE (10000) decompress bound exactly
+// so a block a libRIST receiver would reject as oversized is rejected here too
+// (and a hostile compressed payload cannot force an unbounded allocation).
+// Legitimate media payloads are far smaller (LZ4 is applied on send only when it
+// shrinks the payload, so the decompressed size never exceeds the original
+// ~MTU-sized packet).
+const maxAdvDecompressed = 10000
 
 // advCodec is the stateful Advanced-profile codec for one direction of a flow.
 // It is the analog of mainCodec, gathered into a struct because the Advanced

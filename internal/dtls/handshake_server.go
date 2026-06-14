@@ -3,6 +3,7 @@ package dtls
 import (
 	"crypto/ecdsa"
 	"crypto/hmac"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -177,8 +178,17 @@ func (c *Conn) serverHandshake() error {
 					return err
 				}
 			} else {
-				if _, err := parseClientKeyExchangePSK(msg.body); err != nil {
+				identity, err := parseClientKeyExchangePSK(msg.body)
+				if err != nil {
 					return err
+				}
+				// The shared PSK is the real authenticator (a wrong key fails at
+				// Finished), but when a PSK identity is configured, reject a
+				// mismatched client identity early — it signals a wrong or
+				// misconfigured peer. Constant-time to avoid leaking the identity.
+				if len(cfg.PSKIdentity) > 0 && subtle.ConstantTimeCompare(identity, cfg.PSKIdentity) != 1 {
+					c.sendAlert(alertHandshakeFailure)
+					return errors.New("rist: dtls: client PSK identity does not match configured identity")
 				}
 				pms = pskPremaster(cfg.PSK)
 			}

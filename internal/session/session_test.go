@@ -141,3 +141,14 @@ func TestTimerWheel(t *testing.T) {
 		t.Fatalf("re-armed earliest = (%v, %d), want (TimerPlayout, 10)", id, deadline)
 	}
 }
+
+// TestPublishStatsZeroAlloc gates the per-input stats publish at zero
+// allocations: afterInput runs publishStats after every media packet on the hot
+// loop, so it must not heap-allocate (CLAUDE.md alloc gate on hot paths). A bare
+// (unstarted) Session is used so the call is single-threaded and race-free.
+func TestPublishStatsZeroAlloc(t *testing.T) {
+	s := &Session{flow: flow.New(flow.RoleReceiver, flow.Config{})}
+	if allocs := testing.AllocsPerRun(200, s.publishStats); allocs != 0 {
+		t.Errorf("publishStats allocs/op = %v, want 0", allocs)
+	}
+}

@@ -403,3 +403,43 @@ func ParseVSFProto(b []byte) (VSFProto, int, error) {
 	}
 	return v, VSFProtoSize, nil
 }
+
+// BufferNegotiationSize is the wire size of a buffer-negotiation message body:
+// three 16-bit big-endian fields (libRIST rist_buffer_negotiation).
+const BufferNegotiationSize = 6
+
+// BufferNegotiation is the VSF buffer-negotiation control message (VSF subtype
+// 0x8002, GRE version >= 2): each peer advertises the maximum buffer it allows
+// as a sender and the buffer it currently uses as a receiver, so the two ends
+// converge on a recovery-window size (libRIST rist_buffer_negotiation).
+type BufferNegotiation struct {
+	// SenderMaxMs is the maximum buffer (ms) this device allows as a sender;
+	// 0 means the device is not a sender (it cannot send media).
+	SenderMaxMs uint16
+	// ReceiverCurMs is this device's current receiver buffer (ms); 0 means the
+	// device is not a receiver.
+	ReceiverCurMs uint16
+	// ProtoType scopes the negotiation; 0 applies to the whole session.
+	ProtoType uint16
+}
+
+// AppendTo appends the 6-byte big-endian buffer-negotiation body to dst.
+func (b BufferNegotiation) AppendTo(dst []byte) []byte {
+	dst = binary.BigEndian.AppendUint16(dst, b.SenderMaxMs)
+	dst = binary.BigEndian.AppendUint16(dst, b.ReceiverCurMs)
+	dst = binary.BigEndian.AppendUint16(dst, b.ProtoType)
+	return dst
+}
+
+// ParseBufferNegotiation decodes a buffer-negotiation body from b. It never
+// panics on arbitrary input.
+func ParseBufferNegotiation(b []byte) (BufferNegotiation, error) {
+	if len(b) < BufferNegotiationSize {
+		return BufferNegotiation{}, fmt.Errorf("%w: %d < %d bytes for buffer negotiation", ErrShortBuffer, len(b), BufferNegotiationSize)
+	}
+	return BufferNegotiation{
+		SenderMaxMs:   binary.BigEndian.Uint16(b[0:2]),
+		ReceiverCurMs: binary.BigEndian.Uint16(b[2:4]),
+		ProtoType:     binary.BigEndian.Uint16(b[4:6]),
+	}, nil
+}

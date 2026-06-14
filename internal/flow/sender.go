@@ -66,6 +66,12 @@ type senderState struct {
 	// leave on. Single-path this stage (always 0); multi-path transmission
 	// (identical packets on N paths) is bonding's job (WP8).
 	txPath uint8
+
+	// dataBW and retryBW are the 1/8-weight bitrate EWMAs that drive the
+	// recovery_maxbitrate pacing gate: dataBW is fed every first transmission,
+	// retryBW every emitted retransmission (libRIST's cli_bw / retry_bw).
+	dataBW  bitrateEWMA
+	retryBW bitrateEWMA
 }
 
 // pushApp is the sender-role body of PushApp: assign the next sequence, store
@@ -113,6 +119,7 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 			PathID:     s.txPath,
 		},
 	})
+	s.dataBW.feed(now, wireBytes(len(payload))) // recovery_maxbitrate data-rate EWMA
 	f.stats.Sent++
 }
 
@@ -145,16 +152,24 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 // retransmit is emitted within the same call, so last_retry_request alone is
 // the gate.
 //
-// DEVIATION(librist): the recovery_maxbitrate bandwidth
-// gate is not replicated. It requires a time-windowed bitrate estimator and
-// is a rate-limit refinement, not an ARQ-correctness property; it is deferred
-// (host-level, with the rest of congestion control) just as the receiver
-// defers SR-based offset refinement to WP4. min_retries is likewise unused on
-// the sender — libRIST validates it at config time but never consults it in
-// the retransmit decision.
+// Congestion control (libRIST congestion_control): before emitting a
+// retransmit the sender checks the recovery_maxbitrate bandwidth gate
+// (data-rate + retry-rate vs recovery_maxbitrate*1000); over budget, the entry
+// is left resendable and counted in BandwidthSkipped (libRIST's bandwidth_skip,
+// which does NOT advance transmit_count). The number of retransmits actually
+// emitted in one pass is capped at maxNacksPerLoop (libRIST sender_send_nacks);
+// remaining sequences are dropped this pass and re-NACKed by the receiver.
+// min_retries is unused on the sender — libRIST validates it at config time but
+// never consults it in the retransmit decision.
 func (f *Flow) serviceNack(now clock.Timestamp, req wire.NackRequest) {
 	s := &f.sender
 	rtt := f.est.LastClamped(f.cfg.RTTMin, f.cfg.RTTMax)
+	// Refresh the bitrate windows so a stale-but-high estimate decays even when
+	// no new bytes have flowed since the last pass (libRIST refreshes with len 0
+	// at the top of rist_retry_dequeue).
+	s.dataBW.feed(now, 0)
+	s.retryBW.feed(now, 0)
+	emitted := 0
 	for _, missing := range req.Missing {
 		sl := &s.ring[missing&s.mask]
 		switch {
@@ -164,6 +179,11 @@ func (f *Flow) serviceNack(now clock.Timestamp, req wire.NackRequest) {
 			f.stats.RetransmitSuppressed++
 		case sl.transmitCount >= f.cfg.MaxRetries:
 			f.stats.RetransmitExhausted++
+		case overBudget(f.cfg.CongestionControl, &s.dataBW, &s.retryBW, f.cfg.RecoveryMaxBitrate):
+			// Over the recovery_maxbitrate ceiling: refuse without advancing the
+			// retry state, so the receiver re-NACKs and we accept it once the
+			// rate decays (libRIST returns before touching transmit_count).
+			f.stats.BandwidthSkipped++
 		default:
 			sl.lastRetry = now
 			sl.retried = true
@@ -179,7 +199,12 @@ func (f *Flow) serviceNack(now clock.Timestamp, req wire.NackRequest) {
 					PathID:     s.txPath,
 				},
 			})
+			s.retryBW.feed(now, wireBytes(len(sl.payload)))
 			f.stats.Retransmitted++
+			emitted++
+			if emitted >= f.maxNacksPerLoop {
+				return // per-pass retransmit budget exhausted; receiver re-NACKs the rest
+			}
 		}
 	}
 }

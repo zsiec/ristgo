@@ -124,6 +124,13 @@ type NackRequest struct {
 // can measure round-trip time. On the Simple and Main profile wire it is an
 // RTCP APP packet (PT 204, name "RIST", subtype 2).
 type RttEchoRequest struct {
+	// SSRC is the requester's "SSRC of media source". On an inbound request it
+	// is the peer's SSRC, captured by the codec; the responder MUST copy it into
+	// the matching RttEchoResponse, because a libRIST requester drops any echo
+	// response whose SSRC differs from its own peer_ssrc. On a request the local
+	// flow originates it is left zero and the codec fills the local SSRC.
+	SSRC uint32
+
 	// Timestamp is the requester's clock sample in NTP-64-compatible units,
 	// echoed back verbatim in the matching RttEchoResponse.
 	Timestamp uint64
@@ -133,6 +140,12 @@ type RttEchoRequest struct {
 // wire it is an RTCP APP packet (PT 204, name "RIST", subtype 3). The
 // requester computes RTT as (now − Timestamp) − ProcessingDelay.
 type RttEchoResponse struct {
+	// SSRC is the requester's "SSRC of media source", copied verbatim from the
+	// RttEchoRequest. It MUST equal the requester's SSRC: a libRIST requester
+	// drops any echo response whose SSRC differs from its own peer_ssrc, so
+	// stamping the responder's own SSRC here silently breaks RTT measurement.
+	SSRC uint32
+
 	// Timestamp is the requester's original timestamp, echoed verbatim
 	// from the RttEchoRequest.
 	Timestamp uint64

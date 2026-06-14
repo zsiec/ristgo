@@ -61,10 +61,14 @@
 //     full cleartext header (Hash zeroed) in aad.
 //
 //  3. The AES-CTR-HMAC HMAC key. TR-06-3 §8.1 does not name a separate
-//     authentication key, so we use the PBKDF2-derived AES key directly as the
-//     HMAC-SHA256 key. The order is encrypt-then-MAC (§8.1: "encryption shall
-//     be applied before authentication"): HMAC input = aad || ciphertext, then
-//     truncate the 32-byte HMAC to the 16-byte Hash field. INTERPRETED.
+//     authentication key. Rather than reuse the AES-CTR key as the HMAC key (a
+//     key-separation anti-pattern), we derive an INDEPENDENT HMAC-SHA256 key by
+//     expanding the AES-CTR key with a distinct label (deriveMACKey, an
+//     HKDF-Expand-style step). The order is encrypt-then-MAC (§8.1: "encryption
+//     shall be applied before authentication"): HMAC input = aad || ciphertext,
+//     then truncate the 32-byte HMAC to the 16-byte Hash field. INTERPRETED —
+//     mode 3 is unimplemented by libRIST, so this two-key construction is
+//     ristgo-internal until a reference or the full §5.2.5 detail fixes it.
 //
 // Key derivation is the one CERTAIN piece of the framing: PBKDF2-HMAC-SHA256
 // over the passphrase salted by the 4-byte PSK Nonce, 1024 iterations, derived
@@ -189,11 +193,12 @@ func SealAdvanced(mode PSKMode, password []byte, keyBits int, nonce4 [NonceSize]
 	}
 	switch mode {
 	case PSKModeAESCTRHMAC:
+		macKey := deriveMACKey(key)
 		ct, cerr := ctrXOR(key, BuildIV(iv4), plaintext)
 		if cerr != nil {
 			return nil, hash, cerr
 		}
-		hash = hmacTag(key, aad, ct)
+		hash = hmacTag(macKey, aad, ct)
 		return ct, hash, nil
 	case PSKModeAESGCM:
 		return sealGCM(key, aeadNonce(iv4), aad, plaintext)
@@ -225,8 +230,10 @@ func OpenAdvanced(mode PSKMode, password []byte, keyBits int, nonce4 [NonceSize]
 	switch mode {
 	case PSKModeAESCTRHMAC:
 		// Encrypt-then-MAC means verify-then-decrypt: recompute the HMAC over the
-		// ciphertext and compare in constant time before touching the keystream.
-		want := hmacTag(key, aad, ciphertext)
+		// ciphertext (with the independent MAC key) and compare in constant time
+		// before touching the keystream.
+		macKey := deriveMACKey(key)
+		want := hmacTag(macKey, aad, ciphertext)
 		if subtle.ConstantTimeCompare(want[:], hash[:]) != 1 {
 			return nil, ErrAuthFailed
 		}
@@ -251,9 +258,28 @@ func deriveAEADKey(mode PSKMode, password []byte, nonce4 [NonceSize]byte, keyBit
 	return DeriveKey(password, nonce4[:], keyBits)
 }
 
+// macKeyLabel domain-separates the AES-CTR-HMAC authentication key from the
+// encryption key in deriveMACKey.
+var macKeyLabel = []byte("rist-adv-aes-ctr-hmac-auth-key")
+
+// deriveMACKey derives the independent HMAC-SHA256 authentication key for
+// AES-CTR-HMAC mode by expanding the AES-CTR encryption key with a distinct
+// label (an HKDF-Expand-style step). Reusing one key for both the cipher and the
+// MAC is a key-separation anti-pattern; this keeps them independent (recovering
+// the MAC key does not reveal the cipher key, and vice versa). Mode 3 is not
+// implemented by libRIST and is interop-unvalidated, so this two-key
+// construction is ristgo-internal until a spec or interop oracle fixes the
+// intended derivation.
+func deriveMACKey(encKey []byte) []byte {
+	mac := hmac.New(sha256.New, encKey)
+	mac.Write(macKeyLabel)
+	return mac.Sum(nil)
+}
+
 // hmacTag computes the AES-CTR-HMAC authentication value: HMAC-SHA256 over
-// aad || ciphertext keyed by the PBKDF2-derived key, truncated to the 16-byte
-// Hash field (encrypt-then-MAC; see the package interop note, interpretation 3).
+// aad || ciphertext keyed by the independent MAC key (deriveMACKey), truncated
+// to the 16-byte Hash field (encrypt-then-MAC; see the package interop note,
+// interpretation 3).
 func hmacTag(key, aad, ciphertext []byte) [HashSize]byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write(aad)

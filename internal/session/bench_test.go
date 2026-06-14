@@ -3,6 +3,7 @@ package session
 import (
 	"testing"
 
+	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/wire"
 )
 
@@ -82,4 +83,41 @@ func BenchmarkDecodeMedia(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// TestEncodeMainMediaZeroAlloc gates the Main-profile media encode path —
+// cleartext and PSK-encrypted — at zero steady-state allocations into a reused
+// buffer. Unlike the Simple path it was previously allocating 1 (cleartext) to
+// 3 (encrypted) buffers per packet; the codec now reuses scratch buffers.
+func TestEncodeMainMediaZeroAlloc(t *testing.T) {
+	pkt := benchPacket()
+	dst := make([]byte, 0, 2048)
+
+	run := func(name string, c *mainCodec) {
+		for i := 0; i < 4; i++ { // warm the scratch buffers
+			out, err := c.encodeMainMedia(dst[:0], pkt)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			dst = out
+		}
+		allocs := testing.AllocsPerRun(1000, func() {
+			out, err := c.encodeMainMedia(dst[:0], pkt)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			dst = out
+		})
+		if allocs != 0 {
+			t.Errorf("%s Main encode allocates %v/op, want 0", name, allocs)
+		}
+	}
+
+	run("cleartext", newMainCodec(nil, nil, false, 1971, 1968, false, 0x0ACE_0AC0, "x", false))
+
+	key, err := crypto.NewKey([]byte("a-shared-secret"), crypto.KeySize128, 0, false)
+	if err != nil {
+		t.Fatalf("NewKey: %v", err)
+	}
+	run("encrypted", newMainCodec(key, nil, true, 1971, 1968, false, 0x0ACE_0AC0, "x", false))
 }

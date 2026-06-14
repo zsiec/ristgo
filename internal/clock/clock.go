@@ -35,6 +35,24 @@ func (c *RealClock) Now() Timestamp {
 	return Timestamp(time.Since(c.epoch).Microseconds())
 }
 
+// WallNTP maps a monotonic Timestamp (microseconds since this clock's epoch)
+// to an absolute wall-clock NTP-64 value (seconds since 1900-01-01). RTCP
+// Sender Reports require the NTP field to be real wall-clock time (RFC 3550) so
+// a peer — e.g. a libRIST receiver in RTC timing mode — can convert RTP
+// timestamps to wall time. The session-relative NTPTimeFromTimestamp form is
+// valid only for the RTT echo round trip, where the epoch cancels.
+func (c *RealClock) WallNTP(ts Timestamp) NTPTime {
+	return NTPTimeFromTime(c.epoch.Add(time.Duration(ts) * time.Microsecond))
+}
+
+// WallClocker is a Clock that can also report absolute wall-clock NTP time for
+// a monotonic Timestamp. RealClock implements it; deterministic test clocks
+// need not, in which case callers fall back to a session-relative value.
+type WallClocker interface {
+	Clock
+	WallNTP(Timestamp) NTPTime
+}
+
 // MockClock is a clock for testing that advances only when told to.
 type MockClock struct {
 	now Timestamp

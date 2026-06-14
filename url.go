@@ -51,16 +51,31 @@ func ParseURL(rawURL string, cfg Config) (addr string, out Config, err error) {
 
 // applyQuery folds URL query parameters into cfg.
 func applyQuery(cfg *Config, q url.Values) error {
+	// maxURLMillis bounds a millisecond-valued query parameter. It is far above
+	// any sane RIST timing value (one week) yet far below the point where
+	// n*time.Millisecond would overflow int64 nanoseconds (~9.2e12 ms) and wrap
+	// to a value that could slip past the range checks in validate().
+	const maxURLMillis = 7 * 24 * 3600 * 1000
+	parseMillis := func(key, v string) (time.Duration, error) {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s=%q is not an integer", ErrInvalidConfig, key, v)
+		}
+		if n < 0 || n > maxURLMillis {
+			return 0, fmt.Errorf("%w: %s=%q out of range (0..%d ms)", ErrInvalidConfig, key, v, maxURLMillis)
+		}
+		return time.Duration(n) * time.Millisecond, nil
+	}
 	ms := func(key string, dst *time.Duration) error {
 		v := q.Get(key)
 		if v == "" {
 			return nil
 		}
-		n, err := strconv.Atoi(v)
+		d, err := parseMillis(key, v)
 		if err != nil {
-			return fmt.Errorf("%w: %s=%q is not an integer", ErrInvalidConfig, key, v)
+			return err
 		}
-		*dst = time.Duration(n) * time.Millisecond
+		*dst = d
 		return nil
 	}
 	intVal := func(key string, dst *int) error {
@@ -81,20 +96,20 @@ func applyQuery(cfg *Config, q url.Values) error {
 	// net/url discards order, so ristgo always lets the explicit -min/-max
 	// win — a documented simplification.)
 	if v := q.Get("buffer"); v != "" {
-		n, err := strconv.Atoi(v)
+		d, err := parseMillis("buffer", v)
 		if err != nil {
-			return fmt.Errorf("%w: buffer=%q is not an integer", ErrInvalidConfig, v)
+			return err
 		}
-		cfg.BufferMin = time.Duration(n) * time.Millisecond
-		cfg.BufferMax = cfg.BufferMin
+		cfg.BufferMin = d
+		cfg.BufferMax = d
 	}
 	if v := q.Get("rtt"); v != "" {
-		n, err := strconv.Atoi(v)
+		d, err := parseMillis("rtt", v)
 		if err != nil {
-			return fmt.Errorf("%w: rtt=%q is not an integer", ErrInvalidConfig, v)
+			return err
 		}
-		cfg.RTTMin = time.Duration(n) * time.Millisecond
-		cfg.RTTMax = cfg.RTTMin
+		cfg.RTTMin = d
+		cfg.RTTMax = d
 	}
 	for _, step := range []struct {
 		key string

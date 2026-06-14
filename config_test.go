@@ -192,7 +192,6 @@ func TestValidatePreservesExplicitValues(t *testing.T) {
 		KeyRotation:       4096,
 		Username:          "user",
 		Password:          "pass",
-		Compression:       true,
 		Weight:            5,
 	}
 	want := cfg
@@ -201,6 +200,17 @@ func TestValidatePreservesExplicitValues(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("validate() altered explicit values: got %+v, want %+v", cfg, want)
+	}
+
+	// Compression is Advanced-only, so it cannot coexist with the Main-profile
+	// credentials above; verify it survives validation under ProfileAdvanced.
+	adv := Config{Profile: ProfileAdvanced, Secret: "opensesame", AESKeyBits: 256, Compression: true}
+	wantAdv := adv
+	if err := adv.validate(); err != nil {
+		t.Fatalf("validate advanced: %v", err)
+	}
+	if adv.Compression != wantAdv.Compression {
+		t.Errorf("validate() altered Compression: got %v, want %v", adv.Compression, wantAdv.Compression)
 	}
 }
 
@@ -369,55 +379,109 @@ func TestConfigValidate(t *testing.T) {
 		{"nack negative", func(c *Config) { c.NACKType = NACKType(-1) },
 			"rist: NACKType must be NACKRange (0) or NACKBitmask (1)"},
 
-		// Secret / AESKeyBits / KeyRotation
+		// Secret / AESKeyBits / KeyRotation (require Main or Advanced)
 		{"secret with aes 128", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Secret = "opensesame"
 			c.AESKeyBits = 128
 		}, ""},
 		{"secret with aes 256", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Secret = "opensesame"
 			c.AESKeyBits = 256
 		}, ""},
-		{"secret boundary 127 bytes", func(c *Config) { c.Secret = strings.Repeat("s", 127) }, ""},
-		{"secret too long", func(c *Config) { c.Secret = strings.Repeat("s", 128) },
-			"rist: Secret must be at most 127 bytes"},
+		{"secret on advanced", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.Secret = "opensesame"
+		}, ""},
+		{"secret boundary 127 bytes", func(c *Config) {
+			c.Profile = ProfileMain
+			c.Secret = strings.Repeat("s", 127)
+		}, ""},
+		{"secret too long", func(c *Config) {
+			c.Profile = ProfileMain
+			c.Secret = strings.Repeat("s", 128)
+		}, "rist: Secret must be at most 127 bytes"},
 		{"aes 192 rejected", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Secret = "opensesame"
 			c.AESKeyBits = 192
 		}, "rist: AESKeyBits must be 0, 128, or 256"},
-		{"aes bits without secret", func(c *Config) { c.AESKeyBits = 128 },
-			"rist: AESKeyBits requires a Secret"},
+		{"aes bits without secret", func(c *Config) {
+			c.Profile = ProfileMain
+			c.AESKeyBits = 128
+		}, "rist: AESKeyBits requires a Secret"},
 		{"key rotation with secret", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Secret = "opensesame"
 			c.KeyRotation = 4096
 		}, ""},
-		{"key rotation negative", func(c *Config) { c.KeyRotation = -1 },
-			"rist: KeyRotation must be at least 0 (packets per key)"},
+		{"key rotation negative", func(c *Config) {
+			c.Profile = ProfileMain
+			c.Secret = "opensesame"
+			c.KeyRotation = -1
+		}, "rist: KeyRotation must be at least 0 (packets per key)"},
 
-		// Username / Password
+		// Profile-capability gate: security/feature fields fail closed on the
+		// wrong profile instead of being silently dropped (the WithSecret-on-
+		// Simple cleartext footgun).
+		{"secret on simple rejected", func(c *Config) { c.Secret = "opensesame" },
+			"rist: Secret (PSK encryption) requires ProfileMain or ProfileAdvanced; the Simple profile transmits in the clear"},
+		{"aes on simple rejected", func(c *Config) { c.AESKeyBits = 128 },
+			"rist: AESKeyBits requires ProfileMain or ProfileAdvanced"},
+		{"key rotation on simple rejected", func(c *Config) { c.KeyRotation = 4096 },
+			"rist: KeyRotation requires ProfileMain or ProfileAdvanced"},
+
+		// Username / Password (require Main)
 		{"srp credentials", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Username = "user"
 			c.Password = "pass"
 		}, ""},
-		{"username without password", func(c *Config) { c.Username = "user" },
-			"rist: Username and Password must be set together"},
-		{"password without username", func(c *Config) { c.Password = "pass" },
-			"rist: Username and Password must be set together"},
+		{"username without password", func(c *Config) {
+			c.Profile = ProfileMain
+			c.Username = "user"
+		}, "rist: Username and Password must be set together"},
+		{"password without username", func(c *Config) {
+			c.Profile = ProfileMain
+			c.Password = "pass"
+		}, "rist: Username and Password must be set together"},
 		{"username boundary 255 bytes", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Username = strings.Repeat("u", 255)
 			c.Password = "pass"
 		}, ""},
 		{"username too long", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Username = strings.Repeat("u", 256)
 			c.Password = "pass"
 		}, "rist: Username must be at most 255 bytes"},
 		{"password too long", func(c *Config) {
+			c.Profile = ProfileMain
 			c.Username = "user"
 			c.Password = strings.Repeat("p", 256)
 		}, "rist: Password must be at most 255 bytes"},
+		{"credentials on simple rejected", func(c *Config) {
+			c.Username = "user"
+			c.Password = "pass"
+		}, "rist: Username/Password (EAP-SRP authentication) requires ProfileMain"},
+		{"credentials on advanced rejected", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.Username = "user"
+			c.Password = "pass"
+		}, "rist: Username/Password (EAP-SRP authentication) requires ProfileMain"},
 
 		// Compression / Weight
-		{"compression enabled", func(c *Config) { c.Compression = true }, ""},
+		{"compression enabled", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.Compression = true
+		}, ""},
+		{"compression on simple rejected", func(c *Config) { c.Compression = true },
+			"rist: Compression requires ProfileAdvanced"},
+		{"compression on main rejected", func(c *Config) {
+			c.Profile = ProfileMain
+			c.Compression = true
+		}, "rist: Compression requires ProfileAdvanced"},
 		{"weight positive", func(c *Config) { c.Weight = 5 }, ""},
 		{"weight negative", func(c *Config) { c.Weight = -1 },
 			"rist: Weight must be at least 0 (0 = duplicate)"},
@@ -477,7 +541,7 @@ func TestValidateErrorPrefix(t *testing.T) {
 // TestSecretDefaultsAESKeyBits verifies the libRIST behavior of assuming
 // the maximum key size when a secret is supplied without aes-type.
 func TestSecretDefaultsAESKeyBits(t *testing.T) {
-	cfg := Config{Secret: "opensesame"}
+	cfg := Config{Profile: ProfileMain, Secret: "opensesame"}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -486,7 +550,7 @@ func TestSecretDefaultsAESKeyBits(t *testing.T) {
 	}
 
 	// An explicit value must be preserved.
-	cfg = Config{Secret: "opensesame", AESKeyBits: 128}
+	cfg = Config{Profile: ProfileMain, Secret: "opensesame", AESKeyBits: 128}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}

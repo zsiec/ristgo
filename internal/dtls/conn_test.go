@@ -226,3 +226,107 @@ func TestHandshakePreferCert(t *testing.T) {
 	}
 	exchange(t, client, server)
 }
+
+// dropEpoch1Once wraps a Transport and silently drops the first datagram that
+// carries an epoch-1 (encrypted) record — the server's Flight 6 Finished — to
+// exercise RFC 6347 §4.2.4 last-flight retransmission.
+type dropEpoch1Once struct {
+	Transport
+	mu   sync.Mutex
+	done bool
+}
+
+func recordsContainEpoch1(b []byte) bool {
+	for len(b) >= 13 {
+		epoch := uint16(b[3])<<8 | uint16(b[4])
+		length := int(b[11])<<8 | int(b[12])
+		if epoch != 0 {
+			return true
+		}
+		if 13+length > len(b) {
+			break
+		}
+		b = b[13+length:]
+	}
+	return false
+}
+
+func (d *dropEpoch1Once) Write(b []byte) (int, error) {
+	d.mu.Lock()
+	drop := !d.done && recordsContainEpoch1(b)
+	if drop {
+		d.done = true
+	}
+	d.mu.Unlock()
+	if drop {
+		return len(b), nil // pretend sent; drop it
+	}
+	return d.Transport.Write(b)
+}
+
+// TestServerResendsFinalFlightOnLoss verifies that when the server's final
+// flight (CCS + Finished) is lost, the server resends it on receiving the
+// client's retransmitted flight, so the handshake completes under loss instead
+// of failing (RFC 6347 §4.2.4 last-flight handling).
+func TestServerResendsFinalFlightOnLoss(t *testing.T) {
+	ca, sa := newPipe()
+	cfg := func() *Config {
+		return &Config{
+			PSK:               []byte("a-shared-secret"),
+			PSKIdentity:       []byte("ristgo"),
+			RetransmitTimeout: 50 * time.Millisecond,
+			HandshakeTimeout:  10 * time.Second,
+		}
+	}
+	client := Client(ca, cfg())
+	server := Server(&dropEpoch1Once{Transport: sa}, cfg())
+
+	serverDone := make(chan error, 1)
+	go func() {
+		if err := server.Handshake(); err != nil {
+			serverDone <- err
+			return
+		}
+		// Read so readAppRecords can resend the dropped final flight when the
+		// client retransmits its flight.
+		buf := make([]byte, 4096)
+		_, err := server.Read(buf)
+		serverDone <- err
+	}()
+
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client handshake failed (server did not resend final flight): %v", err)
+	}
+	if _, err := client.Write([]byte("ok")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+// TestPSKIdentityMismatchRejected verifies the server rejects a client whose PSK
+// identity does not match the configured one, even though the PSK itself is
+// shared (the identity is validated as defense-in-depth before the key).
+func TestPSKIdentityMismatchRejected(t *testing.T) {
+	ca, sa := newPipe()
+	cfg := func(id string) *Config {
+		return &Config{
+			PSK:               []byte("a-shared-secret"),
+			PSKIdentity:       []byte(id),
+			RetransmitTimeout: 50 * time.Millisecond,
+			HandshakeTimeout:  3 * time.Second,
+		}
+	}
+	client := Client(ca, cfg("wrong-identity"))
+	server := Server(sa, cfg("expected-identity"))
+
+	var serr error
+	done := make(chan struct{})
+	go func() { serr = server.Handshake(); close(done) }()
+	cerr := client.Handshake()
+	<-done
+	if cerr == nil && serr == nil {
+		t.Fatal("handshake succeeded despite a PSK identity mismatch")
+	}
+}

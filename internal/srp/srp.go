@@ -268,17 +268,17 @@ func MakeVerifier(g *Group, username, password string, salt []byte) []byte {
 	return v.Bytes()
 }
 
-// readSecret draws a per-handshake secret in [0, N) from src. libRIST uses
-// BIGNUM_RANDOM(num, &N) (an integer uniformly in [0, N)). We draw len(N)
-// random bytes and reduce mod N, which is
-// indistinguishable in practice for a 2048-bit N and never produces a value
-// outside [0, N).
+// readSecret draws a per-handshake secret uniformly in [0, N) from src, matching
+// libRIST's BIGNUM_RANDOM(num, &N). It uses crypto/rand.Int's rejection sampling
+// rather than draw-and-reduce-mod-N, which would skew the distribution toward the
+// low end of the range (a small bias for a 2048-bit N, but the unbiased draw is
+// free here).
 func readSecret(src io.Reader, n *big.Int) (*big.Int, error) {
-	buf := make([]byte, (n.BitLen()+7)/8)
-	if _, err := io.ReadFull(src, buf); err != nil {
+	v, err := rand.Int(src, n)
+	if err != nil {
 		return nil, errors.Join(ErrCSPRNG, err)
 	}
-	return new(big.Int).Mod(new(big.Int).SetBytes(buf), n), nil
+	return v, nil
 }
 
 // Client is an SRP-6a authenticatee. It holds the group, salt, the

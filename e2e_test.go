@@ -174,15 +174,15 @@ func TestE2ECloseUnblocksRead(t *testing.T) {
 	}
 	select {
 	case err := <-readErr:
-		if err != ristgo.ErrClosed {
-			t.Fatalf("Read after Close = %v, want ErrClosed", err)
+		if err != io.EOF {
+			t.Fatalf("Read after Close = %v, want io.EOF", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not unblock Read")
 	}
-	// Read after close stays closed.
-	if _, err := rx.Read(make([]byte, 16)); err != ristgo.ErrClosed {
-		t.Fatalf("Read on closed receiver = %v, want ErrClosed", err)
+	// Read after a clean close stays at io.EOF.
+	if _, err := rx.Read(make([]byte, 16)); err != io.EOF {
+		t.Fatalf("Read on closed receiver = %v, want io.EOF", err)
 	}
 
 	// The session's loop + reader goroutines should have exited. Allow a brief

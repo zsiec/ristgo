@@ -19,6 +19,17 @@ const handshakeHeaderLen = 12
 // message here) are a few KB; 64 KiB is generous and safe.
 const maxHandshakeBody = 1 << 16
 
+// maxPendingMessages bounds how many distinct future message_seq entries the
+// reassembler buffers ahead of the in-order delivery cursor. A DTLS flight is a
+// small, fixed number of messages (RFC 6347 §4.2.4 reassembly is windowed), so
+// a peer that declares many distinct future seqs is hostile: handshake
+// fragments arrive as unauthenticated epoch-0 plaintext, and each new seq
+// allocates up to maxHandshakeBody. Without this window a single MTU datagram
+// of fragments with distinct seqs could force megabytes of pending allocation,
+// a handshake-time memory-exhaustion DoS. With it, pending allocation is capped
+// at maxPendingMessages * maxHandshakeBody.
+const maxPendingMessages = 8
+
 // handshakeMessage is one fully reassembled handshake message.
 type handshakeMessage struct {
 	typ  handshakeType
@@ -137,6 +148,12 @@ func newReassembler() *reassembler {
 func (r *reassembler) accept(f parsedFragment) error {
 	if f.seq < r.next {
 		return nil // already delivered; ignore retransmission
+	}
+	// Drop fragments beyond the reassembly window so a hostile peer cannot pin
+	// memory by declaring many distinct future message_seq values. f.seq >= next
+	// holds here, so the uint16 gap is the simple forward distance.
+	if f.seq-r.next >= maxPendingMessages {
+		return nil
 	}
 	p := r.pending[f.seq]
 	if p == nil {

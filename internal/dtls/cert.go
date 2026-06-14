@@ -136,6 +136,12 @@ func verifyPeerCertificate(chain [][]byte, cfg *Config) (*x509.Certificate, erro
 		if got != cfg.PeerCertFingerprint {
 			return nil, fmt.Errorf("%w: fingerprint mismatch", errBadCertificate)
 		}
+		// A pin authenticates the key, but still reject an expired or
+		// not-yet-valid leaf, or a non-P-256 ECDSA key, rather than accepting any
+		// bytes whose hash matches.
+		if err := checkLeafSanity(leaf); err != nil {
+			return nil, err
+		}
 		return leaf, nil
 	}
 	if cfg.RootCAs == nil {
@@ -169,4 +175,19 @@ func signECDSA(key *ecdsa.PrivateKey, msg []byte) ([]byte, error) {
 func verifyECDSA(pub *ecdsa.PublicKey, msg, sig []byte) bool {
 	digest := sha256.Sum256(msg)
 	return ecdsa.VerifyASN1(pub, digest[:], sig)
+}
+
+// checkLeafSanity rejects a peer leaf certificate that is outside its validity
+// period or whose ECDSA key is not on P-256. It is applied on the
+// fingerprint-pin path, where the pin authenticates the key but the certificate
+// fields are otherwise unverified.
+func checkLeafSanity(leaf *x509.Certificate) error {
+	now := time.Now()
+	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+		return fmt.Errorf("%w: certificate outside its validity period", errBadCertificate)
+	}
+	if pk, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok || pk.Curve != elliptic.P256() {
+		return fmt.Errorf("%w: leaf key is not ECDSA P-256", errBadCertificate)
+	}
+	return nil
 }

@@ -198,6 +198,16 @@ func (c *Conn) processHandshakeRecord(r record) error {
 			frag = frag[n:]
 		}
 		return nil
+	case recordApplicationData:
+		// A fast peer (e.g. OpenSSL) may pipeline early application data right
+		// after its Finished, in the same or the next datagram, before our
+		// handshake read loop exits. Buffer it (subject to the replay window)
+		// instead of dropping it, so Read returns it once the handshake
+		// completes — otherwise the first payload(s) are lost.
+		if pt, ok := c.decryptRecord(r); ok {
+			c.appData = append(c.appData, pt)
+		}
+		return nil
 	default:
 		return nil
 	}

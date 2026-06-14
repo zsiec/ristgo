@@ -49,9 +49,41 @@ func TestLearnAddressesOnce(t *testing.T) {
 	if p.Media != a {
 		t.Fatalf("Media = %v, want first-learned %v", p.Media, a)
 	}
-	p.LearnRTCP(b)
-	p.LearnRTCP(a)
-	if p.RTCP != b {
-		t.Fatalf("RTCP = %v, want first-learned %v", p.RTCP, b)
+	// RTCP candidates must share the media host (10.0.0.1); LearnRTCP rejects a
+	// foreign host once media is known (see TestLearnRTCPRejectsForeignHost).
+	rtcp1 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 200}
+	rtcp2 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 300}
+	p.LearnRTCP(rtcp1)
+	p.LearnRTCP(rtcp2)
+	if p.RTCP != rtcp1 {
+		t.Fatalf("RTCP = %v, want first-learned %v", p.RTCP, rtcp1)
+	}
+}
+
+// TestLearnRTCPRejectsForeignHost verifies that once the media return address is
+// known, an RTCP source on a different host is rejected (feedback-redirection /
+// reflection guard), while a same-host RTCP source on a different port is
+// accepted.
+func TestLearnRTCPRejectsForeignHost(t *testing.T) {
+	media := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5000}
+	attacker := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 5001}
+	legit := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5001}
+
+	p := New(2000)
+	p.LearnMedia(media)
+	p.LearnRTCP(attacker)
+	if p.RTCP != nil {
+		t.Fatalf("RTCP = %v, want nil (foreign-host spoof rejected)", p.RTCP)
+	}
+	p.LearnRTCP(legit)
+	if p.RTCP != legit {
+		t.Fatalf("RTCP = %v, want %v (same-host RTCP accepted)", p.RTCP, legit)
+	}
+
+	// With no media known yet, first-source-wins still applies.
+	q := New(2000)
+	q.LearnRTCP(attacker)
+	if q.RTCP != attacker {
+		t.Fatalf("RTCP = %v, want %v (first-wins before media known)", q.RTCP, attacker)
 	}
 }

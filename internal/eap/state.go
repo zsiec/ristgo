@@ -114,6 +114,19 @@ func (a *Authenticatee) Recv(payload []byte) (out *Frame, err error) {
 	return a.handle(f)
 }
 
+// negotiatedVersion returns the EAPOL version to emit in reply to req: the peer's
+// legacy version 2 when it advertises it, otherwise the current version 3.
+// libRIST drives BOTH the on-wire version byte and the SRP hashing mode (PAD vs
+// the pre-0.2.16 unpadded k/u) from the authenticator's advertised version, so a
+// reply must echo it rather than hardcode 3 — otherwise a legacy (srp-compat=1)
+// libRIST peer cannot interoperate.
+func negotiatedVersion(req Frame) uint8 {
+	if req.Version == 2 {
+		return 2
+	}
+	return eapVersion3
+}
+
 // handle drives the authenticatee state machine for a parsed frame.
 func (a *Authenticatee) handle(f Frame) (*Frame, error) {
 	if f.Kind == KindFailure {
@@ -127,15 +140,21 @@ func (a *Authenticatee) handle(f Frame) (*Frame, error) {
 		a.state = StateFailed
 		return nil, ErrAuthFailed
 	}
-	a.id = f.Identifier // adopt the request identifier; we echo it on our reply
+	// NOTE: the request identifier is adopted into a.id only inside the cases
+	// that legitimately process a request (below), NEVER in the prologue. Doing
+	// it here would let an unauthenticated spoofed frame — a no-op SUCCESS or a
+	// rejected/unexpected frame — overwrite a.id and so defeat the
+	// stale-FAILURE-identifier gate above. libRIST hardened exactly this path
+	// (it assigns last_identifier only after subtype validation passes).
 	switch f.Kind {
 	case KindIdentityRequest:
 		// Reply with our identity (process_eap_request_identity).
+		a.id = f.Identifier // echoed on our reply; tracks the live exchange
 		if a.state == StateUnauth {
 			a.state = StateInProgress
 		}
 		out := Frame{
-			Version:    eapVersion3,
+			Version:    negotiatedVersion(f),
 			Code:       CodeResponse,
 			Identifier: f.Identifier,
 			Kind:       KindIdentityResponse,
@@ -155,16 +174,24 @@ func (a *Authenticatee) handle(f Frame) (*Frame, error) {
 			a.state = StateFailed
 			return nil, ErrBadLength
 		}
-		client, err := srp.NewClient(grp, f.Salt)
+		// The challenge's version selects the SRP hashing mode for the rest of
+		// the handshake: legacy (pre-0.2.16, unpadded k/u) for version 2, the
+		// PAD-compliant mode for version 3 (libRIST process_eap_request_srp_challenge).
+		newClient := srp.NewClient
+		if negotiatedVersion(f) == 2 {
+			newClient = srp.NewClientLegacy
+		}
+		client, err := newClient(grp, f.Salt)
 		if err != nil {
 			a.state = StateFailed
 			return nil, errors.Join(ErrSRP, err)
 		}
+		a.id = f.Identifier // adopt only now that the challenge is accepted
 		a.client = client
 		a.salt = f.Salt
 		a.state = StateInProgress
 		out := Frame{
-			Version:    eapVersion3,
+			Version:    negotiatedVersion(f),
 			Code:       CodeResponse,
 			Identifier: f.Identifier,
 			Kind:       KindClientKey,
@@ -179,13 +206,14 @@ func (a *Authenticatee) handle(f Frame) (*Frame, error) {
 			a.state = StateFailed
 			return nil, ErrUnexpected
 		}
+		a.id = f.Identifier // adopt only now that the frame is in-sequence
 		if err := a.client.ComputeKey(f.Public, a.username, a.password); err != nil {
 			// libRIST treats a bad B as a permanent failure.
 			a.state = StateFailed
 			return nil, errors.Join(ErrSRP, err)
 		}
 		out := Frame{
-			Version:    eapVersion3,
+			Version:    negotiatedVersion(f),
 			Code:       CodeResponse,
 			Identifier: f.Identifier,
 			Kind:       KindClientValidator,
@@ -200,6 +228,7 @@ func (a *Authenticatee) handle(f Frame) (*Frame, error) {
 			a.state = StateFailed
 			return nil, ErrAuthFailed
 		}
+		a.id = f.Identifier // adopt only now that the frame is in-sequence
 		if !a.client.VerifyM2(f.Proof) {
 			a.state = StateFailed
 			return nil, ErrAuthFailed
@@ -210,7 +239,7 @@ func (a *Authenticatee) handle(f Frame) (*Frame, error) {
 		// identifier. This is what drives the authenticator to its terminal
 		// SUCCESS; without it the peer waits on its retransmit timer.
 		ack := Frame{
-			Version:    eapVersion3,
+			Version:    negotiatedVersion(f),
 			Code:       CodeSuccess,
 			Identifier: f.Identifier,
 			Kind:       KindSuccess,
@@ -315,17 +344,31 @@ func (a *Authenticator) Recv(payload []byte) (out *Frame, err error) {
 // handle drives the authenticator state machine for a parsed frame.
 func (a *Authenticator) handle(f Frame) (*Frame, error) {
 	// Reject a RESPONSE or FAILURE whose identifier does not match the request we
-	// last issued. KindStart opens the exchange and carries no meaningful
-	// identifier, so it is exempt.
-	if a.state != StateUnauth && f.Kind != KindStart && f.Identifier != a.id {
+	// last issued. KindStart and KindLogoff open/close the exchange and carry no
+	// meaningful identifier, so they are exempt.
+	if a.state != StateUnauth && f.Kind != KindStart && f.Kind != KindLogoff && f.Identifier != a.id {
 		return nil, nil
 	}
 	switch f.Kind {
 	case KindStart:
 		// A client EAPOL-START prompts an IDENTITY REQUEST
-		// (eap_process_eapol EAPOL_TYPE_START).
+		// (eap_process_eapol EAPOL_TYPE_START). Once the SRP exchange has begun
+		// (a.server set), ignore a further START so a spoofed mid-handshake START
+		// cannot reset the live exchange (libRIST's !last_pkt guard).
+		if a.server != nil {
+			return nil, nil
+		}
 		out := a.Start()
 		return &out, nil
+
+	case KindLogoff:
+		// EAPOL-LOGOFF tears the authentication down to the unauthenticated
+		// state rather than being an error (libRIST resets to UNAUTH).
+		a.state = StateUnauth
+		a.server = nil
+		a.session = nil
+		a.verified = false
+		return nil, nil
 
 	case KindIdentityResponse:
 		// Look up the verifier and send CHALLENGE
@@ -415,6 +458,7 @@ func (a *Authenticator) handle(f Frame) (*Frame, error) {
 		// (process_eap_response_srp_server_validator).
 		if a.verified {
 			a.state = StateSuccess
+			a.id++ // ctx->last_identifier++ on terminal SUCCESS
 		}
 		return nil, nil
 

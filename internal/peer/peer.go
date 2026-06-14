@@ -39,11 +39,22 @@ func (p *Peer) LearnMedia(addr *net.UDPAddr) {
 	}
 }
 
-// LearnRTCP records the peer's RTCP return address if not already known.
+// LearnRTCP records the peer's RTCP return address if not already known. When
+// the media return address is already known, it only accepts an RTCP source on
+// the same host (matching IP): a RIST sender's RTCP and media originate from one
+// host (the source ports may differ, the IP does not), so this rejects an
+// off-path datagram spoofed to the RTCP port that would otherwise redirect the
+// receiver's NACK/RR feedback to a victim address — a low-factor reflection
+// vector. Until media is known there is nothing to validate against, so
+// first-source-wins applies (as it must, the session is still forming).
 func (p *Peer) LearnRTCP(addr *net.UDPAddr) {
-	if p.RTCP == nil {
-		p.RTCP = addr
+	if p.RTCP != nil {
+		return
 	}
+	if p.Media != nil && addr != nil && !p.Media.IP.Equal(addr.IP) {
+		return // RTCP source on a different host than media: reject as a spoof
+	}
+	p.RTCP = addr
 }
 
 // Observe marks that traffic arrived from the peer at instant now, resetting

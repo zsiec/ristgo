@@ -154,7 +154,9 @@ func encodeFeedback(dst []byte, lead rtcp.Packet, ssrc uint32, cname string, fbs
 		switch f := fb.(type) {
 		case wire.NackRequest:
 			if bitmask {
-				for _, p := range rtcp.EncodeBitmaskNACK(ssrc, f.SSRC, f.Missing) {
+				// SenderSSRC is zero: TR-06-1 §5.3.2.1 has the RIST sender
+				// ignore it and libRIST transmits zero, so match it on the wire.
+				for _, p := range rtcp.EncodeBitmaskNACK(0, f.SSRC, f.Missing) {
 					nacks = append(nacks, p)
 				}
 			} else {
@@ -163,9 +165,14 @@ func encodeFeedback(dst []byte, lead rtcp.Packet, ssrc uint32, cname string, fbs
 				}
 			}
 		case wire.RttEchoRequest:
+			// A request the local flow originates carries no SSRC (zero); stamp
+			// the local SSRC so the peer's response filter accepts our request's
+			// echo. (An inbound request never reaches the encoder.)
 			echoes = append(echoes, rtcp.EchoRequest{SSRC: ssrc, Timestamp: f.Timestamp})
 		case wire.RttEchoResponse:
-			echoes = append(echoes, rtcp.EchoResponse{SSRC: ssrc, Timestamp: f.Timestamp, ProcessingDelay: f.ProcessingDelay})
+			// Echo the requester's SSRC (captured on decode), not our own: a
+			// libRIST requester drops a response whose SSRC != its peer_ssrc.
+			echoes = append(echoes, rtcp.EchoResponse{SSRC: f.SSRC, Timestamp: f.Timestamp, ProcessingDelay: f.ProcessingDelay})
 		}
 	}
 	pkts = append(pkts, nacks...)
@@ -191,9 +198,9 @@ func decodeFeedback(b []byte, nackRef uint32) ([]wire.Feedback, error) {
 		case rtcp.BitmaskNACK:
 			out = append(out, nackToWire(pk.MediaSSRC, pk.MissingSeqs(), nackRef))
 		case rtcp.EchoRequest:
-			out = append(out, wire.RttEchoRequest{Timestamp: pk.Timestamp})
+			out = append(out, wire.RttEchoRequest{SSRC: pk.SSRC, Timestamp: pk.Timestamp})
 		case rtcp.EchoResponse:
-			out = append(out, wire.RttEchoResponse{Timestamp: pk.Timestamp, ProcessingDelay: pk.ProcessingDelay})
+			out = append(out, wire.RttEchoResponse{SSRC: pk.SSRC, Timestamp: pk.Timestamp, ProcessingDelay: pk.ProcessingDelay})
 		case rtcp.LinkQualityReport:
 			// Source adaptation (TR-06-4 Part 1): the LQM rides as an RR
 			// profile-specific extension; cross the waist as wire.LinkQuality so

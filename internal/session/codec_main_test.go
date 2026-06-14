@@ -527,3 +527,115 @@ func TestMainExtPayloadBridge(t *testing.T) {
 		t.Fatalf("ext round-trip %+v != %+v", got, ext)
 	}
 }
+
+// TestDecodeMainVSFWrapper verifies the Main decoder unwraps the version-2 VSF
+// proto: a VSF-wrapped REDUCED media datagram decodes as media, and a
+// keepalive/buffer-negotiation subtype is accepted (no error, not media)
+// instead of being dropped as an undecodable "want reduced" datagram.
+func TestDecodeMainVSFWrapper(t *testing.T) {
+	const ssrc = 0x0BAD_F00E
+	enc, dec := newCodecPair(t, 0, false, ssrc) // cleartext
+
+	// Encode a normal (v1, reduced) media datagram, then rewrap it as a v2 VSF
+	// REDUCED datagram by splicing the 4-byte VSF proto after the GRE header.
+	pkt := wire.MediaPacket{Seq: 0x2345, SourceTime: mainSrcNTP(1_000_000), SSRC: ssrc, Payload: tsPacket(188, 0x100, 0xAA)}
+	dg, err := enc.encodeMainMedia(nil, pkt)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	hdr, off, err := gre.Parse(dg)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	hdr.ProtType = gre.ProtoVSF
+	hdr.Version = 2
+	wrapped, _ := hdr.AppendTo(nil)
+	wrapped = gre.VSFProto{Type: gre.VSFTypeRIST, Subtype: gre.VSFSubtypeReduced}.AppendTo(wrapped)
+	wrapped = append(wrapped, dg[off:]...)
+	isMedia, got, _, err := dec.decodeMain(wrapped, 0)
+	if err != nil {
+		t.Fatalf("decode VSF-reduced: %v", err)
+	}
+	if !isMedia || got.Seq != pkt.Seq {
+		t.Fatalf("VSF-reduced decoded as media=%v seq=%#x, want true/%#x", isMedia, got.Seq, pkt.Seq)
+	}
+
+	// A keepalive VSF subtype must be accepted (no error), not dropped as
+	// undecodable.
+	ka, _ := gre.Header{Version: 2, HasSeq: true, ProtType: gre.ProtoVSF}.AppendTo(nil)
+	ka = gre.VSFProto{Type: gre.VSFTypeRIST, Subtype: gre.VSFSubtypeKeepalive}.AppendTo(ka)
+	ka = append(ka, 0x00, 0x01, 0x02, 0x03) // arbitrary keepalive body
+	if isMedia, _, _, err := dec.decodeMain(ka, 0); err != nil || isMedia {
+		t.Fatalf("VSF keepalive: isMedia=%v err=%v, want (false, nil)", isMedia, err)
+	}
+}
+
+// TestOOBRoundTrip verifies the out-of-band codec: encodeOOB/peekOOB round-trip
+// cleartext and PSK-encrypted, OOB is framed as GRE FULL (not reduced), and a
+// media datagram is not misdetected as OOB.
+func TestOOBRoundTrip(t *testing.T) {
+	for _, keyBits := range []int{0, crypto.KeySize128, crypto.KeySize256} {
+		enc, dec := newCodecPair(t, keyBits, false, 0x0BAD_F00E)
+		payload := []byte("out-of-band control metadata \x00\x01\xff\x47")
+		dg, err := enc.encodeOOB(nil, payload)
+		if err != nil {
+			t.Fatalf("keyBits=%d encodeOOB: %v", keyBits, err)
+		}
+		got, ok, err := dec.peekOOB(dg)
+		if !ok || err != nil {
+			t.Fatalf("keyBits=%d peekOOB: ok=%v err=%v", keyBits, ok, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("keyBits=%d OOB round-trip: got %q want %q", keyBits, got, payload)
+		}
+		// A media datagram must NOT be detected as OOB (it is GRE reduced/VSF).
+		md, err := enc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SSRC: 0x0BAD_F00E, Payload: tsPacket(188, 0x100, 0xAA)})
+		if err != nil {
+			t.Fatalf("encodeMainMedia: %v", err)
+		}
+		if _, ok, _ := dec.peekOOB(md); ok {
+			t.Fatalf("keyBits=%d media datagram misdetected as OOB", keyBits)
+		}
+	}
+}
+
+// TestGREKeepaliveRoundTrip verifies the GRE keepalive codec: a v1 keepalive
+// encodes and decodes with its MAC + capability bits (cleartext and encrypted),
+// a v2 keepalive's GRE version is reported (for the monotonic upgrade) even
+// though its VSF body is decoded by decodeMain, and media is not misdetected.
+func TestGREKeepaliveRoundTrip(t *testing.T) {
+	for _, keyBits := range []int{0, crypto.KeySize128} {
+		enc, dec := newCodecPair(t, keyBits, false, 0x0BAD_F00E)
+		ka := gre.Keepalive{MAC: [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02}, Caps: gre.StandardCapabilities()}
+
+		dg, err := enc.encodeKeepalive(nil, ka, gre.VersionMin)
+		if err != nil {
+			t.Fatalf("keyBits=%d encodeKeepalive v1: %v", keyBits, err)
+		}
+		kind, got, ver, err := dec.peekControl(dg)
+		if err != nil || kind != controlKeepalive {
+			t.Fatalf("keyBits=%d peekControl v1: kind=%v err=%v", keyBits, kind, err)
+		}
+		if ver != gre.VersionMin {
+			t.Fatalf("v1 keepalive version=%d want %d", ver, gre.VersionMin)
+		}
+		if got.MAC != ka.MAC || got.Caps != ka.Caps {
+			t.Fatalf("keepalive mismatch: got %+v want %+v", got, ka)
+		}
+
+		// A v2 keepalive reports version 2 (the upgrade signal); its VSF body is
+		// decoded by decodeMain, so peekControl returns controlNone here.
+		dg2, err := enc.encodeKeepalive(nil, ka, gre.VersionCur)
+		if err != nil {
+			t.Fatalf("encodeKeepalive v2: %v", err)
+		}
+		if _, _, ver2, _ := dec.peekControl(dg2); ver2 != gre.VersionCur {
+			t.Fatalf("v2 keepalive version=%d want %d", ver2, gre.VersionCur)
+		}
+
+		md, _ := enc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SSRC: 0x0BAD_F00E, Payload: tsPacket(188, 0x100, 0xAA)})
+		if kind, _, _, _ := dec.peekControl(md); kind == controlKeepalive {
+			t.Fatal("media datagram misdetected as keepalive")
+		}
+	}
+}

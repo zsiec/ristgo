@@ -96,9 +96,46 @@ func (c *Controller) Observe(lossFraction float64) int {
 	return c.current
 }
 
-// ObserveLQM folds one Link Quality Message into the target using its
-// original-loss fraction (the link congestion signal).
-func (c *Controller) ObserveLQM(m LQM) int { return c.Observe(m.LossFraction()) }
+// ObserveLQM folds one Link Quality Message into the target using the two-signal
+// rule of the TR-06-4 Part 1 §6.1 encoder rate-adaptation example: probe the
+// rate UP only when "the number of unrecovered packets is zero AND the number
+// of lost packets is less than a certain level", and back OFF when "the number
+// of unrecovered packets is non-zero OR the number of lost packets is higher
+// than a certain level". Adapting on raw original loss alone (as a single-signal
+// Observe(LossFraction) would) is wrong: it lets the encoder climb while the
+// receiver is dropping unrecoverable packets whenever the loss is spread thinly
+// enough to stay under the target.
+//
+// A report that accounts for no packets at all (a total stall/blackout) carries
+// no information about the link, so the target is held rather than probed up —
+// otherwise a dead link reads as "clean" and the controller ratchets the rate
+// toward the ceiling, the worst possible reaction.
+func (c *Controller) ObserveLQM(m LQM) int {
+	if m.SourceReceived == 0 && m.OriginalLost == 0 && m.Unrecovered == 0 {
+		return c.current // no accounting this period: no information, hold
+	}
+	origLoss := m.LossFraction()
+	if m.Unrecovered == 0 && origLoss <= c.cfg.TargetLoss {
+		c.current = clampKbps(c.current+c.cfg.IncreaseKbps, c.cfg.MinKbps, c.cfg.MaxKbps)
+		return c.current
+	}
+	// Back off, scaling the multiplicative cut by the worse of the residual
+	// (unrecovered) loss and the original loss above target, so a link dropping
+	// unrecoverable packets cuts even when raw loss is thin.
+	severity := m.ResidualLossFraction()
+	if over := origLoss - c.cfg.TargetLoss; over > severity {
+		severity = over
+	}
+	cut := c.cfg.DecreaseGain * severity
+	if cut > maxCut {
+		cut = maxCut
+	}
+	if cut < 0 {
+		cut = 0
+	}
+	c.current = clampKbps(int(float64(c.current)*(1-cut)), c.cfg.MinKbps, c.cfg.MaxKbps)
+	return c.current
+}
 
 func clampKbps(v, lo, hi int) int {
 	if v < lo {

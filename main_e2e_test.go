@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"runtime"
 	"testing"
@@ -371,14 +372,14 @@ func TestE2EMainCloseUnblocksRead(t *testing.T) {
 	}
 	select {
 	case err := <-readErr:
-		if err != ristgo.ErrClosed {
-			t.Fatalf("Read after Close = %v, want ErrClosed", err)
+		if err != io.EOF {
+			t.Fatalf("Read after Close = %v, want io.EOF", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not unblock Read")
 	}
-	if _, err := rx.Read(make([]byte, 16)); err != ristgo.ErrClosed {
-		t.Fatalf("Read on closed receiver = %v, want ErrClosed", err)
+	if _, err := rx.Read(make([]byte, 16)); err != io.EOF {
+		t.Fatalf("Read on closed receiver = %v, want io.EOF", err)
 	}
 
 	// The session's loop + readMain goroutines should have exited. Allow a brief
@@ -390,4 +391,64 @@ func TestE2EMainCloseUnblocksRead(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("goroutines did not return to baseline: have %d, baseline %d", runtime.NumGoroutine(), baseline)
+}
+
+// TestE2EMainOOB verifies the out-of-band side channel over the Main profile: a
+// PSK-encrypted OOB datagram round-trips sender->receiver via WriteOOB/ReadOOB,
+// and a Simple-profile sender rejects OOB with ErrOOBUnsupported.
+func TestE2EMainOOB(t *testing.T) {
+	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
+	rx, err := ristgo.NewReceiver(addr, mainConfig("ristgo-oob-secret", 128))
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewSender(addr, mainConfig("ristgo-oob-secret", 128))
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+
+	oobMsg := "hello out-of-band \x00\x47\xff metadata"
+	gotOOB := make(chan string, 1)
+	go func() {
+		rx.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 4096)
+		n, rerr := rx.ReadOOB(buf)
+		if rerr != nil {
+			gotOOB <- ""
+			return
+		}
+		gotOOB <- string(buf[:n])
+	}()
+
+	// OOB is fire-and-forget (no ARQ); resend until the receiver reads it.
+	deadline := time.Now().Add(5 * time.Second)
+	tx.SetWriteDeadline(deadline)
+	for time.Now().Before(deadline) {
+		if err := tx.WriteOOB([]byte(oobMsg)); err != nil {
+			t.Fatalf("WriteOOB: %v", err)
+		}
+		select {
+		case got := <-gotOOB:
+			if got != oobMsg {
+				t.Fatalf("OOB mismatch:\n got %q\nwant %q", got, oobMsg)
+			}
+			goto simpleCheck
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	t.Fatal("OOB datagram not received within the deadline")
+
+simpleCheck:
+	// A Simple-profile sender has no OOB channel.
+	scfg := ristgo.DefaultConfig() // ProfileSimple
+	stx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", freeMainPort(t)&^1), scfg)
+	if err != nil {
+		t.Fatalf("NewSender(Simple): %v", err)
+	}
+	defer stx.Close()
+	if err := stx.WriteOOB([]byte("x")); !errors.Is(err, ristgo.ErrOOBUnsupported) {
+		t.Fatalf("Simple WriteOOB = %v, want ErrOOBUnsupported", err)
+	}
 }

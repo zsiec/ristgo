@@ -137,3 +137,36 @@ func TestControllerClosedLoopTracksCapacity(t *testing.T) {
 		prev = mean
 	}
 }
+
+// TestObserveLQMUsesUnrecoveredSignal locks in the TR-06-4 §6.1 two-signal
+// rule: probe up only when unrecovered==0 AND original loss <= target; back off
+// when unrecovered>0 even if raw loss is below target; and hold (do not probe
+// up) on a zero-accounting stall report.
+func TestObserveLQMUsesUnrecoveredSignal(t *testing.T) {
+	cfg := DefaultControllerConfig()
+	cfg.InitialKbps = 50_000
+	cfg.MaxKbps = 100_000
+
+	// Thin loss (under the 0.5% target) but a packet went unrecovered: must NOT
+	// probe up — it must back off.
+	c := NewController(cfg)
+	got := c.ObserveLQM(LQM{SourceReceived: 100_000, OriginalLost: 100, Unrecovered: 1})
+	if got >= 50_000 {
+		t.Errorf("target=%d after unrecovered>0 with thin loss; want a decrease below 50000", got)
+	}
+
+	// Same thin loss but everything recovered (unrecovered==0, loss<=target):
+	// probe up.
+	c = NewController(cfg)
+	got = c.ObserveLQM(LQM{SourceReceived: 100_000, OriginalLost: 100, Unrecovered: 0})
+	if got <= 50_000 {
+		t.Errorf("target=%d after clean recovery; want an increase above 50000", got)
+	}
+
+	// Total stall: no packets accounted for. Must hold, not ratchet up.
+	c = NewController(cfg)
+	got = c.ObserveLQM(LQM{})
+	if got != 50_000 {
+		t.Errorf("target=%d on a zero-accounting stall report; want held at 50000", got)
+	}
+}

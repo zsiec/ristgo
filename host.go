@@ -2,6 +2,7 @@ package ristgo
 
 import (
 	crand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -192,6 +193,13 @@ func buildEAPServer(cfg Config) (*eap.Authenticator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
+	// Seed the first EAP identifier from crypto/rand so it is unpredictable on
+	// the wire (libRIST seeds last_identifier from a random byte). A read error
+	// is effectively impossible; leave the identifier at 0 if it ever happens.
+	var seed [1]byte
+	if _, err := crand.Read(seed[:]); err == nil {
+		a.SeedIdentifier(seed[0])
+	}
 	return a, nil
 }
 
@@ -207,6 +215,9 @@ func applyRateAdapt(sc *session.Config, cfg Config) {
 	cc := adapt.DefaultControllerConfig()
 	cc.MaxKbps = cfg.MaxBitrate
 	cc.InitialKbps = cfg.MaxBitrate
+	if cfg.MinBitrate > 0 {
+		cc.MinKbps = cfg.MinBitrate
+	}
 	if step := cfg.MaxBitrate / 100; step > 0 {
 		cc.IncreaseKbps = step
 	}
@@ -217,13 +228,15 @@ func applyRateAdapt(sc *session.Config, cfg Config) {
 // toFlowConfig maps the public Config to the deterministic core's config.
 func toFlowConfig(cfg Config) flow.Config {
 	return flow.Config{
-		RecoveryBufferMin: clock.FromDuration(cfg.BufferMin),
-		RecoveryBufferMax: clock.FromDuration(cfg.BufferMax),
-		ReorderBuffer:     clock.FromDuration(cfg.ReorderBuffer),
-		RTTMin:            clock.FromDuration(cfg.RTTMin),
-		RTTMax:            clock.FromDuration(cfg.RTTMax),
-		MinRetries:        cfg.MinRetries,
-		MaxRetries:        cfg.MaxRetries,
+		RecoveryBufferMin:  clock.FromDuration(cfg.BufferMin),
+		RecoveryBufferMax:  clock.FromDuration(cfg.BufferMax),
+		ReorderBuffer:      clock.FromDuration(cfg.ReorderBuffer),
+		RTTMin:             clock.FromDuration(cfg.RTTMin),
+		RTTMax:             clock.FromDuration(cfg.RTTMax),
+		MinRetries:         cfg.MinRetries,
+		MaxRetries:         cfg.MaxRetries,
+		RecoveryMaxBitrate: cfg.MaxBitrate,
+		CongestionControl:  flow.CongestionNormal, // libRIST default congestion_control
 	}
 }
 
@@ -254,14 +267,29 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 		ErrSessionTimeout: ErrSessionTimeout,
 		ErrBufferOverflow: ErrBufferOverflow,
 		ErrAuth:           ErrAuth,
+		ErrOOBUnsupported: ErrOOBUnsupported,
 	}
+}
+
+// cryptoUint32 returns a cryptographically-random uint32. The SSRC and initial
+// sequence number are randomized to resist off-path injection, so they are
+// drawn from crypto/rand rather than the predictable math/rand PRNG.
+// crypto/rand.Read effectively never fails on supported platforms; on that
+// impossible error it falls back to the randomly auto-seeded math/rand/v2
+// global so the library never panics.
+func cryptoUint32() uint32 {
+	var b [4]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return rand.Uint32()
+	}
+	return binary.BigEndian.Uint32(b[:])
 }
 
 // randomEvenSSRC returns a random even 32-bit flow SSRC. The LSB is reserved
 // as the retransmit marker, so the base SSRC must be even (libRIST).
-func randomEvenSSRC() uint32 { return rand.Uint32() &^ 1 }
+func randomEvenSSRC() uint32 { return cryptoUint32() &^ 1 }
 
 // randomStartSeq returns a random initial RTP sequence number (RFC 3550
 // recommends randomizing it), kept in the low 16 bits since the wire sequence
 // is 16-bit.
-func randomStartSeq() uint32 { return uint32(rand.Uint32() & 0xFFFF) }
+func randomStartSeq() uint32 { return cryptoUint32() & 0xFFFF }

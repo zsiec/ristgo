@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	mrand "math/rand/v2"
 	"net"
 	"runtime"
@@ -308,8 +309,8 @@ func TestE2EBondedCloseUnblocksRead(t *testing.T) {
 	}
 	select {
 	case err := <-readErr:
-		if err != ristgo.ErrClosed {
-			t.Fatalf("Read after Close = %v, want ErrClosed", err)
+		if err != io.EOF {
+			t.Fatalf("Read after Close = %v, want io.EOF", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not unblock Read")
@@ -322,4 +323,69 @@ func TestE2EBondedCloseUnblocksRead(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("goroutines did not return to baseline: have %d, baseline %d", runtime.NumGoroutine(), baseline)
+}
+
+// bondProfileConfig returns a fast bonded config for the given profile + AES.
+func bondProfileConfig(profile ristgo.Profile, secret string, aesBits int) func() ristgo.Config {
+	return func() ristgo.Config {
+		c := ristgo.DefaultConfig()
+		c.Profile = profile
+		c.Secret = secret
+		c.AESKeyBits = aesBits
+		c.BufferMin = 300 * time.Millisecond
+		c.BufferMax = 300 * time.Millisecond
+		return c
+	}
+}
+
+// TestE2EBondedMainAdvanced streams over a clean 2-path bond on the Main and
+// Advanced profiles (PSK-encrypted), verifying bit-exact merged delivery and
+// that the second path's copies are deduplicated. Each path tunnels over a
+// single port; the profile codec frames/encrypts the media, duplicated across
+// paths and merged by the (Seq, SourceTime) dedup.
+func TestE2EBondedMainAdvanced(t *testing.T) {
+	cases := []struct {
+		name    string
+		profile ristgo.Profile
+	}{
+		{"main-aes128", ristgo.ProfileMain},
+		{"advanced-aes128", ristgo.ProfileAdvanced},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const totalBytes = 96 * 1024
+			pA := freeMainPort(t)
+			pB := freeMainPort(t)
+			for pB == pA {
+				pB = freeMainPort(t)
+			}
+			addrs := []string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}
+			cfg := bondProfileConfig(tc.profile, "ristgo-bonded-secret", 128)
+
+			rx, err := ristgo.NewBondedReceiver(addrs, cfg())
+			if err != nil {
+				t.Fatalf("NewBondedReceiver: %v", err)
+			}
+			defer rx.Close()
+			tx, err := ristgo.NewBondedSender(addrs, cfg())
+			if err != nil {
+				t.Fatalf("NewBondedSender: %v", err)
+			}
+			defer tx.Close()
+
+			payload := make([]byte, totalBytes)
+			if _, err := rand.Read(payload); err != nil {
+				t.Fatalf("rand: %v", err)
+			}
+			want := sha256.Sum256(payload)
+			if got := streamSHA(t, tx, rx, payload, nil); got != want {
+				st := rx.Stats()
+				t.Fatalf("%s bond hash mismatch (Received=%d Delivered=%d Duplicates=%d Lost=%d)",
+					tc.name, st.Received, st.Delivered, st.Duplicates, st.Lost)
+			}
+			if st := rx.Stats(); st.Duplicates == 0 {
+				t.Fatalf("%s: expected the second path's copies to be deduplicated, Duplicates=0", tc.name)
+			}
+		})
+	}
 }

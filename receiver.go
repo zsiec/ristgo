@@ -1,12 +1,26 @@
 package ristgo
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/zsiec/ristgo/internal/session"
 	"github.com/zsiec/ristgo/internal/socket"
 )
+
+// readEOF maps a clean close (ErrClosed) to io.EOF so a Receiver behaves like a
+// well-mannered io.Reader: io.Copy and bufio stop cleanly at end-of-stream
+// instead of reporting a spurious error. Abnormal teardown
+// (ErrSessionTimeout/ErrBufferOverflow/ErrAuth) is passed through unchanged so
+// callers can still distinguish it.
+func readEOF(n int, err error) (int, error) {
+	if errors.Is(err, ErrClosed) {
+		return n, io.EOF
+	}
+	return n, err
+}
 
 // Receiver receives media from a RIST sender, recovering lost packets via ARQ
 // and delivering them in order. It is an io.ReadCloser: each Read returns the
@@ -126,15 +140,33 @@ func newAdvReceiver(addr string, cfg Config) (*Receiver, error) {
 }
 
 // Read returns the next in-order media payload. It blocks until data is
-// available, the read deadline passes (ErrTimeout), or the receiver is closed
-// (ErrClosed, after any buffered payloads are drained).
-func (r *Receiver) Read(p []byte) (int, error) { return r.sess.Read(p) }
+// available, the read deadline passes (ErrTimeout), or the stream ends. A clean
+// Close ends the stream with io.EOF (so io.Copy returns nil); an abnormal
+// teardown returns ErrSessionTimeout, ErrBufferOverflow, or ErrAuth.
+func (r *Receiver) Read(p []byte) (int, error) { return readEOF(r.sess.Read(p)) }
 
 // SetReadDeadline sets the deadline for future Read calls; a zero time clears
 // it.
 func (r *Receiver) SetReadDeadline(t time.Time) error {
 	r.sess.SetReadDeadline(t)
 	return nil
+}
+
+// ReadOOB returns the next out-of-band datagram received from the peer,
+// truncated to len(buf) (OOB is datagram-oriented, not a stream). It blocks
+// until one arrives, the deadline passes (ErrTimeout), or the receiver closes
+// (ErrClosed). It returns ErrOOBUnsupported on a Simple-profile receiver.
+func (r *Receiver) ReadOOB(buf []byte) (int, error) { return r.sess.ReadOOB(buf) }
+
+// WriteOOB sends one out-of-band datagram to the peer (Main and Advanced
+// profiles). OOB is a fire-and-forget side channel that bypasses ARQ recovery.
+// The payload must be at most MaxMediaPayload bytes. It returns ErrOOBUnsupported
+// on a Simple-profile receiver.
+func (r *Receiver) WriteOOB(p []byte) error {
+	if len(p) > MaxMediaPayload {
+		return fmt.Errorf("rist: OOB payload %d bytes exceeds MaxMediaPayload %d", len(p), MaxMediaPayload)
+	}
+	return r.sess.WriteOOB(p)
 }
 
 // LocalPort returns the bound even media UDP port.

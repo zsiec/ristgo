@@ -13,7 +13,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,8 +36,10 @@ func main() {
 	}
 	defer rx.Close()
 
-	// Cancelling ctx (Ctrl-C) closes rx, so Read returns ErrClosed — a clean stop.
-	if _, err := io.Copy(os.Stdout, rx); err != nil && !errors.Is(err, ristgo.ErrClosed) {
+	// Cancelling ctx (Ctrl-C) closes rx, which ends the stream with io.EOF, so
+	// io.Copy returns nil — a clean stop. A non-nil error is an abnormal teardown
+	// (session timeout, buffer overflow, or auth failure).
+	if _, err := io.Copy(os.Stdout, rx); err != nil {
 		fmt.Fprintf(os.Stderr, "receiver: %v\n", err)
 		os.Exit(1)
 	}

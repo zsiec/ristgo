@@ -283,3 +283,28 @@ func equalU32(a, b []uint32) bool {
 	}
 	return true
 }
+
+// TestDropAdvEchoRequests verifies the Advanced feedback path drops inbound
+// RTT-echo requests (so the flow never answers them) while preserving NACKs,
+// echo responses, and link-quality reports. ristgo must not answer an Advanced
+// RTT-echo request: libRIST's Advanced RTT-echo response handler mis-scales the
+// round-trip (>>16 instead of >>32), so a response poisons its last_rtt and
+// jams its retransmit re-queue, permanently losing a packet under loss.
+func TestDropAdvEchoRequests(t *testing.T) {
+	in := []wire.Feedback{
+		wire.RttEchoRequest{Timestamp: 1},
+		wire.NackRequest{SSRC: 7, Missing: []uint32{1, 2, 3}},
+		wire.RttEchoResponse{Timestamp: 2, ProcessingDelay: 3},
+		wire.RttEchoRequest{Timestamp: 4},
+		wire.LinkQuality{},
+	}
+	got := dropAdvEchoRequests(in)
+	for _, fb := range got {
+		if _, isReq := fb.(wire.RttEchoRequest); isReq {
+			t.Fatalf("dropAdvEchoRequests left an RttEchoRequest in %#v", got)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("kept %d feedback items, want 3 (NACK, echo response, link quality)", len(got))
+	}
+}

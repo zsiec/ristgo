@@ -182,3 +182,65 @@ func TestParseEdgeKinds(t *testing.T) {
 		t.Fatal("short CLIENT_VALIDATOR proof: got nil error, want rejection")
 	}
 }
+
+// TestSpoofedSuccessCannotDefeatFailureGate verifies that a spoofed no-op frame
+// (a SUCCESS, or an unexpected frame) cannot overwrite the authenticatee's
+// tracked identifier and thereby make a legitimate in-flight FAILURE be dropped.
+// The identifier is adopted only from a legitimately processed request.
+func TestSpoofedSuccessCannotDefeatFailureGate(t *testing.T) {
+	authee, err := NewAuthenticatee("rist", "mainprofile")
+	if err != nil {
+		t.Fatalf("NewAuthenticatee: %v", err)
+	}
+	authee.Start()
+	idReq := Frame{Version: 3, Code: CodeRequest, Identifier: 7, Kind: KindIdentityRequest}
+	if _, err := authee.Recv(idReq.AppendTo(nil)); err != nil {
+		t.Fatalf("IDENTITY REQUEST: %v", err)
+	}
+	// Attacker injects a SUCCESS with a bogus identifier; it is a no-op and must
+	// NOT change the tracked identifier (which stays 7).
+	spoof := Frame{Version: 3, Code: CodeSuccess, Identifier: 99, Kind: KindSuccess}
+	if out, err := authee.Recv(spoof.AppendTo(nil)); out != nil || err != nil {
+		t.Fatalf("spoofed SUCCESS: out=%v err=%v, want (nil,nil)", out, err)
+	}
+	// The legitimate FAILURE for the live exchange (id 7) must still fail it.
+	fail := Frame{Version: 3, Code: CodeFailure, Identifier: 7, Kind: KindFailure}
+	if _, err := authee.Recv(fail.AppendTo(nil)); !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("legit FAILURE after spoofed SUCCESS: err=%v, want ErrAuthFailed (identifier was corrupted)", err)
+	}
+}
+
+// TestAuthenticatorStartGuardAndLogoff verifies the authenticator ignores a
+// spurious mid-handshake EAPOL-START (so a spoofed START cannot reset the live
+// exchange) and treats EAPOL-LOGOFF as a reset to UNAUTH rather than an error.
+func TestAuthenticatorStartGuardAndLogoff(t *testing.T) {
+	salt := make([]byte, 32)
+	verifier := srp.MakeVerifier(srp.DefaultGroup(), "user", "pass", salt)
+	a, err := NewAuthenticator(func(u string) ([]byte, []byte, bool) {
+		if u == "user" {
+			return verifier, salt, true
+		}
+		return nil, nil, false
+	})
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	a.Start() // -> IN-PROGRESS
+	idResp := Frame{Version: 3, Code: CodeResponse, Identifier: a.id, Kind: KindIdentityResponse, Username: "user"}
+	if _, err := a.Recv(idResp.AppendTo(nil)); err != nil {
+		t.Fatalf("identity response: %v", err)
+	}
+	// A spurious START once the SRP exchange has begun is ignored, not answered.
+	start := Frame{Version: 3, Kind: KindStart}
+	if out, err := a.Recv(start.AppendTo(nil)); out != nil || err != nil {
+		t.Fatalf("mid-handshake START: out=%v err=%v, want (nil,nil)", out, err)
+	}
+	// EAPOL-LOGOFF resets to UNAUTH (no error).
+	logoff := Frame{Version: 3, Kind: KindLogoff}
+	if out, err := a.Recv(logoff.AppendTo(nil)); out != nil || err != nil {
+		t.Fatalf("LOGOFF: out=%v err=%v, want (nil,nil)", out, err)
+	}
+	if a.State() != StateUnauth {
+		t.Fatalf("after LOGOFF state=%v, want UNAUTH", a.State())
+	}
+}

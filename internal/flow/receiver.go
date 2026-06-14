@@ -155,13 +155,30 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	}
 
 	packetTime := f.mapSourceTime(pkt.SourceTime)
+
+	// Source-clock re-anchor (libRIST receiver_calculate_packet_time wrap
+	// fix-up): if a fresh, in-sequence packet maps far outside the recovery
+	// window, the source clock wrapped (a 32-bit RTP timestamp wraps every ~13h
+	// at 90 kHz) or was reset. The offset locked at the first packet is now
+	// stale, so without this every subsequent packet would map into the past and
+	// be shed as too-late — a permanent stall. Re-anchor the offset to the
+	// current arrival and reset the source-time tracking so playout continues.
+	// Gated on a fresh, in-order, non-retransmit packet far (> recovery window)
+	// from now, so ordinary jitter and reordering never trigger it.
+	if !pkt.Retransmit && pkt.Seq == r.lastFound+1 &&
+		(packetTime.Before(now.Add(-f.recoveryBuffer110)) || packetTime.After(now.Add(f.recoveryBuffer110))) {
+		src := clock.NTPTime(pkt.SourceTime).Timestamp()
+		r.offset = now.Sub(src)
+		packetTime = now
+		r.maxSourceTime = pkt.SourceTime
+		r.lastPacketTime = now
+		f.stats.ClockResync++
+	}
+
 	// Track the newest source timestamp and its packet time, mirroring
 	// calculate_packet_time. The update runs before the out-of-order
 	// comparison, exactly as in libRIST, so the packet advancing the clock
 	// can never compare against itself.
-	// DEVIATION(librist): the source-clock-jump and offset-change
-	// heuristics are omitted — the offset is locked at the first packet
-	// until WP4 adds SR-based refinement.
 	if pkt.SourceTime > r.maxSourceTime {
 		r.maxSourceTime = pkt.SourceTime
 		r.lastPacketTime = packetTime
@@ -315,6 +332,15 @@ func (f *Flow) markMissing(now clock.Timestamp, path uint8, current uint32, pack
 	nackTime := packetTimeLast
 	count := uint64(1)
 	for m := r.lastFound + 1; m != current; m++ {
+		// Buffer-bloat / overflow guard (libRIST init_peer_settings): stop
+		// queuing new missing entries once the missing queue exceeds
+		// missing_counter_max. The already-queued entries keep being retried;
+		// this gap is truncated here (libRIST breaks the same walk in place),
+		// which bounds receiver memory under sustained loss instead of letting
+		// the ring fill unboundedly.
+		if r.missingCount > int(f.missingCounterMax) {
+			break
+		}
 		nackTime = nackTime.Add(interpacket)
 		f.addMissing(now, path, m, nackTime)
 		count++
@@ -331,13 +357,14 @@ func (f *Flow) markMissing(now clock.Timestamp, path uint8, current uint32, pack
 // [now-recoveryBuffer, now] — out-of-range values become now, exactly as
 // the C does.
 //
-// The first NACK attempt is scheduled at insertionTime + smoothedRTT per
-// the WP3 constants binding.
-// DEVIATION(librist): libRIST schedules next_nack = now + rtt where
-// rtt = max(clamp(smoothed)/2, reorder_buffer); the binding fixes
-// firstNack = insertionTime + smoothed instead (the two agree on cold
-// start whenever the clamp forces insertionTime to now and
-// reorder_buffer <= rtt_min).
+// The first NACK is scheduled at now + max(clamp(rtt)/2, reorder_buffer),
+// matching libRIST's rist_receiver_missing (next_nack = now + rtt, where the
+// caller derives rtt = clamp(eight_times_rtt/8, rtt_min, rtt_max), halves it,
+// then floors it at recovery_reorder_buffer — "optimal dynamic time for the
+// first retry is rtt/2"). The clamp+floor make the interval inherently bounded:
+// it never drops below reorder_buffer (default 15 ms) even when the EWMA
+// collapses toward zero, so a merely-reordered packet is not NACKed before its
+// in-order copy can arrive within the reorder window.
 func (f *Flow) addMissing(now clock.Timestamp, path uint8, missingSeq uint32, nackTime clock.Timestamp) {
 	r := &f.receiver
 	insertion := nackTime
@@ -346,11 +373,15 @@ func (f *Flow) addMissing(now clock.Timestamp, path uint8, missingSeq uint32, na
 	} else if insertion.Before(now.Add(-f.recoveryBuffer)) {
 		insertion = now
 	}
+	firstRTT := f.est.Clamped(f.cfg.RTTMin, f.cfg.RTTMax) / 2
+	if firstRTT < f.cfg.ReorderBuffer {
+		firstRTT = f.cfg.ReorderBuffer
+	}
 	e := &missingEntry{
 		seq:           missingSeq,
 		path:          path,
 		insertionTime: insertion,
-		nextNack:      insertion.Add(f.est.Smoothed()),
+		nextNack:      now.Add(firstRTT),
 	}
 	if r.missingTail == nil {
 		r.missingHead = e
@@ -414,10 +445,16 @@ func (f *Flow) processNacks(now clock.Timestamp) {
 			f.stats.Abandoned++
 			remove = true
 		case !now.Before(e.nextNack):
-			e.nextNack = now.Add(f.est.RetryInterval(f.cfg.RTTMin, f.cfg.RTTMax))
-			e.nackCount++
-			batch = append(batch, e.seq)
-			f.stats.NacksSent++
+			// Cap one emitted NackRequest at RIST_MAX_NACKS sequences (libRIST
+			// receiver_nack_output maxcounter). When the budget is full the entry
+			// is left due — its nextNack is not advanced — so it is serviced on
+			// the next 5 ms pass rather than dropped.
+			if len(batch) < ristMaxNacks {
+				e.nextNack = now.Add(f.est.RetryInterval(f.cfg.RTTMin, f.cfg.RTTMax))
+				e.nackCount++
+				batch = append(batch, e.seq)
+				f.stats.NacksSent++
+			}
 		}
 		if remove {
 			if prev == nil {

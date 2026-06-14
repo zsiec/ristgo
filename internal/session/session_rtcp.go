@@ -127,7 +127,7 @@ func (s *Session) keepaliveLead(now clock.Timestamp) rtcp.Packet {
 	if s.sender {
 		return rtcp.SenderReport{
 			SSRC:    s.cfg.SSRC,
-			NTP:     uint64(clock.NTPTimeFromTimestamp(now)),
+			NTP:     s.wallNTP(now), // absolute wall-clock NTP (RFC 3550); see wallNTP
 			RTPTime: uint32(rtpTicksFromMicros(int64(now))),
 		}
 	}

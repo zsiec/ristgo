@@ -3,6 +3,7 @@ package session
 import (
 	"net"
 
+	"github.com/zsiec/ristgo/internal/adv"
 	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/flow"
@@ -107,12 +108,25 @@ func NewBondedSender(conn *socket.Conn, remotes [][2]*net.UDPAddr, group *bondin
 // on its one socket (it never receives media), and resolves the path by source
 // address.
 func (s *Session) startBondReaders() {
+	// The Main and Advanced profiles tunnel each path over a single socket
+	// (media and control demultiplexed by the codec), so one reader per path
+	// suffices; the Simple profile uses an even/odd media+RTCP socket pair.
+	singlePort := s.main != nil || s.adv != nil
 	if s.sender {
 		s.wg.Add(1)
-		go s.readBond(0, true, s.bond.conns[0].ReadRTCP)
+		if singlePort {
+			go s.readBond(0, false, s.bond.conns[0].ReadMedia)
+		} else {
+			go s.readBond(0, true, s.bond.conns[0].ReadRTCP)
+		}
 		return
 	}
 	for i, c := range s.bond.conns {
+		if singlePort {
+			s.wg.Add(1)
+			go s.readBond(uint8(i), false, c.ReadMedia)
+			continue
+		}
 		s.wg.Add(2)
 		go s.readBond(uint8(i), false, c.ReadMedia)
 		go s.readBond(uint8(i), true, c.ReadRTCP)
@@ -156,23 +170,124 @@ func (s *Session) handleBondInbound(now clock.Timestamp, bi bondInbound) {
 	s.peer.Observe(now)
 	s.bond.group.Observe(idx, now)
 
+	switch {
+	case s.main != nil:
+		s.handleBondMain(now, idx, p, bi)
+	case s.adv != nil:
+		s.handleBondAdv(now, idx, p, bi)
+	default:
+		s.handleBondSimple(now, idx, p, bi)
+	}
+}
+
+// bondObserveRTT attributes an RTT-echo response in fbs to a bonded path so the
+// NACK-peer selection can prefer the lower-latency return path, then feeds all
+// of fbs into the flow. Shared by every profile's bonded feedback path.
+func (s *Session) bondObserveRTT(now clock.Timestamp, idx uint8, fbs []wire.Feedback) {
+	for _, fb := range fbs {
+		if resp, ok := fb.(wire.RttEchoResponse); ok {
+			sent := clock.NTPTime(resp.Timestamp).Timestamp()
+			s.bond.group.ObserveRTT(idx, now.Sub(sent)-clock.Microseconds(resp.ProcessingDelay))
+		}
+		s.flow.FeedFeedback(now, fb)
+	}
+}
+
+// handleBondSimple routes one Simple-profile bonded datagram: RTCP into feedback
+// (with per-path RTT), media into the flow with its path index. Media is decoded
+// with the SHARED decoder so identical wire bytes from any path reconstruct to
+// the same (Seq, SourceTime), which is what the dedup merges.
+func (s *Session) handleBondSimple(now clock.Timestamp, idx uint8, p *peer.Peer, bi bondInbound) {
 	if bi.isRTCP {
 		p.LearnRTCP(bi.src)
 		if fbs, err := decodeFeedback(bi.data, s.highestSent); err == nil {
-			for _, fb := range fbs {
-				s.flow.FeedFeedback(now, fb)
-			}
+			s.bondObserveRTT(now, idx, fbs)
 		}
 		return
 	}
-	// Media (receiver only): decode with the SHARED decoder so identical wire
-	// bytes from any path reconstruct to the same (Seq, SourceTime), then feed
-	// the flow with this path's index. The dedup merges the copies.
 	p.LearnMedia(bi.src)
 	if pkt, err := s.mdec.decode(bi.data); err == nil {
 		s.flow.Feed(now, idx, pkt)
 		s.observeRx(now, pkt)
 	}
+}
+
+// handleBondMain routes one Main-profile bonded datagram. Each path tunnels over
+// one socket, so the shared Main codec demuxes media vs feedback (and OOB); media
+// is fed with its path index and feedback attributed per path.
+func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, bi bondInbound) {
+	p.LearnMedia(bi.src)
+	p.LearnRTCP(bi.src)
+	if oob, ok, oerr := s.main.peekOOB(bi.data); ok {
+		if oerr == nil {
+			s.deliverOOB(oob)
+		}
+		return
+	}
+	isMedia, pkt, fbs, err := s.main.decodeMain(bi.data, s.highestSent)
+	if err != nil {
+		return
+	}
+	if isMedia {
+		s.observeRxBytes(len(bi.data))
+		s.flow.Feed(now, idx, pkt)
+		s.observeRx(now, pkt)
+		return
+	}
+	s.bondObserveRTT(now, idx, fbs)
+}
+
+// handleBondAdv routes one Advanced-profile bonded datagram: adv RTP media into
+// the flow with its path index, or the Main-GRE control substrate (Type-8 or raw
+// GRE RTCP) into feedback. It mirrors handleAdvInbound but is path-aware.
+func (s *Session) handleBondAdv(now clock.Timestamp, idx uint8, p *peer.Peer, bi bondInbound) {
+	p.LearnMedia(bi.src)
+	p.LearnRTCP(bi.src)
+	data := bi.data
+	if len(data) >= 2 && data[0]&0xC0 == 0x80 {
+		if pt := data[1] & 0x7f; pt == adv.PayloadType || pt >= 96 {
+			if pr, err := adv.Parse(data); err == nil {
+				if pr.EncType == adv.TypeGREMain {
+					s.handleBondAdvGRE(now, idx, pr.Payload)
+					return
+				}
+				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(pr); derr == nil {
+					if isMedia {
+						s.observeRxBytes(len(data))
+						s.flow.Feed(now, idx, pkt)
+						s.observeRx(now, pkt)
+					} else {
+						s.bondObserveRTT(now, idx, dropAdvEchoRequests(fbs))
+					}
+				}
+				return
+			}
+		}
+	}
+	s.handleBondAdvGRE(now, idx, data)
+}
+
+// handleBondAdvGRE decodes one Main-profile GRE datagram on a bonded Advanced
+// path (the RTCP/keepalive substrate), feeding any NACK/feedback into the flow
+// with per-path RTT attribution.
+func (s *Session) handleBondAdvGRE(now clock.Timestamp, idx uint8, data []byte) {
+	if oob, ok, oerr := s.advGRE.peekOOB(data); ok {
+		if oerr == nil {
+			s.deliverOOB(oob)
+		}
+		return
+	}
+	isMedia, pkt, fbs, err := s.advGRE.decodeMain(data, s.highestSent)
+	if err != nil {
+		return
+	}
+	if isMedia {
+		s.observeRxBytes(len(data))
+		s.flow.Feed(now, idx, pkt)
+		s.observeRx(now, pkt)
+		return
+	}
+	s.bondObserveRTT(now, idx, dropAdvEchoRequests(fbs))
 }
 
 // bondPathForSrc resolves a sender's inbound source address (a receiver path's
@@ -195,17 +310,38 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 }
 
 // sendBondMedia duplicates one encoded media datagram to every path (full 2022-7
-// redundancy). It encodes once and writes the identical bytes to each path's
-// media destination.
+// redundancy). It encodes ONCE with the profile codec and writes the identical
+// bytes to each path's media destination. The encrypted Main/Advanced transport
+// sequence (the GRE/IV seq) is therefore identical on every path, which is
+// interop-safe: the dedup key is the inner RTP (Seq, SourceTime), identical
+// across paths, and the receiver reads each datagram's transport seq from the
+// wire (libRIST frames per-peer but the receiver merges on the same RTP key).
 func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	s.mediaBuf = s.mediaBuf[:0]
-	b, err := encodeMedia(s.mediaBuf, pkt)
+	var (
+		b   []byte
+		err error
+	)
+	switch {
+	case s.main != nil:
+		b, err = s.main.encodeMainMedia(s.mediaBuf, pkt)
+	case s.adv != nil:
+		b, err = s.adv.encodeAdvMedia(s.mediaBuf, pkt)
+	default:
+		b, err = encodeMedia(s.mediaBuf, pkt)
+	}
 	if err != nil {
 		s.logf("bond: encode media seq %d: %v", pkt.Seq, err)
 		return
 	}
 	s.mediaBuf = b
 	for i := range s.bond.remotes {
+		// Skip a path proven dead (seen and then silent past the session timeout)
+		// so the sender stops blasting media at a permanently-down path; a
+		// never-seen path is still sent to (libRIST's hard-dead prune).
+		if !s.bond.group.ShouldDuplicate(uint8(i), now) {
+			continue
+		}
 		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[i][0]); err != nil {
 			s.logf("bond: write media path %d: %v", i, err)
 		}
@@ -222,14 +358,26 @@ func (s *Session) sendBondFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 	if s.sender {
 		lead = rtcp.SenderReport{
 			SSRC:    s.cfg.SSRC,
-			NTP:     uint64(clock.NTPTimeFromTimestamp(now)),
+			NTP:     s.wallNTP(now), // absolute wall-clock NTP (RFC 3550); see wallNTP
 			RTPTime: uint32(rtpTicksFromMicros(int64(now))),
 		}
 	} else {
 		lead = s.receiverReport()
 	}
 	s.rtcpBuf = s.rtcpBuf[:0]
-	b, err := encodeFeedback(s.rtcpBuf, lead, s.cfg.SSRC, s.cfg.CNAME, fbs, s.cfg.Bitmask)
+	// Main and Advanced tunnel feedback as a GRE compound (the Main codec, or the
+	// Advanced profile's GRE control substrate) over the single per-path socket;
+	// the Simple profile sends bare compound RTCP on the odd port.
+	greCodec := s.bondGRECodec()
+	var (
+		b   []byte
+		err error
+	)
+	if greCodec != nil {
+		b, err = greCodec.encodeMainFeedback(s.rtcpBuf, lead, fbs, s.cfg.Bitmask)
+	} else {
+		b, err = encodeFeedback(s.rtcpBuf, lead, s.cfg.SSRC, s.cfg.CNAME, fbs, s.cfg.Bitmask)
+	}
 	if err != nil {
 		s.logf("bond: encode feedback: %v", err)
 		return
@@ -237,17 +385,16 @@ func (s *Session) sendBondFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 	s.rtcpBuf = b
 
 	if s.sender {
-		// Send on every path's RTCP destination so RTT echoes and SDES reach
-		// each receiver path (so each learns the sender's RTCP return address).
+		// Send on every path so RTT echoes and SDES reach each receiver path.
 		for i := range s.bond.remotes {
-			if err := s.bond.conns[0].WriteRTCP(b, s.bond.remotes[i][1]); err != nil {
+			if err := s.writeBondFeedback(s.bond.conns[0], greCodec, s.bond.remotes[i][1], s.bond.remotes[i][0]); err != nil {
 				s.logf("bond: write feedback path %d: %v", i, err)
 			}
 		}
 		s.lastTx = now
 		return
 	}
-	// Receiver: route to the selected live path (NACK-peer selection).
+	// Receiver: route NACK groups to the single selected live path.
 	idx, ok := s.bond.group.SelectNackPath(now)
 	if !ok {
 		return
@@ -256,18 +403,76 @@ func (s *Session) sendBondFeedback(fbs []wire.Feedback, now clock.Timestamp) {
 	if p.RTCP == nil {
 		return // that path's return address not learned yet
 	}
-	if err := s.bond.conns[idx].WriteRTCP(b, p.RTCP); err != nil {
+	if err := s.writeBondFeedback(s.bond.conns[idx], greCodec, p.RTCP, p.RTCP); err != nil {
 		s.logf("bond: write feedback on path %d: %v", idx, err)
 	}
 	s.lastTx = now
 }
 
-// sendBondKeepalive emits a periodic keepalive: a sender sends an SR + SDES +
-// RTT-echo on every path (so receivers learn its return address and RTT
-// tracks); a receiver sends an RR + RTT-echo on the selected live path.
+// bondGRECodec returns the GRE codec a bonded session uses to tunnel feedback:
+// the Main codec for a Main bonded session, the Advanced GRE control substrate
+// for an Advanced one, or nil for the Simple profile (bare RTCP).
+func (s *Session) bondGRECodec() *mainCodec {
+	if s.main != nil {
+		return s.main
+	}
+	return s.advGRE
+}
+
+// writeBondFeedback writes one encoded feedback datagram to a path. Single-port
+// profiles (greCodec != nil) write the media-side socket/address; the Simple
+// profile writes the RTCP socket/odd-port address.
+func (s *Session) writeBondFeedback(conn *socket.Conn, greCodec *mainCodec, simpleRTCP, singlePort *net.UDPAddr) error {
+	if greCodec != nil {
+		return conn.WriteMedia(s.rtcpBuf, singlePort)
+	}
+	return conn.WriteRTCP(s.rtcpBuf, simpleRTCP)
+}
+
+// sendBondKeepalive emits a periodic keepalive. A sender sends SR + SDES +
+// RTT-echo on every path (sendBondFeedback already fans out). A receiver fans
+// its RR + RTT-echo request out to EVERY learned path — not just the selected
+// NACK path — so each path's RTT and return-path liveness are exercised;
+// otherwise only the selected path's RTT is ever measured and the NACK-peer
+// RTT tie-break has no data. NACK groups still route to the single selected path
+// via sendBondFeedback.
 func (s *Session) sendBondKeepalive(now clock.Timestamp) {
 	echo := []wire.Feedback{wire.RttEchoRequest{Timestamp: uint64(clock.NTPTimeFromTimestamp(now))}}
-	s.sendBondFeedback(echo, now)
+	if s.sender {
+		s.sendBondFeedback(echo, now)
+		return
+	}
+	s.rtcpBuf = s.rtcpBuf[:0]
+	greCodec := s.bondGRECodec()
+	var (
+		b   []byte
+		err error
+	)
+	if greCodec != nil {
+		b, err = greCodec.encodeMainFeedback(s.rtcpBuf, s.receiverReport(), echo, s.cfg.Bitmask)
+	} else {
+		b, err = encodeFeedback(s.rtcpBuf, s.receiverReport(), s.cfg.SSRC, s.cfg.CNAME, echo, s.cfg.Bitmask)
+	}
+	if err != nil {
+		s.logf("bond: encode keepalive: %v", err)
+		return
+	}
+	s.rtcpBuf = b
+	sent := false
+	for i := range s.bond.peers {
+		p := s.bond.peers[i]
+		if p.RTCP == nil {
+			continue // path's return address not learned yet
+		}
+		if err := s.writeBondFeedback(s.bond.conns[i], greCodec, p.RTCP, p.RTCP); err != nil {
+			s.logf("bond: write keepalive path %d: %v", i, err)
+			continue
+		}
+		sent = true
+	}
+	if sent {
+		s.lastTx = now
+	}
 }
 
 // tickBond ages the paths and logs any that died this interval. (The flow keeps

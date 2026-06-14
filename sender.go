@@ -184,6 +184,24 @@ func (s *Sender) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+// WriteOOB sends one out-of-band datagram to the peer (Main and Advanced
+// profiles). OOB is a fire-and-forget side channel — it rides the same socket as
+// the media but bypasses ARQ recovery, so a lost OOB datagram is not
+// retransmitted. The payload must be at most MaxMediaPayload bytes. It returns
+// ErrOOBUnsupported on a Simple-profile sender.
+func (s *Sender) WriteOOB(p []byte) error {
+	if len(p) > MaxMediaPayload {
+		return fmt.Errorf("rist: OOB payload %d bytes exceeds MaxMediaPayload %d", len(p), MaxMediaPayload)
+	}
+	return s.sess.WriteOOB(p)
+}
+
+// ReadOOB returns the next out-of-band datagram received from the peer,
+// truncated to len(buf) (OOB is datagram-oriented, not a stream). It blocks
+// until one arrives, the deadline passes (ErrTimeout), or the sender closes
+// (ErrClosed). It returns ErrOOBUnsupported on a Simple-profile sender.
+func (s *Sender) ReadOOB(buf []byte) (int, error) { return s.sess.ReadOOB(buf) }
+
 // Stats returns a snapshot of the sender's counters.
 func (s *Sender) Stats() Stats { return toStats(s.sess.Stats()) }
 

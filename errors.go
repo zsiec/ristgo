@@ -33,4 +33,9 @@ var (
 	// peer's proof was refused). It is reported by Read/Write after the session
 	// tears down.
 	ErrAuth = errors.New("rist: authentication failed")
+
+	// ErrOOBUnsupported is returned by WriteOOB/ReadOOB on a Simple-profile
+	// Sender or Receiver. The out-of-band side channel exists only on the Main
+	// and Advanced profiles (libRIST rejects OOB on the Simple profile).
+	ErrOOBUnsupported = errors.New("rist: out-of-band data requires the Main or Advanced profile")
 )

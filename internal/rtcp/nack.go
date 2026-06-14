@@ -18,6 +18,19 @@ import "encoding/binary"
 // bound.
 const MaxNackRecordsPerPacket = 16
 
+// maxNackExpand bounds the number of sequence numbers a single decoded NACK
+// packet may expand to. The wire sequence is 16-bit, so there are only 2^16
+// distinct sequence numbers a NACK can possibly request; expanding beyond that
+// only yields duplicates. Without this bound a crafted range NACK — Extra is a
+// 16-bit field, so each 4-byte record expands to up to 65536 sequences, and a
+// ~1.5 KB datagram holds ~370 records — would materialize ~24M uint32 (~96 MB)
+// on the sender per datagram, a memory/CPU amplification DoS. libRIST validates
+// each requested sequence inline against its live send window and never
+// materializes such an array; this cap matches that behavior. It never
+// truncates a legitimate request (a conforming receiver requests far fewer than
+// 2^16 sequences).
+const maxNackExpand = 1 << 16
+
 // NackRange is one Packet Range Request of TR-06-1 §5.3.2.2 (struct
 // rist_rtp_nack_record, libRIST): packets Start through Start+Extra inclusive
 // (mod 2^16) are being requested.
@@ -79,10 +92,15 @@ func (p RangeNACK) MissingSeqs() []uint32 {
 // AppendMissingSeqs appends the expanded sequence list to dst and returns
 // the extended slice, allocating only if dst lacks capacity.
 func (p RangeNACK) AppendMissingSeqs(dst []uint32) []uint32 {
+	appended := 0
 	for _, r := range p.Ranges {
 		s := r.Start
 		for i := uint32(0); i <= uint32(r.Extra); i++ {
+			if appended >= maxNackExpand {
+				return dst // amplification guard; see maxNackExpand
+			}
 			dst = append(dst, uint32(s))
+			appended++
 			s++ // natural uint16 wrap: 65535 -> 0
 		}
 	}
@@ -181,6 +199,9 @@ func (p BitmaskNACK) MissingSeqs() []uint32 {
 // the extended slice, allocating only if dst lacks capacity.
 func (p BitmaskNACK) AppendMissingSeqs(dst []uint32) []uint32 {
 	for _, f := range p.FCIs {
+		if len(dst) >= maxNackExpand {
+			return dst // amplification guard; see maxNackExpand
+		}
 		dst = f.AppendSeqs(dst)
 	}
 	return dst

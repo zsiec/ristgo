@@ -96,6 +96,89 @@ func (s *Session) Read(buf []byte) (int, error) {
 	}
 }
 
+// WriteOOB enqueues one out-of-band datagram for transmission (Main/Advanced
+// profiles only). OOB rides the same socket as media but bypasses ARQ entirely
+// — fire-and-forget, like libRIST's rist_oob_write. It returns ErrOOBUnsupported
+// when the session has no OOB channel (the Simple profile). It blocks under
+// back-pressure, honoring the write deadline (ErrTimeout) and close (ErrClosed).
+func (s *Session) WriteOOB(p []byte) error {
+	if s.oobIn == nil {
+		return s.cfg.ErrOOBUnsupported
+	}
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	for {
+		select {
+		case <-s.done:
+			return s.closeReason()
+		default:
+		}
+		timer, expired := s.deadlineTimerFor(s.writeDeadline.Load())
+		if expired {
+			return s.cfg.ErrTimeout
+		}
+		var timeout <-chan time.Time
+		if timer != nil {
+			timeout = timer.C
+		}
+		select {
+		case s.oobIn <- cp:
+			stopOptTimer(timer)
+			return nil
+		case <-s.done:
+			stopOptTimer(timer)
+			return s.closeReason()
+		case <-timeout:
+			return s.cfg.ErrTimeout
+		case <-s.writeWake:
+			stopOptTimer(timer)
+		}
+	}
+}
+
+// ReadOOB returns the next received out-of-band datagram (Main/Advanced only).
+// Unlike Read it is datagram-oriented: each call returns exactly one OOB payload,
+// truncated to len(buf). It returns ErrOOBUnsupported on the Simple profile, and
+// blocks until an OOB datagram arrives, the read deadline passes (ErrTimeout), or
+// the session closes (ErrClosed, after draining buffered OOB).
+func (s *Session) ReadOOB(buf []byte) (int, error) {
+	if s.oobOut == nil {
+		return 0, s.cfg.ErrOOBUnsupported
+	}
+	for {
+		select {
+		case p := <-s.oobOut:
+			return copy(buf, p), nil
+		default:
+		}
+		timer, expired := s.deadlineTimerFor(s.readDeadline.Load())
+		if expired {
+			return 0, s.cfg.ErrTimeout
+		}
+		var timeout <-chan time.Time
+		if timer != nil {
+			timeout = timer.C
+		}
+		select {
+		case p := <-s.oobOut:
+			stopOptTimer(timer)
+			return copy(buf, p), nil
+		case <-s.done:
+			stopOptTimer(timer)
+			select {
+			case p := <-s.oobOut:
+				return copy(buf, p), nil
+			default:
+				return 0, s.closeReason()
+			}
+		case <-timeout:
+			return 0, s.cfg.ErrTimeout
+		case <-s.readWake:
+			stopOptTimer(timer)
+		}
+	}
+}
+
 // take copies as much of payload as fits into buf, stashing any remainder for
 // the next Read (stream semantics for io.Copy).
 func (s *Session) take(buf, payload []byte) int {
@@ -146,7 +229,12 @@ func (s *Session) SetWriteDeadline(t time.Time) {
 }
 
 // Stats returns the most recent snapshot of the flow's counters.
-func (s *Session) Stats() flow.Stats { return *s.stats.Load() }
+func (s *Session) Stats() flow.Stats {
+	s.statsMu.Lock()
+	v := s.statsVal
+	s.statsMu.Unlock()
+	return v
+}
 
 // Authenticated reports whether the data channel is open: true for a Simple
 // session or a Main session without EAP, and for a Main+EAP session once the

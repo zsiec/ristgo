@@ -118,6 +118,15 @@ type Config struct {
 	// Default: 100000 (100 Mbps). Must be positive.
 	MaxBitrate int
 
+	// MinBitrate is the floor, in kbps, below which source-adaptation rate
+	// control (OnRateAdapt) will not drive the encoder target. TR-06-4 Part 1
+	// §7 notes that for a given codec, resolution, and frame rate there is a
+	// minimum supportable bit rate below which operation is not guaranteed, so
+	// an application should set this to its encoder's viable floor. 0 (the
+	// default) means the controller's built-in 500 kbps floor. When set it must
+	// satisfy 0 < MinBitrate <= MaxBitrate. Only meaningful with OnRateAdapt.
+	MinBitrate int
+
 	// VirtSrcPort is the virtual source port carried in the reduced
 	// overhead header (libRIST virt_src_port). Not used by the Simple
 	// profile. Default: 1971.
@@ -261,6 +270,29 @@ func (cfg *Config) validate() error {
 		return errors.New("rist: Profile must be ProfileSimple (0), ProfileMain (1), or ProfileAdvanced (2)")
 	}
 
+	// Profile-capability gate: fail closed when a security- or feature-bearing
+	// field is set on a profile that does not consume it, instead of silently
+	// dropping it on the floor. The Simple profile (TR-06-1) has no encryption,
+	// no SRP authentication, and no compression; EAP-SRP is Main-only; payload
+	// compression is Advanced-only. A caller who sets Secret but forgets
+	// ProfileMain/Advanced must get an error rather than a cleartext stream.
+	if cfg.Profile == ProfileSimple {
+		switch {
+		case cfg.Secret != "":
+			return errors.New("rist: Secret (PSK encryption) requires ProfileMain or ProfileAdvanced; the Simple profile transmits in the clear")
+		case cfg.AESKeyBits != 0:
+			return errors.New("rist: AESKeyBits requires ProfileMain or ProfileAdvanced")
+		case cfg.KeyRotation != 0:
+			return errors.New("rist: KeyRotation requires ProfileMain or ProfileAdvanced")
+		}
+	}
+	if cfg.Username != "" && cfg.Profile != ProfileMain {
+		return errors.New("rist: Username/Password (EAP-SRP authentication) requires ProfileMain")
+	}
+	if cfg.Compression && cfg.Profile != ProfileAdvanced {
+		return errors.New("rist: Compression requires ProfileAdvanced")
+	}
+
 	if cfg.DTLS != nil {
 		if cfg.Profile != ProfileMain {
 			return errors.New("rist: DTLS transport security requires ProfileMain")
@@ -270,6 +302,12 @@ func (cfg *Config) validate() error {
 		}
 		if cfg.DTLS.PSK == nil && len(cfg.DTLS.CertPEM) == 0 && !cfg.DTLS.InsecureSkipVerify && cfg.DTLS.PeerFingerprint == [32]byte{} {
 			return errors.New("rist: DTLS requires a PSK, a certificate, or peer verification")
+		}
+		// Bound the PSK well below the 16-bit length prefix in the RFC 4279
+		// pre-master construction (a >64 KiB PSK would silently truncate); a DTLS
+		// PSK is a short shared secret, so 512 bytes is generous.
+		if len(cfg.DTLS.PSK) > 512 {
+			return errors.New("rist: DTLS PSK must be at most 512 bytes")
 		}
 	}
 
@@ -356,6 +394,12 @@ func (cfg *Config) validate() error {
 	}
 	if cfg.MaxBitrate < 0 {
 		return errors.New("rist: MaxBitrate must be positive (kbps)")
+	}
+	if cfg.MinBitrate < 0 {
+		return errors.New("rist: MinBitrate must be at least 0 (kbps; 0 = library floor)")
+	}
+	if cfg.MinBitrate > cfg.MaxBitrate {
+		return errors.New("rist: MinBitrate must not exceed MaxBitrate")
 	}
 
 	if cfg.VirtSrcPort == 0 {

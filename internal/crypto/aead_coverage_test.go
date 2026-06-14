@@ -216,7 +216,8 @@ func TestInterpretedHMACKeyAndScope(t *testing.T) {
 	}
 
 	// Independently reconstruct using the public DeriveKey, then assert the
-	// derived key is the HMAC key and aad||ct is the HMAC input.
+	// derived key is the AES-CTR key and an independent (expanded) MAC key over
+	// aad||ct is the HMAC input.
 	key, err := DeriveKey(password, nonce4[:], KeySize256)
 	if err != nil {
 		t.Fatalf("DeriveKey: %v", err)
@@ -233,9 +234,13 @@ func TestInterpretedHMACKeyAndScope(t *testing.T) {
 	if _, e := ctrXOR(make([]byte, 7), BuildIV(1), []byte("x")); !errors.Is(e, ErrInvalidKeySize) {
 		t.Fatalf("ctrXOR with a 7-byte key: err = %v, want ErrInvalidKeySize", e)
 	}
-	wantHash := hmacTag(key, aad, wantCT)
+	wantHash := hmacTag(deriveMACKey(key), aad, wantCT)
 	if wantHash != hash {
-		t.Fatalf("hash != HMAC(derivedKey, aad||ct)[:16]:\n got  %x\n want %x", hash, wantHash)
+		t.Fatalf("hash != HMAC(macKey, aad||ct)[:16]:\n got  %x\n want %x", hash, wantHash)
+	}
+	// The MAC key must be independent of the AES-CTR encryption key.
+	if bytes.Equal(deriveMACKey(key)[:KeySize256/8], key) {
+		t.Fatal("MAC key equals the AES-CTR key (no key separation)")
 	}
 }
 

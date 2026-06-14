@@ -206,7 +206,7 @@ func EncodeBitmaskNACK(mediaSSRC uint32, missing []uint32) []NackBitmask {
 		return nil
 	}
 	s := append([]uint32(nil), missing...)
-	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	sortSeqsWrap(s)
 
 	var out []NackBitmask
 	i := 0
@@ -242,7 +242,7 @@ func EncodeRangeNACK(mediaSSRC uint32, missing []uint32) []NackRange {
 		return nil
 	}
 	s := append([]uint32(nil), missing...)
-	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	sortSeqsWrap(s)
 
 	var out []NackRange
 	i := 0
@@ -260,7 +260,12 @@ func EncodeRangeNACK(mediaSSRC uint32, missing []uint32) []NackRange {
 			if next != s[j]+1 { // gap: run ends
 				break
 			}
-			if next-pss > maxNACKDecodeRange { // run longer than the cap: split
+			// Split so the emitted NALP never reaches maxNACKDecodeRange: a
+			// libRIST receiver's recovery loop is bounded by BOTH i<=NALP AND
+			// i<maxNACKDecodeRange, so a NALP of exactly maxNACKDecodeRange would
+			// leave PSS+maxNACKDecodeRange un-recovered (a permanent 1-packet
+			// hole). Breaking at >= keeps the max emitted NALP at cap-1.
+			if next-pss >= maxNACKDecodeRange {
 				break
 			}
 			j++
@@ -269,6 +274,20 @@ func EncodeRangeNACK(mediaSSRC uint32, missing []uint32) []NackRange {
 		i = j + 1
 	}
 	return out
+}
+
+// sortSeqsWrap sorts a missing-sequence list in ascending circular (wrap-aware)
+// order. The entries lie within a bounded recovery window (< 2^31 wide), so
+// ordering by the signed 32-bit distance from the first element is correct even
+// when the window straddles the 2^32 sequence wrap — a raw-value sort would put
+// sequences just below and just above the wrap at opposite ends and split one
+// consecutive run into two distant NACK entries.
+func sortSeqsWrap(s []uint32) {
+	if len(s) == 0 {
+		return
+	}
+	pivot := s[0]
+	sort.Slice(s, func(i, j int) bool { return int32(s[i]-pivot) < int32(s[j]-pivot) })
 }
 
 // RTTEcho is the body shared by the RTT Echo Request (CIRTTEchoReq) and

@@ -63,9 +63,54 @@ const (
 	RoleReceiver
 )
 
-// DefaultRingSize is the default receiver ring capacity in slots, matching
-// libRIST's receiver_queue_max of 2^16 entries (UINT16_SIZE).
+// DefaultRingSize is the FLOOR for the ring capacity in slots when no explicit
+// RingSize is configured. libRIST allocates its sender_queue/receiver_queue as a
+// flat UINT16_SIZE*8 (2^19) pointer array; ristgo instead derives the size from
+// the recovery window and bitrate (deriveRingSize) so memory is proportional to
+// need — ristgo's ring slots inline the per-packet metadata (~72 bytes) rather
+// than holding a pointer, so a flat 2^19 would be ~37 MB per flow. 2^16 is the
+// floor (it comfortably covers the 100 Mbps / 1000 ms default at ~9000 packets);
+// high-bitrate or large-window configs round up above it.
 const DefaultRingSize = 1 << 16
+
+// maxDerivedRingSize caps the derived ring at 2^21 slots (~150 MB at 72 B/slot)
+// so a pathological window×bitrate configuration cannot request unbounded
+// memory. Beyond this the caller should set RingSize explicitly.
+const maxDerivedRingSize = 1 << 21
+
+// ringPacketBytes is the assumed on-wire packet size used when deriving the ring
+// floor from the recovery window and bitrate. It is deliberately on the small
+// side of a typical 1316-byte MPEG-TS RIST packet so the derived ring oversizes
+// rather than undersizes.
+const ringPacketBytes = 1100
+
+// deriveRingSize returns the ring floor that holds a full recovery window's
+// worth of in-flight packets at the configured max bitrate: the sender retains
+// history for recovery_length_max + 2*rtt_min (libRIST sender_recover_min_time),
+// the receiver for the recovery buffer; the larger governs. It is a pure
+// function of Config (no clock read) and is floored at DefaultRingSize and
+// capped at maxDerivedRingSize. nextPow2 rounding is applied by the caller.
+func deriveRingSize(cfg Config) int {
+	windowUs := cfg.RecoveryBufferMax + 2*cfg.RTTMin
+	if rb := cfg.RecoveryBuffer(); rb > windowUs {
+		windowUs = rb
+	}
+	kbps := cfg.RecoveryMaxBitrate
+	if kbps <= 0 {
+		kbps = 100000
+	}
+	// packets = windowSeconds * bits_per_second / (8 * packetBytes)
+	//         = (windowUs/1e6) * (kbps*1000) / (8 * ringPacketBytes)
+	//         = windowUs * kbps / (8000 * ringPacketBytes)
+	packets := int64(windowUs) * int64(kbps) / (8000 * ringPacketBytes)
+	if packets < DefaultRingSize {
+		return DefaultRingSize
+	}
+	if packets > maxDerivedRingSize {
+		return maxDerivedRingSize
+	}
+	return int(packets)
+}
 
 // Receiver pacing constants from libRIST.
 const (
@@ -90,11 +135,10 @@ type Config struct {
 	// RecoveryBufferMin.
 	RecoveryBufferMax clock.Microseconds
 
-	// ReorderBuffer is libRIST's recovery_reorder_buffer. The receiver
-	// half does not consume it directly this stage (libRIST folds it into
-	// the rtt value used for the first NACK — see the DEVIATION note at
-	// addMissing); it is carried here so the sender half and later stages
-	// share one Config.
+	// ReorderBuffer is libRIST's recovery_reorder_buffer. The receiver folds it
+	// into the first-NACK delay (max(clamp(rtt)/2, reorder_buffer) — see
+	// addMissing), so a merely-reordered packet is not NACKed before its
+	// in-order copy can arrive within the reorder window.
 	ReorderBuffer clock.Microseconds
 
 	// RTTMin and RTTMax clamp the smoothed RTT whenever it is read for
@@ -110,10 +154,22 @@ type Config struct {
 	// once it has been NACKed this many times.
 	MaxRetries int
 
+	// RecoveryMaxBitrate is libRIST's recovery_maxbitrate in kbps (default
+	// 100000 = 100 Mbps). It sizes the ring floor (a window's worth of packets
+	// must fit) and drives the sender congestion-control pacing. 0 defaults to
+	// 100000.
+	RecoveryMaxBitrate int
+
+	// CongestionControl selects the sender's recovery_maxbitrate pacing mode
+	// (libRIST congestion_control). The zero value is CongestionOff; the libRIST
+	// default is CongestionNormal, set by DefaultConfig and the host.
+	CongestionControl CongestionMode
+
 	// RingSize is the ring capacity in slots — the receiver history ring and
-	// the sender retransmit-history ring alike. Values <= 0 default to
-	// DefaultRingSize; other values are rounded up to a power of two so
-	// seq&mask indexing works.
+	// the sender retransmit-history ring alike. Values <= 0 default to a size
+	// derived from the recovery window and RecoveryMaxBitrate (so a window's
+	// worth of in-flight packets always fits); other values are rounded up to a
+	// power of two so seq&mask indexing works.
 	RingSize int
 
 	// SSRC is the base flow SSRC the sender half stamps into every outgoing
@@ -134,14 +190,16 @@ type Config struct {
 // rtt_max = 500 ms, min_retries = 6, max_retries = 20, and the 2^16 ring.
 func DefaultConfig() Config {
 	return Config{
-		RecoveryBufferMin: 1000 * clock.Millisecond,
-		RecoveryBufferMax: 1000 * clock.Millisecond,
-		ReorderBuffer:     15 * clock.Millisecond,
-		RTTMin:            5 * clock.Millisecond,
-		RTTMax:            500 * clock.Millisecond,
-		MinRetries:        6,
-		MaxRetries:        20,
-		RingSize:          DefaultRingSize,
+		RecoveryBufferMin:  1000 * clock.Millisecond,
+		RecoveryBufferMax:  1000 * clock.Millisecond,
+		ReorderBuffer:      15 * clock.Millisecond,
+		RTTMin:             5 * clock.Millisecond,
+		RTTMax:             500 * clock.Millisecond,
+		MinRetries:         6,
+		MaxRetries:         20,
+		RecoveryMaxBitrate: 100000,
+		CongestionControl:  CongestionNormal,
+		RingSize:           DefaultRingSize,
 	}
 }
 
@@ -165,6 +223,13 @@ type Flow struct {
 	// double multiply-and-truncate libRIST uses for its too-late and
 	// NACK-abandon thresholds.
 	recoveryBuffer110 clock.Microseconds
+
+	// missingCounterMax bounds how many missing entries the receiver queues
+	// before it stops marking new gaps (libRIST's buffer-bloat / overflow
+	// guard); maxNacksPerLoop caps the retransmissions the sender emits per
+	// service pass. Both are pure functions of Config, computed in New.
+	missingCounterMax uint32
+	maxNacksPerLoop   int
 
 	// est is the libRIST eight_times_rtt estimator. One per flow this
 	// stage; per-path attribution lands with bonding (WP8), when feedback
@@ -198,9 +263,11 @@ func New(role Role, cfg Config) *Flow {
 	// Same arithmetic as libRIST's (recovery_buffer_ticks * 1.1) double
 	// multiply with truncation.
 	f.recoveryBuffer110 = clock.Microseconds(float64(f.recoveryBuffer) * 1.1)
+	f.missingCounterMax = deriveMissingCounterMax(cfg)
+	f.maxNacksPerLoop = deriveMaxNacksPerLoop(cfg)
 	size := cfg.RingSize
 	if size <= 0 {
-		size = DefaultRingSize
+		size = deriveRingSize(cfg)
 	}
 	size = nextPow2(size)
 	switch role {
@@ -254,14 +321,19 @@ func (f *Flow) Feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 // SSRC/flow-id demultiplexing is the host's job (PLAN.md: internal/socket
 // demuxes by addr/flow-id; cf. libRIST's per-peer SSRC guard). Feedback
 // handed here is trusted to belong to this flow: the RTT estimator update and
-// serviceNack apply no additive SSRC check, and wire.RttEchoResponse
-// intentionally carries no SSRC field.
+// serviceNack apply no additive SSRC check. The echo SSRC that does cross the
+// waist (wire.RttEchoRequest/Response.SSRC) is not a demux key — it is the
+// requester's SSRC, carried only so the responder can echo it back to satisfy
+// the peer's response filter.
 func (f *Flow) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	switch fb := fb.(type) {
 	case wire.RttEchoRequest:
+		// Echo the requester's SSRC (and timestamp) back: a libRIST requester
+		// drops any response whose SSRC differs from its own, so the response
+		// must carry the request's SSRC, not the responder's flow id.
 		f.outputs.push(SendFeedback{
 			Path: f.feedbackPath(),
-			FB:   wire.RttEchoResponse{Timestamp: fb.Timestamp, ProcessingDelay: 0},
+			FB:   wire.RttEchoResponse{SSRC: fb.SSRC, Timestamp: fb.Timestamp, ProcessingDelay: 0},
 		})
 	case wire.RttEchoResponse:
 		// sample = (now - echoed timestamp) - processing delay. libRIST's

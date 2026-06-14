@@ -268,11 +268,14 @@ func TestMissingDetectInterpolationExact(t *testing.T) {
 	for e := f.receiver.missingHead; e != nil; e = e.next {
 		got = append(got, entry{e.seq, e.path, e.insertionTime, e.nextNack, e.nackCount})
 	}
-	// firstNack = insertionTime + smoothedRTT (cold start = RTTMin = 5ms).
+	// firstNack = now + max(clamp(rtt)/2, reorder_buffer) anchored to now=45000
+	// (libRIST rist_receiver_missing). Cold start: clamp(rtt)/2 = 2.5ms <
+	// reorder_buffer (15ms), so the floor applies: 45000 + 15000 = 60000 for
+	// every entry, regardless of its interpolated insertion time.
 	want := []entry{
-		{102, 3, 22_600, 27_600, 0},
-		{103, 3, 28_200, 33_200, 0},
-		{104, 3, 33_800, 38_800, 0},
+		{102, 3, 22_600, 60_000, 0},
+		{103, 3, 28_200, 60_000, 0},
+		{104, 3, 33_800, 60_000, 0},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("missing entries = %+v, want %+v", got, want)
@@ -307,8 +310,9 @@ func TestMissingInsertionTimeClamped(t *testing.T) {
 	if e.insertionTime != 2_010_000 {
 		t.Fatalf("insertionTime = %d, want clamped to now (2010000)", e.insertionTime)
 	}
-	if e.nextNack != 2_015_000 {
-		t.Fatalf("nextNack = %d, want 2015000", e.nextNack)
+	// firstNack = now + max(clamp(rtt)/2, reorder_buffer) = 2010000 + 15000.
+	if e.nextNack != 2_025_000 {
+		t.Fatalf("nextNack = %d, want 2025000", e.nextNack)
 	}
 }
 
@@ -327,7 +331,14 @@ func TestMissingGapGuards(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := New(RoleReceiver, testConfig())
+			// Raise RecoveryMaxBitrate so missing_counter_max (which caps the
+			// marked gap, tested separately) far exceeds MaxGap16 and this test
+			// isolates the wraparound boundary. Pin RingSize so the high bitrate
+			// does not balloon the derived ring.
+			cfg := testConfig()
+			cfg.RecoveryMaxBitrate = 10_000_000
+			cfg.RingSize = 1 << 16
+			f := New(RoleReceiver, cfg)
 			f.Feed(10_000, 0, mkPkt(tt.firstSeq, 0, nil))
 			f.Feed(17_000, 0, mkPkt(tt.nextSeq, 7_000, nil))
 			if got := f.Stats().Missing; got != tt.wantMissing {
@@ -373,10 +384,26 @@ func TestNackPassBatchAndRetryTiming(t *testing.T) {
 	f.Feed(45_000, 0, mkPkt(105, 35_000, nil)) // missing 102..104
 	drainOutputs(f)
 
-	// Timer fires at 50000: every entry's first nack (27600/33200/38800)
-	// is due -> one grouped NackRequest, retry at now + 1.1*clamp(rtt).
+	// Every entry's first nack is scheduled at now+reorder_buffer =
+	// 45000+15000 = 60000. The 5ms cadence timer fires at 50000 and 55000 with
+	// nothing yet due, re-arming each time.
 	f.HandleTimer(50_000, TimerNack)
 	outs := drainOutputs(f)
+	if fbs := feedbackOutputs(outs); len(fbs) != 0 {
+		t.Fatalf("unexpected feedback at 50000: %v", fbs)
+	}
+	if want := []Output{SetTimer{ID: TimerNack, Deadline: 55_000}}; !reflect.DeepEqual(outs, want) {
+		t.Fatalf("outputs at 50000 = %v, want re-arm to 55000", outs)
+	}
+	f.HandleTimer(55_000, TimerNack)
+	if fbs := feedbackOutputs(drainOutputs(f)); len(fbs) != 0 {
+		t.Fatalf("unexpected feedback at 55000")
+	}
+
+	// 60000: every entry's first nack is due -> one grouped NackRequest, each
+	// re-scheduled at now + 1.1*clamp(rtt) = 60000 + 5500.
+	f.HandleTimer(60_000, TimerNack)
+	outs = drainOutputs(f)
 	fbs := feedbackOutputs(outs)
 	if len(fbs) != 1 {
 		t.Fatalf("feedback outputs = %d, want 1 (%v)", len(fbs), outs)
@@ -392,32 +419,31 @@ func TestNackPassBatchAndRetryTiming(t *testing.T) {
 		t.Fatalf("nack.SSRC = %#x, want 0x12345678", nack.SSRC)
 	}
 	// Re-armed on the 5ms cadence.
-	if want := (SetTimer{ID: TimerNack, Deadline: 55_000}); outs[len(outs)-1] != want {
+	if want := (SetTimer{ID: TimerNack, Deadline: 65_000}); outs[len(outs)-1] != want {
 		t.Fatalf("rearm = %v, want %v", outs[len(outs)-1], want)
 	}
 	for e := f.receiver.missingHead; e != nil; e = e.next {
-		// next_nack = now + (uint64)(rtt*1.1) = 50000 + 5500
-		// (librist).
-		if e.nextNack != 55_500 || e.nackCount != 1 {
-			t.Fatalf("entry %d nextNack/count = %d/%d, want 55500/1", e.seq, e.nextNack, e.nackCount)
+		// next_nack = now + (uint64)(rtt*1.1) = 60000 + 5500 (librist).
+		if e.nextNack != 65_500 || e.nackCount != 1 {
+			t.Fatalf("entry %d nextNack/count = %d/%d, want 65500/1", e.seq, e.nextNack, e.nackCount)
 		}
 	}
 	if got := f.Stats().NacksSent; got != 3 {
 		t.Fatalf("NacksSent = %d, want 3", got)
 	}
 
-	// 55000: nothing due (55500 > 55000) -> no feedback, just the re-arm.
-	f.HandleTimer(55_000, TimerNack)
+	// 65000: nothing due (65500 > 65000) -> no feedback, just the re-arm.
+	f.HandleTimer(65_000, TimerNack)
 	outs = drainOutputs(f)
 	if fbs := feedbackOutputs(outs); len(fbs) != 0 {
-		t.Fatalf("unexpected feedback at 55000: %v", fbs)
+		t.Fatalf("unexpected feedback at 65000: %v", fbs)
 	}
-	if want := []Output{SetTimer{ID: TimerNack, Deadline: 60_000}}; !reflect.DeepEqual(outs, want) {
+	if want := []Output{SetTimer{ID: TimerNack, Deadline: 70_000}}; !reflect.DeepEqual(outs, want) {
 		t.Fatalf("outputs = %v, want %v", outs, want)
 	}
 
-	// 60000: due again.
-	f.HandleTimer(60_000, TimerNack)
+	// 70000: due again (65500 <= 70000).
+	f.HandleTimer(70_000, TimerNack)
 	if fbs := feedbackOutputs(drainOutputs(f)); len(fbs) != 1 {
 		t.Fatalf("second retry batch missing")
 	}
@@ -434,14 +460,15 @@ func TestNackAbandonMaxRetries(t *testing.T) {
 	f.Feed(24_000, 0, mkPkt(102, 14_000, nil)) // missing 101
 	drainOutputs(f)
 
-	f.processNacks(30_000) // nack #1
-	f.processNacks(40_000) // nack #2 (nextNack was 30000+5500)
+	// First nack is due at 24000 + reorder_buffer(15000) = 39000.
+	f.processNacks(40_000) // nack #1 (due at 39000)
+	f.processNacks(50_000) // nack #2 (nextNack was 40000+5500=45500)
 	if got := f.Stats().NacksSent; got != 2 {
 		t.Fatalf("NacksSent = %d, want 2", got)
 	}
 	// Third pass: nackCount(2) >= MaxRetries(2) -> abandon
 	// (librist).
-	f.processNacks(50_000)
+	f.processNacks(60_000)
 	st := f.Stats()
 	if st.Abandoned != 1 || st.NacksSent != 2 || f.receiver.missingCount != 0 {
 		t.Fatalf("abandoned/nacks/pending = %d/%d/%d, want 1/2/0",
@@ -697,5 +724,99 @@ func TestFeedbackWithoutHandlerCounted(t *testing.T) {
 	}
 	if outs := drainOutputs(f); outs != nil {
 		t.Fatalf("unexpected outputs %v", outs)
+	}
+}
+
+// TestEchoResponseEchoesRequesterSSRC verifies that an inbound RTT echo request
+// produces a response carrying the requester's SSRC (not the responder's). A
+// libRIST requester drops any echo response whose SSRC differs from its own
+// peer_ssrc, so echoing the wrong SSRC silently breaks RTT measurement.
+func TestEchoResponseEchoesRequesterSSRC(t *testing.T) {
+	for _, role := range []Role{RoleReceiver, RoleSender} {
+		f := New(role, testConfig())
+		const requesterSSRC = 0xABCD_1234
+		f.FeedFeedback(clock.Timestamp(clock.Second), wire.RttEchoRequest{SSRC: requesterSSRC, Timestamp: 0x1111_2222_3333_4444})
+		fbs := feedbackOutputs(drainOutputs(f))
+		var resp *wire.RttEchoResponse
+		for _, fb := range fbs {
+			if r, ok := fb.FB.(wire.RttEchoResponse); ok {
+				resp = &r
+			}
+		}
+		if resp == nil {
+			t.Fatalf("role %v: no RttEchoResponse emitted", role)
+		}
+		if resp.SSRC != requesterSSRC {
+			t.Errorf("role %v: response SSRC = %#x, want requester %#x", role, resp.SSRC, requesterSSRC)
+		}
+		if resp.Timestamp != 0x1111_2222_3333_4444 {
+			t.Errorf("role %v: response did not echo the request timestamp", role)
+		}
+	}
+}
+
+// TestSourceClockWrapReanchor verifies the receiver re-anchors its clock offset
+// when a fresh in-sequence packet's source time jumps far outside the recovery
+// window (a 32-bit RTP-timestamp wrap), instead of shedding every subsequent
+// packet as too-late and stalling the stream permanently.
+func TestSourceClockWrapReanchor(t *testing.T) {
+	f := New(RoleReceiver, testConfig())
+	base := clock.Microseconds(10_000_000)
+	now := clock.Timestamp(10_000_000)
+	for i := 0; i < 3; i++ {
+		f.Feed(now, 0, mkPkt(uint32(100+i), base+clock.Microseconds(i)*1000, []byte{1}))
+		now += 1000
+	}
+	drainOutputs(f)
+	drainEvents(f)
+	before := f.Stats()
+
+	// Source time wraps to near zero while the sequence continues (seq 103).
+	now += 1000
+	f.Feed(now, 0, mkPkt(103, 5_000, []byte{2}))
+	after := f.Stats()
+	if after.ClockResync != before.ClockResync+1 {
+		t.Fatalf("ClockResync = %d, want %d (no re-anchor on wrap)", after.ClockResync, before.ClockResync+1)
+	}
+	if after.TooLate != before.TooLate {
+		t.Fatalf("wrapped packet shed as too-late (%d) instead of re-anchoring", after.TooLate)
+	}
+	if after.Received != before.Received+1 {
+		t.Fatalf("wrapped packet not accepted (Received %d -> %d)", before.Received, after.Received)
+	}
+
+	// The stream keeps flowing after the wrap (no permanent stall).
+	now += 1000
+	f.Feed(now, 0, mkPkt(104, 6_000, []byte{3}))
+	if f.Stats().Received != after.Received+1 {
+		t.Fatalf("post-wrap packet not accepted; stream stalled")
+	}
+}
+
+// TestMissingCounterMaxCaps verifies the receiver stops queuing new missing
+// entries once the missing queue exceeds missing_counter_max (libRIST's
+// buffer-bloat / overflow guard), so a large gap cannot fill the ring.
+func TestMissingCounterMaxCaps(t *testing.T) {
+	cfg := testConfig() // default 100 Mbps / 1000 ms -> missing_counter_max = 4166
+	f := New(RoleReceiver, cfg)
+	f.Feed(10_000, 0, mkPkt(100, 0, nil))
+	// A gap of 20000 (< MaxGap16) would mark ~20000 entries without the cap.
+	f.Feed(17_000, 0, mkPkt(100+20000, 7_000, nil))
+	if got := f.Stats().Missing; got > uint64(deriveMissingCounterMax(cfg))+1 {
+		t.Fatalf("Stats.Missing = %d, want <= missing_counter_max+1 (%d)", got, deriveMissingCounterMax(cfg)+1)
+	}
+	if f.Stats().Missing < 1000 {
+		t.Fatalf("Stats.Missing = %d, want a substantial (capped) count", f.Stats().Missing)
+	}
+}
+
+// TestDerivedCongestionConstants checks the libRIST-matching defaults.
+func TestDerivedCongestionConstants(t *testing.T) {
+	cfg := DefaultConfig()
+	if got := deriveMissingCounterMax(cfg); got != 4166 {
+		t.Errorf("missing_counter_max = %d, want 4166", got)
+	}
+	if got := deriveMaxNacksPerLoop(cfg); got != 88 {
+		t.Errorf("max_nacksperloop = %d, want 88", got)
 	}
 }

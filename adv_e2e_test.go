@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"runtime"
 	"testing"
 	"time"
@@ -280,8 +281,8 @@ func TestE2EAdvCloseUnblocksRead(t *testing.T) {
 	}
 	select {
 	case err := <-readErr:
-		if err != ristgo.ErrClosed {
-			t.Fatalf("Read after Close = %v, want ErrClosed", err)
+		if err != io.EOF {
+			t.Fatalf("Read after Close = %v, want io.EOF", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not unblock Read")

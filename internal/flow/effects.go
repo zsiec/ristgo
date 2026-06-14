@@ -182,6 +182,13 @@ type Stats struct {
 	// the core.
 	IgnoredFeedback uint64
 
+	// ClockResync counts source-clock re-anchors: a fresh in-sequence packet
+	// mapped far outside the recovery window (a 32-bit RTP-timestamp wrap, ~13h
+	// at 90 kHz, or a source clock reset), so the locked offset was refreshed to
+	// keep playout from stalling (libRIST receiver_calculate_packet_time wrap
+	// fix-up).
+	ClockResync uint64
+
 	// --- Sender-half counters ---
 
 	// Sent counts first-transmission media packets emitted by PushApp.
@@ -204,4 +211,9 @@ type Stats struct {
 	// RetransmitExhausted counts NACKed sequence numbers refused because the
 	// packet had already been retransmitted MaxRetries times.
 	RetransmitExhausted uint64
+
+	// BandwidthSkipped counts retransmissions refused by the recovery_maxbitrate
+	// pacing gate (libRIST stats_sender_instant.bandwidth_skip). The entry is
+	// left resendable, so the receiver re-NACKs it once the rate decays.
+	BandwidthSkipped uint64
 }

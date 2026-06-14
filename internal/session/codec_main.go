@@ -147,6 +147,20 @@ type mainCodec struct {
 	// bitmask selects the NACK wire encoding for outbound feedback: false for
 	// RIST range NACK (TR-06 default), true for RFC 4585 bitmask NACK.
 	bitmask bool
+
+	// Reusable encode scratch (loop-owned, single goroutine). The Main media
+	// encode path is otherwise the only hot path that heap-allocates per packet
+	// — unlike the 0-alloc Simple and Advanced-cleartext paths — so these
+	// buffers let buildMediaRTP and frame reuse memory instead of passing nil.
+	// They are distinct so none aliases another within one encode (rtpScratch
+	// holds the inner RTP, npdScratch the null-suppressed payload, extScratch the
+	// NPD extension bytes, regionScratch the cleartext AES region, ctScratch the
+	// ciphertext); the final datagram is built in the caller's dst.
+	rtpScratch    []byte
+	npdScratch    []byte
+	extScratch    []byte
+	regionScratch []byte
+	ctScratch     []byte
 }
 
 // newMainCodec constructs a Main-profile codec. sendKey and recvKey may be nil
@@ -200,16 +214,21 @@ func (c *mainCodec) encodeMainMedia(dst []byte, pkt wire.MediaPacket) ([]byte, e
 // encodeMedia output.
 func (c *mainCodec) buildMediaRTP(pkt wire.MediaPacket) ([]byte, error) {
 	if !c.npdEnabled {
-		return encodeMedia(nil, pkt)
+		out, err := encodeMedia(c.rtpScratch[:0], pkt)
+		c.rtpScratch = out
+		return out, err
 	}
 	// Try to suppress null packets. Suppress copies through unchanged (and
 	// reports suppressed==0) when the payload has no nulls; it errors when the
 	// payload is not a whole number of <=7 TS packets. Either way, fall back
 	// to a plain RTP packet — libRIST attaches the extension only when
 	// suppress_null_packets returns > 0.
-	reduced, npdBits, suppressed, err := npd.Suppress(nil, pkt.Payload)
+	reduced, npdBits, suppressed, err := npd.Suppress(c.npdScratch[:0], pkt.Payload)
+	c.npdScratch = reduced
 	if err != nil || suppressed == 0 {
-		return encodeMedia(nil, pkt)
+		out, err := encodeMedia(c.rtpScratch[:0], pkt)
+		c.rtpScratch = out
+		return out, err
 	}
 
 	ssrc := pkt.SSRC
@@ -239,11 +258,15 @@ func (c *mainCodec) buildMediaRTP(pkt wire.MediaPacket) ([]byte, error) {
 			// (profile + length) itself; ExtensionPayload is only the four
 			// bytes after it: flags, npd_bits, seq_ext (npd.Ext minus its
 			// identifier+length). appendExtPayload emits exactly those.
-			ExtensionPayload: appendExtPayload(nil, ext),
+			ExtensionPayload: c.extScratch[:0],
 		},
 		Payload: reduced,
 	}
-	return p.AppendTo(nil)
+	p.Header.ExtensionPayload = appendExtPayload(p.Header.ExtensionPayload, ext)
+	c.extScratch = p.Header.ExtensionPayload
+	out, err := p.AppendTo(c.rtpScratch[:0])
+	c.rtpScratch = out
+	return out, err
 }
 
 // appendExtPayload appends the four NPD extension-payload bytes (flags,
@@ -289,9 +312,13 @@ func (c *mainCodec) buildCompound(lead rtcp.Packet, fbs []wire.Feedback, bitmask
 		case wire.NackRequest:
 			nacks = append(nacks, c.encodeNACK(f, bitmask)...)
 		case wire.RttEchoRequest:
+			// Originated request: stamp the local SSRC. (An inbound request
+			// never reaches the encoder.)
 			echoes = append(echoes, rtcp.EchoRequest{SSRC: c.ssrc, Timestamp: f.Timestamp})
 		case wire.RttEchoResponse:
-			echoes = append(echoes, rtcp.EchoResponse{SSRC: c.ssrc, Timestamp: f.Timestamp, ProcessingDelay: f.ProcessingDelay})
+			// Echo the requester's SSRC (captured on decode), not our own: a
+			// libRIST requester drops a response whose SSRC != its peer_ssrc.
+			echoes = append(echoes, rtcp.EchoResponse{SSRC: f.SSRC, Timestamp: f.Timestamp, ProcessingDelay: f.ProcessingDelay})
 		}
 	}
 	pkts = append(pkts, nacks...)
@@ -347,7 +374,9 @@ func (c *mainCodec) encodeNACK(f wire.NackRequest, bitmask bool) []rtcp.Packet {
 func (c *mainCodec) nackPackets(mediaSSRC uint32, missing []uint32, bitmask bool) []rtcp.Packet {
 	var out []rtcp.Packet
 	if bitmask {
-		for _, p := range rtcp.EncodeBitmaskNACK(c.ssrc, mediaSSRC, missing) {
+		// SenderSSRC is zero: TR-06-1 §5.3.2.1 has the RIST sender ignore it and
+		// libRIST transmits zero, so match it on the wire.
+		for _, p := range rtcp.EncodeBitmaskNACK(0, mediaSSRC, missing) {
 			out = append(out, p)
 		}
 	} else {
@@ -392,15 +421,18 @@ func (c *mainCodec) frame(dst, inner []byte) ([]byte, error) {
 
 	// Encrypted: the AES-CTR region is the reduced header followed by the
 	// inner packet, encrypted as one block under the GRE sequence's IV. Build
-	// the cleartext region in a scratch buffer, then encrypt it after the GRE
-	// header. The key may rotate on Encrypt, so read the nonce afterwards.
-	region := reduced.AppendTo(nil)
+	// the cleartext region in a reused scratch buffer, then encrypt it (into a
+	// second reused buffer) after the GRE header. The key may rotate on Encrypt,
+	// so read the nonce afterwards.
+	region := reduced.AppendTo(c.regionScratch[:0])
 	region = append(region, inner...)
+	c.regionScratch = region
 
-	ct, err := c.sendKey.Encrypt(seq, nil, region)
+	ct, err := c.sendKey.Encrypt(seq, c.ctScratch[:0], region)
 	if err != nil {
 		return dst, err
 	}
+	c.ctScratch = ct
 	hdr.HasKey = true
 	hdr.KeySize256 = c.keySize256
 	hdr.Nonce = c.sendKey.Nonce()
@@ -410,6 +442,165 @@ func (c *mainCodec) frame(dst, inner []byte) ([]byte, error) {
 		return dst, err
 	}
 	return append(out, ct...), nil
+}
+
+// controlKind identifies a decoded GRE control message peeked by peekControl.
+type controlKind uint8
+
+const (
+	controlNone      controlKind = iota // not a control datagram
+	controlKeepalive                    // a GRE keepalive (caps + MAC)
+	controlBufferNeg                    // a VSF buffer-negotiation message
+)
+
+// frameControl frames a GRE control body (a keepalive or buffer-negotiation
+// message) at the given GRE version: version 1 writes the protocol type directly
+// (ProtoKeepalive); version >= 2 wraps it in the VSF ethertype + 4-byte VSF
+// proto. The body is encrypted under the PSK when one is configured (matching
+// libRIST's send_data, which runs keepalives through the encrypted path). It
+// increments the shared GRE sequence counter once.
+func (c *mainCodec) frameControl(dst, body []byte, version uint8, proto, vsfSubtype uint16) ([]byte, error) {
+	seq := c.greSeq
+	c.greSeq++
+	hdr := gre.Header{Version: version, HasSeq: true, Seq: seq}
+	var region []byte
+	if version >= gre.VersionCur {
+		hdr.ProtType = gre.ProtoVSF
+		region = gre.VSFProto{Type: gre.VSFTypeRIST, Subtype: vsfSubtype}.AppendTo(nil)
+		region = append(region, body...)
+	} else {
+		hdr.ProtType = proto
+		region = body
+	}
+	if c.sendKey == nil {
+		out, err := hdr.AppendTo(dst)
+		if err != nil {
+			return dst, err
+		}
+		return append(out, region...), nil
+	}
+	ct, err := c.sendKey.Encrypt(seq, nil, region)
+	if err != nil {
+		return dst, err
+	}
+	hdr.HasKey = true
+	hdr.KeySize256 = c.keySize256
+	hdr.Nonce = c.sendKey.Nonce()
+	out, err := hdr.AppendTo(dst)
+	if err != nil {
+		return dst, err
+	}
+	return append(out, ct...), nil
+}
+
+// encodeKeepalive frames a GRE keepalive carrying this node's MAC and capability
+// bits, at the negotiated GRE version (see frameControl).
+func (c *mainCodec) encodeKeepalive(dst []byte, ka gre.Keepalive, version uint8) ([]byte, error) {
+	return c.frameControl(dst, ka.AppendTo(nil), version, gre.ProtoKeepalive, gre.VSFSubtypeKeepalive)
+}
+
+// encodeBufferNeg frames a VSF buffer-negotiation message (always GRE version 2;
+// libRIST only sends/parses it at version >= 2).
+func (c *mainCodec) encodeBufferNeg(dst []byte, bn gre.BufferNegotiation) ([]byte, error) {
+	return c.frameControl(dst, bn.AppendTo(nil), gre.VersionCur, gre.ProtoVSF, gre.VSFSubtypeBufferNegotiation)
+}
+
+// peekControl classifies one inbound Main datagram for the GRE control path. It
+// always returns the sender's GRE version (read cheaply from the header, for the
+// monotonic version upgrade) and, for a version-1 keepalive (ProtoKeepalive),
+// decodes the keepalive body so the caller can learn the peer's capabilities and
+// MAC. A version-2 VSF datagram returns controlNone with its version — its
+// subtype lives inside the (possibly encrypted) region, which decodeMain owns
+// (decrypting once, avoiding a double-decrypt here). Returns ok=false (via the
+// version 0 / controlNone result) only on a malformed GRE header. Never panics.
+func (c *mainCodec) peekControl(b []byte) (kind controlKind, ka gre.Keepalive, version uint8, err error) {
+	hdr, off, perr := gre.Parse(b)
+	if perr != nil {
+		return controlNone, ka, 0, nil
+	}
+	version = hdr.Version
+	if hdr.ProtType != gre.ProtoKeepalive {
+		return controlNone, ka, version, nil
+	}
+	region := b[off:]
+	if hdr.HasKey {
+		if c.recvKey == nil {
+			return controlNone, ka, version, nil
+		}
+		c.recvKey.SetKeyBits(hBitKeySize(hdr.KeySize256))
+		pt, derr := c.recvKey.Decrypt(hdr.Nonce, hdr.Seq, nil, region)
+		if derr != nil {
+			return controlKeepalive, ka, version, derr // it IS a keepalive, just undecodable
+		}
+		region = pt
+	}
+	ka, err = gre.ParseKeepalive(region)
+	return controlKeepalive, ka, version, err
+}
+
+// encodeOOB frames an out-of-band data payload (libRIST RIST_PAYLOAD_TYPE_DATA_OOB):
+// GRE FULL framing (prot_type 0x0800) with NO reduced-overhead header and NO RTP
+// header — the raw OOB bytes follow the GRE header directly, encrypted under the
+// PSK when one is configured (matching libRIST's send_data: OOB participates in
+// PSK but never in ARQ). The GRE sequence counter is shared with media/RTCP (it
+// is the AES IV), so OOB and media advance one monotonic sequence.
+func (c *mainCodec) encodeOOB(dst, payload []byte) ([]byte, error) {
+	seq := c.greSeq
+	c.greSeq++
+	hdr := gre.Header{
+		Version:  gre.VersionMin,
+		HasSeq:   true,
+		ProtType: gre.ProtoFull,
+		Seq:      seq,
+	}
+	if c.sendKey == nil {
+		out, err := hdr.AppendTo(dst)
+		if err != nil {
+			return dst, err
+		}
+		return append(out, payload...), nil
+	}
+	ct, err := c.sendKey.Encrypt(seq, nil, payload)
+	if err != nil {
+		return dst, err
+	}
+	hdr.HasKey = true
+	hdr.KeySize256 = c.keySize256
+	hdr.Nonce = c.sendKey.Nonce()
+	out, err := hdr.AppendTo(dst)
+	if err != nil {
+		return dst, err
+	}
+	return append(out, ct...), nil
+}
+
+// peekOOB reports whether b is an out-of-band data datagram (GRE FULL framing)
+// and, if so, returns its decrypted payload. It mirrors peekEAPOL but, unlike
+// EAPOL, OOB participates in PSK encryption, so it uses the codec's decryptor.
+// ok is true whenever b is GRE-FULL (an OOB datagram) regardless of decode
+// success, so the caller routes it to OOB delivery rather than the media demux.
+// It never panics on arbitrary input.
+func (c *mainCodec) peekOOB(b []byte) (oob []byte, ok bool, err error) {
+	hdr, off, perr := gre.Parse(b)
+	if perr != nil || hdr.ProtType != gre.ProtoFull {
+		return nil, false, nil
+	}
+	region := b[off:]
+	if hdr.HasKey {
+		if c.recvKey == nil {
+			return nil, true, fmt.Errorf("rist: main: encrypted OOB but no decryptor configured")
+		}
+		c.recvKey.SetKeyBits(hBitKeySize(hdr.KeySize256))
+		pt, derr := c.recvKey.Decrypt(hdr.Nonce, hdr.Seq, nil, region)
+		if derr != nil {
+			return nil, true, derr
+		}
+		return pt, true, nil
+	}
+	if c.recvKey != nil {
+		return nil, true, fmt.Errorf("rist: main: cleartext OOB but decryptor configured")
+	}
+	return region, true, nil
 }
 
 // encodeEAPOL frames an EAP-over-GRE authentication payload: the GRE header
@@ -464,7 +655,15 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 	if err != nil {
 		return false, wire.MediaPacket{}, nil, err
 	}
-	if hdr.ProtType != gre.ProtoReduced {
+	// Accept version-1 reduced framing and the version-2 VSF wrapper. The VSF
+	// proto sits in the region after the GRE sequence, so (when encrypted) it is
+	// inside the AES-CTR region and is unwrapped after decryption below.
+	isVSF := false
+	switch hdr.ProtType {
+	case gre.ProtoReduced:
+	case gre.ProtoVSF:
+		isVSF = true
+	default:
 		return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: GRE proto 0x%04x, want reduced", hdr.ProtType)
 	}
 	region := b[off:]
@@ -486,6 +685,22 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 		}
 	} else if c.recvKey != nil {
 		return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: cleartext datagram but decryptor configured")
+	}
+
+	// Unwrap the version-2 VSF proto (now decrypted): libRIST maps subtype
+	// 0x0000->REDUCED, 0x8000->KEEPALIVE, 0x8002->BUFFER_NEGOTIATION. Only
+	// REDUCED carries media/RTCP we decode; keepalive and buffer-negotiation are
+	// liveness/handshake control already served at the peer layer, so we accept
+	// them without error or action rather than dropping the datagram.
+	if isVSF {
+		vsf, vn, verr := gre.ParseVSFProto(region)
+		if verr != nil {
+			return false, wire.MediaPacket{}, nil, verr
+		}
+		if vsf.Subtype != gre.VSFSubtypeReduced {
+			return false, wire.MediaPacket{}, nil, nil
+		}
+		region = region[vn:]
 	}
 
 	// Strip the reduced-overhead header; the inner packet follows.
@@ -620,9 +835,9 @@ func (c *mainCodec) decodeFeedbackMain(b []byte, nackRef uint32) ([]wire.Feedbac
 			out = append(out, c.foldNACK(pk.MediaSSRC, pk.MissingSeqs(), seqHigh, haveExtSeq, nackRef))
 			haveExtSeq = false
 		case rtcp.EchoRequest:
-			out = append(out, wire.RttEchoRequest{Timestamp: pk.Timestamp})
+			out = append(out, wire.RttEchoRequest{SSRC: pk.SSRC, Timestamp: pk.Timestamp})
 		case rtcp.EchoResponse:
-			out = append(out, wire.RttEchoResponse{Timestamp: pk.Timestamp, ProcessingDelay: pk.ProcessingDelay})
+			out = append(out, wire.RttEchoResponse{SSRC: pk.SSRC, Timestamp: pk.Timestamp, ProcessingDelay: pk.ProcessingDelay})
 		case rtcp.LinkQualityReport:
 			// Source adaptation (TR-06-4 Part 1 §5.3): the Simple-profile LQM RR
 			// carried transparently over the GRE tunnel; cross the waist as
