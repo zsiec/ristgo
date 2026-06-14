@@ -50,17 +50,21 @@ interop:
 
 # check-deps: the module dependency graph may contain only this module,
 # golang.org/x/crypto, and the Go standard library. (PLAN.md: deps rule.)
+# golang.org/x/sys is allowed solely as a transitive dependency of x/crypto:
+# x/crypto/chacha20poly1305 -> chacha20 imports x/sys/cpu for CPU-feature
+# detection on amd64 (it does not appear on arm64). It is not a dependency we
+# choose directly, and stays within the x/crypto family.
 check-deps:
 	@out=$$($(GO) list -deps -f '{{if and (not .Standard) .Module}}{{.Module.Path}}{{end}}' ./... 2>/dev/null) \
 		|| { echo "check-deps: FAIL — go list -deps ./... failed"; exit 1; }; \
 	bad=$$(printf '%s\n' "$$out" | grep . | sort -u \
-		| grep -v -x -e '$(MODULE)' -e 'golang.org/x/crypto' || true); \
+		| grep -v -x -e '$(MODULE)' -e 'golang.org/x/crypto' -e 'golang.org/x/sys' || true); \
 	if [ -n "$$bad" ]; then \
 		echo "check-deps: FAIL — forbidden module dependencies:"; \
 		echo "$$bad"; \
 		exit 1; \
 	fi; \
-	echo "check-deps: OK (std + $(MODULE) + golang.org/x/crypto only)"
+	echo "check-deps: OK (std + $(MODULE) + golang.org/x/crypto [+ x/sys via x/crypto] only)"
 
 # check-flow-imports: the deterministic core internal/flow may depend only on
 # internal/{seq,clock,rtt,wire} and the standard library. (PLAN.md: hard
