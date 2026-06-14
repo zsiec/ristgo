@@ -1,9 +1,9 @@
 # Contributing to ristgo
 
-ristgo is in early development; expect the internals to move quickly. Before
-writing any code, read **[CLAUDE.md](CLAUDE.md)** — it is the project
-conventions file (architecture guardrails, style rules, test taxonomy,
-authoritative protocol defaults) and is binding for all contributions.
+ristgo is a pure-Go RIST implementation. Contributions are welcome; the
+conventions below — architecture guardrails, style, and test discipline — are
+binding for all changes. See the [package documentation](https://pkg.go.dev/github.com/zsiec/ristgo)
+for the API and design overview.
 
 ## The gauntlet
 
@@ -24,7 +24,7 @@ Or equivalently:
 make build lint test check-deps check-flow-imports
 ```
 
-## Ground rules (details in CLAUDE.md)
+## Ground rules
 
 - Dependencies: Go standard library + `golang.org/x/crypto` only.
 - `internal/flow` is sans-I/O and may import only

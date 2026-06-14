@@ -170,9 +170,9 @@ runs under `go test -race`. See the `Makefile` (`make test`, `lint`, `bench`,
 
 ## Documentation
 
-- **[PLAN.md](PLAN.md)** — architecture, wire-format reference, and the phased
-  implementation roadmap.
-- **[CLAUDE.md](CLAUDE.md)** — project conventions (style, testing, guardrails).
+- **[pkg.go.dev/github.com/zsiec/ristgo](https://pkg.go.dev/github.com/zsiec/ristgo)** —
+  API reference, the architecture overview, and runnable examples.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — conventions and the test gauntlet.
 - **[NOTICE.md](NOTICE.md)** — third-party attributions (pion/rtp, pion/rtcp, LZ4).
 - **`docs/spec/`** — the VSF TR-06 PDF set (the protocol source of truth).
 

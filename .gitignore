@@ -7,3 +7,9 @@ dist/
 
 # OS noise
 .DS_Store
+
+# Local dev & AI-assist docs (kept on disk, out of the published repo)
+/.claude/
+/CLAUDE.md
+/PLAN.md
+/ORCHESTRATION.md
