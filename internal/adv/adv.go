@@ -171,17 +171,23 @@ const (
 const (
 	CINackBitmask uint16 = 0x0000 // adv.h:217, RIST_ADV_CI_NACK_BITMASK
 	CINackRange   uint16 = 0x0001 // adv.h:218, RIST_ADV_CI_NACK_RANGE
-	CIRTTEchoReq  uint16 = 0x0010 // adv.h:219, RIST_ADV_CI_RTT_ECHO_REQ
-	CIRTTEchoResp uint16 = 0x0011 // adv.h:220, RIST_ADV_CI_RTT_ECHO_RESP
-	CIFEC20225Row uint16 = 0x0020 // adv.h:221, RIST_ADV_CI_FEC_2022_5_ROW
-	CIFEC20225Col uint16 = 0x0021 // adv.h:222, RIST_ADV_CI_FEC_2022_5_COL
-	CIFEC20221Row uint16 = 0x0022 // adv.h:223, RIST_ADV_CI_FEC_2022_1_ROW
-	CIFEC20221Col uint16 = 0x0023 // adv.h:224, RIST_ADV_CI_FEC_2022_1_COL
-	CIKeepalive   uint16 = 0x8000 // adv.h:225, RIST_ADV_CI_KEEPALIVE
-	CIFlowAttr    uint16 = 0x8001 // adv.h:226, RIST_ADV_CI_FLOW_ATTR
-	CISRPAuth     uint16 = 0x8010 // adv.h:227, RIST_ADV_CI_SRP_AUTH
-	CIPSKNonce    uint16 = 0x8011 // adv.h:228, RIST_ADV_CI_PSK_NONCE
-	CIUnsupported uint16 = 0x8020 // adv.h:229, RIST_ADV_CI_UNSUPPORTED
+	// CILQMGlobal / CILQMLinkSpecific carry a TR-06-4 Part 1 Link Quality
+	// Message in the Advanced profile (TR-06-4 §5.4, Table 1): the Global report
+	// (combined over all links) and the per-link report. The body is the 44-byte
+	// LQM (internal/adapt).
+	CILQMGlobal       uint16 = 0x0002
+	CILQMLinkSpecific uint16 = 0x0003
+	CIRTTEchoReq      uint16 = 0x0010 // adv.h:219, RIST_ADV_CI_RTT_ECHO_REQ
+	CIRTTEchoResp     uint16 = 0x0011 // adv.h:220, RIST_ADV_CI_RTT_ECHO_RESP
+	CIFEC20225Row     uint16 = 0x0020 // adv.h:221, RIST_ADV_CI_FEC_2022_5_ROW
+	CIFEC20225Col     uint16 = 0x0021 // adv.h:222, RIST_ADV_CI_FEC_2022_5_COL
+	CIFEC20221Row     uint16 = 0x0022 // adv.h:223, RIST_ADV_CI_FEC_2022_1_ROW
+	CIFEC20221Col     uint16 = 0x0023 // adv.h:224, RIST_ADV_CI_FEC_2022_1_COL
+	CIKeepalive       uint16 = 0x8000 // adv.h:225, RIST_ADV_CI_KEEPALIVE
+	CIFlowAttr        uint16 = 0x8001 // adv.h:226, RIST_ADV_CI_FLOW_ATTR
+	CISRPAuth         uint16 = 0x8010 // adv.h:227, RIST_ADV_CI_SRP_AUTH
+	CIPSKNonce        uint16 = 0x8011 // adv.h:228, RIST_ADV_CI_PSK_NONCE
+	CIUnsupported     uint16 = 0x8020 // adv.h:229, RIST_ADV_CI_UNSUPPORTED
 )
 
 // Header size constants (adv.h:262-280).
