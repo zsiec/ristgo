@@ -1,0 +1,246 @@
+package dtls
+
+import (
+	"crypto/ecdsa"
+	"crypto/hmac"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+)
+
+// cookieLen is the size of the stateless HelloVerifyRequest cookie this server
+// generates (RFC 6347 §4.2.1).
+const cookieLen = 20
+
+// The DTLS 1.2 server handshake (RFC 6347 + RFC 5246), the mirror of the client:
+// ClientHello → HelloVerifyRequest → ClientHello(cookie) → server hello flight →
+// client key exchange + Finished → server Finished.
+func (c *Conn) serverHandshake() error {
+	cfg := c.cfg
+	overall := time.Now().Add(cfg.HandshakeTimeout)
+	c.reasm = newReassembler()
+	c.curRetrans = cfg.RetransmitTimeout // first read precedes any sendFlight
+	if !cfg.offersPSK() && !cfg.offersCert() {
+		return errors.New("rist: dtls: server config enables neither PSK nor a certificate")
+	}
+
+	// Flight 1: the cookieless ClientHello (excluded from the transcript).
+	msg, err := c.readHandshakeMessage(overall)
+	if err != nil {
+		return err
+	}
+	if msg.typ != typeClientHello {
+		return fmt.Errorf("rist: dtls: expected ClientHello, got %d", msg.typ)
+	}
+	if _, err := parseClientHello(msg.body); err != nil {
+		return err
+	}
+
+	// Flight 2: HelloVerifyRequest with a fresh cookie (excluded from the
+	// transcript).
+	cookie := make([]byte, cookieLen)
+	if _, err := io.ReadFull(cfg.Rand, cookie); err != nil {
+		return fmt.Errorf("rist: dtls: cookie: %w", err)
+	}
+	hvrBody, _ := helloVerifyRequest{version: versionDTLS10, cookie: cookie}.marshalBody()
+	f2 := &flight{}
+	c.emitHandshake(f2, typeHelloVerifyRequest, 0, hvrBody, false)
+	if err := c.sendFlight(f2); err != nil {
+		return err
+	}
+
+	// Flight 3: the ClientHello echoing the cookie — the first transcript message.
+	msg, err = c.readHandshakeMessage(overall)
+	if err != nil {
+		return err
+	}
+	if msg.typ != typeClientHello {
+		return fmt.Errorf("rist: dtls: expected cookie ClientHello, got %d", msg.typ)
+	}
+	ch, err := parseClientHello(msg.body)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(ch.cookie, cookie) {
+		c.sendAlert(alertHandshakeFailure)
+		return errors.New("rist: dtls: client cookie mismatch")
+	}
+	c.addToTranscript(msg)
+
+	clientRandom := ch.random
+	suite, err := selectSuite(cfg, ch.cipherSuites)
+	if err != nil {
+		c.sendAlert(alertHandshakeFailure)
+		return err
+	}
+	c.cipherSuite = suite
+	isECDHE := suite == tlsECDHEECDSAWithAES128GCMSHA256
+	useEMS := ch.extMasterSecret
+
+	serverRandom := make([]byte, randomLen)
+	if _, err := io.ReadFull(cfg.Rand, serverRandom); err != nil {
+		return fmt.Errorf("rist: dtls: server random: %w", err)
+	}
+
+	// Flight 4: ServerHello, [Certificate, ServerKeyExchange,
+	// [CertificateRequest]], ServerHelloDone.
+	f4 := &flight{}
+	shBody, _ := serverHello{
+		version:             versionDTLS12,
+		random:              serverRandom,
+		cipherSuite:         suite,
+		extMasterSecret:     useEMS,
+		pointFormats:        isECDHE && ch.pointFormatsOffered,
+		secureRenegotiation: ch.secureRenegotiation,
+	}.marshalBody()
+	c.emitHandshake(f4, typeServerHello, 0, shBody, true)
+
+	var ecdhePriv ecdhePrivate
+	if isECDHE {
+		certBody, _ := certificateMsg{chain: cfg.Certificate.DER}.marshalBody()
+		c.emitHandshake(f4, typeCertificate, 0, certBody, true)
+
+		priv, pub, err := generateECDHE(cfg.Rand)
+		if err != nil {
+			return err
+		}
+		ecdhePriv = priv
+		ske := serverKeyExchange{curve: namedGroupSecp256r1, publicKey: pub, sigScheme: sigSchemeECDSAP256SHA256}
+		signed := make([]byte, 0, len(clientRandom)+len(serverRandom)+len(ske.signedParams()))
+		signed = append(signed, clientRandom...)
+		signed = append(signed, serverRandom...)
+		signed = append(signed, ske.signedParams()...)
+		sig, err := signECDSA(cfg.Certificate.PrivateKey, signed)
+		if err != nil {
+			return err
+		}
+		ske.signature = sig
+		skeBody, _ := ske.marshalBody()
+		c.emitHandshake(f4, typeServerKeyExchange, 0, skeBody, true)
+
+		if cfg.RequireClientCert {
+			crBody, _ := certificateRequest{}.marshalBody()
+			c.emitHandshake(f4, typeCertificateRequest, 0, crBody, true)
+		}
+	}
+	c.emitHandshake(f4, typeServerHelloDone, 0, nil, true)
+	if err := c.sendFlight(f4); err != nil {
+		return err
+	}
+
+	// Flight 5: the client's key exchange flight.
+	var (
+		pms        []byte
+		master     []byte
+		clientLeaf *ecdsa.PublicKey
+		gotCKE     bool
+	)
+	for {
+		msg, err = c.readHandshakeMessage(overall)
+		if err != nil {
+			return err
+		}
+		if msg.typ == typeFinished {
+			break
+		}
+		// Finished is the only message after CCS; everything here is epoch 0.
+		c.addToTranscript(msg)
+		switch msg.typ {
+		case typeCertificate:
+			cert, err := parseCertificate(msg.body)
+			if err != nil {
+				return err
+			}
+			if len(cert.chain) == 0 {
+				if cfg.RequireClientCert {
+					c.sendAlert(alertBadCertificate)
+					return errors.New("rist: dtls: client certificate required but none sent")
+				}
+			} else {
+				leaf, err := verifyPeerCertificate(cert.chain, cfg)
+				if err != nil {
+					c.sendAlert(alertBadCertificate)
+					return err
+				}
+				c.peerLeaf = leaf
+				clientLeaf, _ = leaf.PublicKey.(*ecdsa.PublicKey)
+			}
+		case typeClientKeyExchange:
+			if isECDHE {
+				pub, err := parseClientKeyExchangeECDHE(msg.body)
+				if err != nil {
+					return err
+				}
+				if pms, err = ecdhePremaster(ecdhePriv, pub); err != nil {
+					c.sendAlert(alertHandshakeFailure)
+					return err
+				}
+			} else {
+				if _, err := parseClientKeyExchangePSK(msg.body); err != nil {
+					return err
+				}
+				pms = pskPremaster(cfg.PSK)
+			}
+			gotCKE = true
+			// Transcript now runs through ClientKeyExchange: derive keys so the
+			// epoch-1 Finished that follows can be decrypted.
+			master = c.deriveMaster(pms, useEMS, clientRandom, serverRandom)
+			keys, err := deriveKeys(master, clientRandom, serverRandom)
+			if err != nil {
+				return err
+			}
+			c.keys = keys
+			c.keysReady = true
+		case typeCertificateVerify:
+			cv, err := parseCertificateVerify(msg.body)
+			if err != nil {
+				return err
+			}
+			if clientLeaf == nil {
+				return errors.New("rist: dtls: CertificateVerify without a client certificate")
+			}
+			// The signature covers the transcript up to but not including this
+			// CertificateVerify; addToTranscript(msg) above already appended it, so
+			// verify against the transcript with the CV body removed.
+			signedLen := len(c.transcript) - len(msg.fullMessageBytes())
+			if !verifyECDSA(clientLeaf, c.transcript[:signedLen], cv.signature) {
+				c.sendAlert(alertDecryptError)
+				return errors.New("rist: dtls: client CertificateVerify invalid")
+			}
+		default:
+			return fmt.Errorf("rist: dtls: unexpected message %d in client flight", msg.typ)
+		}
+	}
+	if !gotCKE {
+		return errors.New("rist: dtls: client flight missing ClientKeyExchange")
+	}
+	if !c.peerCCS {
+		return errors.New("rist: dtls: client Finished without ChangeCipherSpec")
+	}
+	if cfg.RequireClientCert && c.peerLeaf == nil {
+		c.sendAlert(alertBadCertificate)
+		return errors.New("rist: dtls: client did not authenticate")
+	}
+
+	// Verify the client Finished over the transcript through CertificateVerify /
+	// ClientKeyExchange (it is not yet in the transcript).
+	expectedClientVerify := finishedVerifyData(master, labelClientFinished, c.transcriptHash())
+	if !hmac.Equal(expectedClientVerify, msg.body) {
+		c.sendAlert(alertDecryptError)
+		return errors.New("rist: dtls: client Finished verify_data mismatch")
+	}
+	c.addToTranscript(msg) // include client Finished before computing ours
+
+	// Flight 6: server CCS + Finished.
+	f6 := &flight{}
+	emitCCS(f6)
+	serverVerify := finishedVerifyData(master, labelServerFinished, c.transcriptHash())
+	c.emitHandshake(f6, typeFinished, 1, marshalFinished(serverVerify), true)
+	if err := c.sendFlight(f6); err != nil {
+		return err
+	}
+
+	c.sendEpoch = 1
+	return nil
+}
