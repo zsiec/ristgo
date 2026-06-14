@@ -1,6 +1,7 @@
 package ristgo
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -149,7 +150,7 @@ func TestDefaultConfigValidates(t *testing.T) {
 	if err := validated.validate(); err != nil {
 		t.Fatalf("DefaultConfig().validate() = %v, want nil", err)
 	}
-	if validated != cfg {
+	if !reflect.DeepEqual(validated, cfg) {
 		t.Errorf("validate() altered DefaultConfig: got %+v, want %+v", validated, cfg)
 	}
 }
@@ -161,7 +162,7 @@ func TestValidateZeroConfig(t *testing.T) {
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate zero config: %v", err)
 	}
-	if want := DefaultConfig(); cfg != want {
+	if want := DefaultConfig(); !reflect.DeepEqual(cfg, want) {
 		t.Errorf("validated zero config = %+v, want %+v", cfg, want)
 	}
 }
@@ -198,7 +199,7 @@ func TestValidatePreservesExplicitValues(t *testing.T) {
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	if cfg != want {
+	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("validate() altered explicit values: got %+v, want %+v", cfg, want)
 	}
 }

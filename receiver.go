@@ -58,7 +58,9 @@ func newSimpleReceiver(addr string, cfg Config) (*Receiver, error) {
 		return nil, err
 	}
 	fc := toFlowConfig(cfg)
-	sess := session.NewReceiver(conn, toSessionConfig(cfg, fc, randomEvenSSRC()))
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
+	sc.AdaptLQM = cfg.SourceAdaptation
+	sess := session.NewReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }
 
@@ -83,6 +85,7 @@ func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.Main = mp
+	sc.AdaptLQM = cfg.SourceAdaptation
 	sess := session.NewMainReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }
@@ -106,6 +109,7 @@ func newAdvReceiver(addr string, cfg Config) (*Receiver, error) {
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.Adv = ap
+	sc.AdaptLQM = cfg.SourceAdaptation
 	sess := session.NewAdvReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }

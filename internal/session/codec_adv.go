@@ -405,6 +405,17 @@ func (c *advCodec) decodeControl(payload []byte) ([]wire.Feedback, error) {
 			return nil, err
 		}
 		return []wire.Feedback{wire.RttEchoResponse{Timestamp: e.Timestamp(), ProcessingDelay: e.ProcessingDelay}}, nil
+	case adv.CILQMGlobal, adv.CILQMLinkSpecific:
+		// Source adaptation (TR-06-4 Part 1): a Type=Control message carrying the
+		// 44-byte LQM (Global = whole-flow, Link-Specific = per-path). Cross the
+		// waist as wire.LinkQuality for the host's rate controller; a short body is
+		// ignored rather than treated as an error.
+		var lq wire.LinkQuality
+		if len(body) < len(lq.LQM) {
+			return nil, nil
+		}
+		copy(lq.LQM[:], body)
+		return []wire.Feedback{lq}, nil
 	case adv.CIKeepalive, adv.CIFlowAttr, adv.CIPSKNonce:
 		return nil, nil
 	default:

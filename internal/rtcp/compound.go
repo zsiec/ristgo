@@ -81,7 +81,7 @@ func checkCompoundOrder(pkts []Packet) error {
 		return fmt.Errorf("%w: a compound needs a report packet and an SDES packet, got %d packet(s)", ErrCompoundOrder, len(pkts))
 	}
 	switch pkts[0].(type) {
-	case SenderReport, ReceiverReport, EmptyReceiverReport:
+	case SenderReport, ReceiverReport, EmptyReceiverReport, LinkQualityReport:
 	default:
 		return fmt.Errorf("%w: first packet must be an SR or (empty) RR, got %T", ErrCompoundOrder, pkts[0])
 	}

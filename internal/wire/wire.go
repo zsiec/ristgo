@@ -185,8 +185,22 @@ type ExtSeq struct {
 	SeqHigh uint16
 }
 
+// LinkQuality carries a VSF TR-06-4 Part 1 Link Quality Message from the
+// receiver to the sender for source adaptation. The 44 bytes are the opaque
+// on-the-wire LQM (Figure 2), decoded by internal/adapt; carrying them as raw
+// bytes keeps this package free of a TR-06-4 dependency. It is a host concern,
+// not flow input: every profile codec decodes its LQM encapsulation (Simple/Main
+// RR profile-specific extension, Advanced control index 0x0002/0x0003) into this
+// variant, and the host intercepts it to drive the rate controller rather than
+// feeding it to the flow core.
+type LinkQuality struct {
+	// LQM is the 44-byte Link Quality Message (internal/adapt decodes it).
+	LQM [44]byte
+}
+
 // Marker-method implementations sealing the Feedback variant set.
 func (NackRequest) isFeedback()     {}
+func (LinkQuality) isFeedback()     {}
 func (RttEchoRequest) isFeedback()  {}
 func (RttEchoResponse) isFeedback() {}
 func (SenderReport) isFeedback()    {}

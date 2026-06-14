@@ -175,6 +175,21 @@ type Config struct {
 	// Must be >= 0.
 	Weight int
 
+	// SourceAdaptation, set on a Receiver, makes it send periodic Link Quality
+	// Messages back to the sender (VSF TR-06-4 Part 1). Default: false. Supported
+	// on all three profiles: the LQM is carried as an RR profile-specific
+	// extension on Simple (§5.2), the same RR tunnelled over GRE on Main (§5.3),
+	// and a native Type=Control message (Control Index 0x0002) on Advanced (§5.4).
+	SourceAdaptation bool
+
+	// OnRateAdapt, set on a Sender, enables source-adaptation rate control: the
+	// sender feeds each inbound Link Quality Message to an AIMD controller and
+	// calls this function with the new encoder bit-rate target in kbps. The
+	// application should retune its encoder toward that target. nil (the default)
+	// disables rate adaptation. The callback runs on the session's event loop, so
+	// it must not block. Supported on all three profiles (see SourceAdaptation).
+	OnRateAdapt func(targetKbps int)
+
 	// Logger receives diagnostic log messages. When nil (the default),
 	// no logging occurs and there is zero performance overhead.
 	Logger Logger

@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zsiec/ristgo/internal/adapt"
 	"github.com/zsiec/ristgo/internal/adv"
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
@@ -75,6 +76,15 @@ type Config struct {
 	// messages, with no GRE framing. At most one of Main/Adv is non-nil; both
 	// nil means the Simple profile.
 	Adv *AdvParams
+
+	// Source adaptation (TR-06-4 Part 1, see adapt.go). AdaptLQM makes a
+	// receiver emit periodic Link Quality Messages. RateController + OnRateAdapt,
+	// when both set on a sender, feed each inbound LQM to the controller and
+	// report the new encoder-rate target to the application. All three are off by
+	// default, leaving non-adaptive sessions unchanged.
+	AdaptLQM       bool
+	RateController *adapt.Controller
+	OnRateAdapt    func(kbps int)
 }
 
 // MainParams carries the Main-profile codec parameters. The public layer builds
@@ -196,6 +206,15 @@ type Session struct {
 	// sent the immediate authentication handshake (so it is sent once, on the
 	// first inbound datagram, not repeatedly).
 	advPeerKnown bool
+
+	// Source-adaptation state (adapt.go), loop-owned. rxBytes/lqmPrevBytes meter
+	// the measured data bandwidth; lqmSeq/lqmPrev/lqmLast carry the per-reporting
+	// -period deltas a receiver folds into each Link Quality Message.
+	rxBytes      uint64
+	lqmPrevBytes uint64
+	lqmSeq       uint32
+	lqmPrev      flow.Stats
+	lqmLast      clock.Timestamp
 
 	// lastTx is the instant of the last RTCP/media transmission; the
 	// keepalive ticker only emits a periodic RTCP when the flow has been
@@ -406,6 +425,9 @@ func (s *Session) loop() {
 	if s.sender {
 		s.sendKeepalive(s.clk.Now())
 	}
+	// Anchor the LQM reporting period at start-up so the first report covers a
+	// real interval rather than the whole epoch.
+	s.lqmLast = s.clk.Now()
 	// A Main-profile EAP client opens authentication immediately with an
 	// EAPOL-START; media is held (appIn is gated below) until it succeeds.
 	if s.eapClient != nil {
@@ -427,6 +449,7 @@ func (s *Session) loop() {
 			now := s.clk.Now()
 			s.peer.LearnMedia(m.src)
 			s.peer.Observe(now)
+			s.observeRxBytes(len(m.data))
 			if pkt, err := s.mdec.decode(m.data); err == nil {
 				s.flow.Feed(now, 0, pkt)
 				s.observeRx(now, pkt)
@@ -437,9 +460,7 @@ func (s *Session) loop() {
 			s.peer.LearnRTCP(r.src)
 			s.peer.Observe(now)
 			if fbs, err := decodeFeedback(r.data, s.highestSent); err == nil {
-				for _, fb := range fbs {
-					s.flow.FeedFeedback(now, fb)
-				}
+				s.feedFeedback(now, fbs)
 			}
 			s.afterInput(now, timer)
 		case d := <-s.mainIn:
@@ -454,12 +475,11 @@ func (s *Session) loop() {
 				s.handleEAP(now, eapPayload)
 			} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
 				if isMedia {
+					s.observeRxBytes(len(d.data))
 					s.flow.Feed(now, 0, pkt)
 					s.observeRx(now, pkt)
 				} else {
-					for _, fb := range fbs {
-						s.flow.FeedFeedback(now, fb)
-					}
+					s.feedFeedback(now, fbs)
 				}
 			} else {
 				// A decode failure on an otherwise-delivered datagram usually
@@ -516,6 +536,11 @@ func (s *Session) loop() {
 				s.sendKeepalive(now)
 			} else if s.peer.RTCP != nil && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
 				s.sendKeepalive(now)
+			}
+			// A receiver that opted into source adaptation emits a Link Quality
+			// Message each interval (TR-06-4 Part 1).
+			if s.adaptEmitsLQM() {
+				s.sendLQM(now)
 			}
 		}
 	}
@@ -761,12 +786,11 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 				}
 				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(p); derr == nil {
 					if isMedia {
+						s.observeRxBytes(len(data))
 						s.flow.Feed(now, 0, pkt)
 						s.observeRx(now, pkt)
 					} else {
-						for _, fb := range fbs {
-							s.flow.FeedFeedback(now, fb)
-						}
+						s.feedFeedback(now, fbs)
 					}
 				} else {
 					s.logf("adv: drop undecodable adv datagram (%d bytes): %v", len(data), derr)
@@ -793,13 +817,12 @@ func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
 	if isMedia {
 		// libRIST does not send GRE-framed media in Advanced mode; accept it
 		// defensively all the same.
+		s.observeRxBytes(len(data))
 		s.flow.Feed(now, 0, pkt)
 		s.observeRx(now, pkt)
 		return
 	}
-	for _, fb := range fbs {
-		s.flow.FeedFeedback(now, fb)
-	}
+	s.feedFeedback(now, fbs)
 }
 
 // handleEAP drives the Main-profile EAP-SRP handshake for one received EAPOL

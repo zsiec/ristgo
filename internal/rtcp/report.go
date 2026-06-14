@@ -168,6 +168,46 @@ func decodeReceiverReport(h header, body []byte) (Packet, bool) {
 			LSR:            binary.BigEndian.Uint32(body[24:28]),
 			DLSR:           binary.BigEndian.Uint32(body[28:32]),
 		}, true
+	case h.count == 0 && h.size == lqmReportSize:
+		var p LinkQualityReport
+		p.SSRC = binary.BigEndian.Uint32(body[4:8])
+		copy(p.LQM[:], body[8:lqmReportSize])
+		return p, true
 	}
 	return nil, false
 }
+
+// lqmReportSize is an empty RR (8 bytes) plus a 44-byte Link Quality Message
+// profile-specific extension (TR-06-4 Part 1 Figure 4): length field 12.
+const lqmReportSize = emptyRRSize + LQMExtensionSize
+
+// LQMExtensionSize is the byte size of the Link Quality Message that rides on an
+// RR as an RFC 3550 §6.4.2 profile-specific extension (TR-06-4 Part 1 Figure 2).
+const LQMExtensionSize = 44
+
+// LinkQualityReport is an empty RTCP Receiver Report (PT=201, RC=0) carrying a
+// 44-byte Link Quality Message as an RFC 3550 §6.4.2 profile-specific extension
+// (TR-06-4 Part 1 §5.2, Figure 4). The receiver sends it to the sender for
+// source adaptation. The LQM bytes are opaque here — decoded by internal/adapt —
+// so this package carries no TR-06-4 dependency.
+type LinkQualityReport struct {
+	// SSRC identifies the originator (the RIST receiver).
+	SSRC uint32
+	// LQM is the 44-byte Link Quality Message (internal/adapt encodes/decodes it).
+	LQM [LQMExtensionSize]byte
+}
+
+// MarshalSize returns the encoded size: always 52 bytes.
+func (LinkQualityReport) MarshalSize() int { return lqmReportSize }
+
+// AppendTo appends the empty-RR header (length 12), the reporter SSRC, and the
+// 44-byte LQM extension to buf.
+func (p LinkQualityReport) AppendTo(buf []byte) []byte {
+	buf = appendHeader(buf, 0, PTReceiverReport, lqmReportSize/4-1)
+	buf, w := grow(buf, lqmReportSize-headerSize)
+	binary.BigEndian.PutUint32(w[0:4], p.SSRC)
+	copy(w[4:], p.LQM[:])
+	return buf
+}
+
+func (LinkQualityReport) isPacket() {}

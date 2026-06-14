@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zsiec/ristgo/internal/adapt"
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/eap"
@@ -162,6 +163,25 @@ func buildEAPServer(cfg Config) (*eap.Authenticator, error) {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
 	return a, nil
+}
+
+// applyRateAdapt wires source-adaptation rate control onto a sender's session
+// config when the caller supplied an OnRateAdapt callback (TR-06-4 Part 1): it
+// builds an AIMD controller whose ceiling is the configured MaxBitrate (the
+// recovery_maxbitrate) and forwards each new target to the callback. A no-op
+// when OnRateAdapt is nil.
+func applyRateAdapt(sc *session.Config, cfg Config) {
+	if cfg.OnRateAdapt == nil {
+		return
+	}
+	cc := adapt.DefaultControllerConfig()
+	cc.MaxKbps = cfg.MaxBitrate
+	cc.InitialKbps = cfg.MaxBitrate
+	if step := cfg.MaxBitrate / 100; step > 0 {
+		cc.IncreaseKbps = step
+	}
+	sc.RateController = adapt.NewController(cc)
+	sc.OnRateAdapt = cfg.OnRateAdapt
 }
 
 // toFlowConfig maps the public Config to the deterministic core's config.

@@ -80,7 +80,9 @@ func newSimpleSender(addr string, cfg Config) (*Sender, error) {
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
 	fc.StartSeq = randomStartSeq()
-	sess := session.NewSender(conn, mediaAddr, rtcpAddr, toSessionConfig(cfg, fc, ssrc))
+	sc := toSessionConfig(cfg, fc, ssrc)
+	applyRateAdapt(&sc, cfg)
+	sess := session.NewSender(conn, mediaAddr, rtcpAddr, sc)
 	return &Sender{sess: sess, remote: mediaAddr}, nil
 }
 
@@ -112,6 +114,7 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 	fc.StartSeq = randomStartSeq()
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Main = mp
+	applyRateAdapt(&sc, cfg)
 	sess := session.NewMainSender(conn, remote, sc)
 	return &Sender{sess: sess, remote: remote}, nil
 }
@@ -142,6 +145,7 @@ func newAdvSender(addr string, cfg Config) (*Sender, error) {
 	fc.StartSeq = randomStartSeq()
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Adv = ap
+	applyRateAdapt(&sc, cfg)
 	sess := session.NewAdvSender(conn, remote, sc)
 	return &Sender{sess: sess, remote: remote}, nil
 }

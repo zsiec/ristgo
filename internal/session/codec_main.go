@@ -623,6 +623,11 @@ func (c *mainCodec) decodeFeedbackMain(b []byte, nackRef uint32) ([]wire.Feedbac
 			out = append(out, wire.RttEchoRequest{Timestamp: pk.Timestamp})
 		case rtcp.EchoResponse:
 			out = append(out, wire.RttEchoResponse{Timestamp: pk.Timestamp, ProcessingDelay: pk.ProcessingDelay})
+		case rtcp.LinkQualityReport:
+			// Source adaptation (TR-06-4 Part 1 §5.3): the Simple-profile LQM RR
+			// carried transparently over the GRE tunnel; cross the waist as
+			// wire.LinkQuality for the host's rate controller.
+			out = append(out, wire.LinkQuality{LQM: pk.LQM})
 		}
 	}
 	return out, nil

@@ -52,6 +52,10 @@ var roundTripPackets = []struct {
 	{"extseq zero", ExtSeq{}},
 	{"extseq max", ExtSeq{SSRC: 0xFFFFFFFF, SeqHigh: 0xFFFF}},
 	{"extseq typical", ExtSeq{SSRC: 0xCAFEBABE, SeqHigh: 2}},
+
+	{"LQM zero", LinkQualityReport{}},
+	{"LQM max", LinkQualityReport{SSRC: 0xFFFFFFFF, LQM: fillLQM(0xFF)}},
+	{"LQM typical", LinkQualityReport{SSRC: 0xABCD1234, LQM: rampLQM()}},
 }
 
 // TestRoundTrip asserts decode(encode(x)) == x and that re-encoding the

@@ -194,6 +194,11 @@ func decodeFeedback(b []byte, nackRef uint32) ([]wire.Feedback, error) {
 			out = append(out, wire.RttEchoRequest{Timestamp: pk.Timestamp})
 		case rtcp.EchoResponse:
 			out = append(out, wire.RttEchoResponse{Timestamp: pk.Timestamp, ProcessingDelay: pk.ProcessingDelay})
+		case rtcp.LinkQualityReport:
+			// Source adaptation (TR-06-4 Part 1): the LQM rides as an RR
+			// profile-specific extension; cross the waist as wire.LinkQuality so
+			// the host routes it to the rate controller, not the flow core.
+			out = append(out, wire.LinkQuality{LQM: pk.LQM})
 		}
 	}
 	return out, nil
