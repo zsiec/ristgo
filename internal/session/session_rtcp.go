@@ -92,6 +92,10 @@ func (s *Session) receiverReport() rtcp.ReceiverReport {
 // only calls it when the flow has not transmitted for a full interval, so it
 // does not double the flow's own echo cadence.
 func (s *Session) sendKeepalive(now clock.Timestamp) {
+	if s.bond != nil {
+		s.sendBondKeepalive(now)
+		return
+	}
 	if s.peer.RTCP == nil {
 		return // return path not learned yet
 	}

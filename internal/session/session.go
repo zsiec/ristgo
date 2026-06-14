@@ -158,6 +158,10 @@ type Session struct {
 	// encapsulation Type field rather than by socket.
 	adv *advCodec
 
+	// bond holds the link-bonding / SMPTE 2022-7 multipath state (N paths onto
+	// one flow), non-nil in bonded mode. See bonded.go.
+	bond *bondState
+
 	// advGRE is the Main-profile GRE control substrate used in Advanced mode.
 	// libRIST's Advanced profile begins with the Main-profile GRE handshake —
 	// it authenticates a peer ONLY via a GRE-framed RTCP SDES packet
@@ -202,10 +206,11 @@ type Session struct {
 	rx rxStats
 
 	// event-loop inputs
-	mediaIn chan inbound // Simple media socket
-	rtcpIn  chan inbound // Simple RTCP socket
-	mainIn  chan inbound // Main single GRE socket (media and feedback)
-	advIn   chan inbound // Advanced single UDP socket (media and control)
+	mediaIn chan inbound     // Simple media socket
+	rtcpIn  chan inbound     // Simple RTCP socket
+	mainIn  chan inbound     // Main single GRE socket (media and feedback)
+	advIn   chan inbound     // Advanced single UDP socket (media and control)
+	bondIn  chan bondInbound // bonded multipath: per-path media/RTCP, tagged
 	appIn   chan []byte
 
 	// delivery to Read
@@ -357,6 +362,10 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 func (s *Session) start() {
 	s.wg.Add(1)
 	go s.loop()
+	if s.bond != nil {
+		s.startBondReaders()
+		return
+	}
 	if s.main != nil {
 		s.wg.Add(1)
 		go s.readMain()
@@ -478,6 +487,10 @@ func (s *Session) loop() {
 			}
 			s.handleAdvInbound(now, d.data)
 			s.afterInput(now, timer)
+		case bi := <-s.bondIn:
+			now := s.clk.Now()
+			s.handleBondInbound(now, bi)
+			s.afterInput(now, timer)
 		case p := <-appIn:
 			now := s.clk.Now()
 			s.flow.PushApp(now, p)
@@ -492,12 +505,16 @@ func (s *Session) loop() {
 				s.shutdown(s.cfg.ErrSessionTimeout)
 				return
 			}
-			// Emit a periodic keepalive. The Advanced profile sends its
-			// GRE+RTCP handshake and adv keepalive every interval (matching
-			// libRIST's unconditional periodic RTCP, which keeps the peer
-			// authenticated); the Simple/Main profiles only fill idle gaps so
-			// the flow's own RTT-echo cadence is not doubled.
-			if s.peer.RTCP != nil && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
+			// Emit a periodic keepalive. Bonding ages its paths and sends every
+			// interval (a sender must keep advertising its return address on all
+			// paths; both ends keep RTT/liveness fresh). The Advanced profile
+			// sends its GRE+RTCP handshake every interval (matching libRIST's
+			// unconditional periodic RTCP); the Simple/Main profiles only fill
+			// idle gaps so the flow's own RTT-echo cadence is not doubled.
+			if s.bond != nil {
+				s.tickBond(now)
+				s.sendKeepalive(now)
+			} else if s.peer.RTCP != nil && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
 				s.sendKeepalive(now)
 			}
 		}
@@ -567,6 +584,10 @@ func (s *Session) drain(now clock.Timestamp) {
 // address: a bare RTP packet on the Simple profile, a GRE-tunnelled (and
 // PSK-encrypted) one on the Main profile, sent over the single GRE socket.
 func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
+	if s.bond != nil {
+		s.sendBondMedia(now, pkt)
+		return
+	}
 	if s.peer.Media == nil {
 		return
 	}
@@ -595,6 +616,10 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 // sendFeedback builds one compound RTCP datagram from the drained feedback and
 // transmits it to the peer's RTCP address.
 func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
+	if s.bond != nil {
+		s.sendBondFeedback(fbs, now)
+		return
+	}
 	if s.peer.RTCP == nil {
 		return // return path not learned yet
 	}

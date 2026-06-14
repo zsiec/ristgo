@@ -182,6 +182,9 @@ func (s *Session) shutdown(reason error) {
 		s.closeErr.Store(&reason)
 		close(s.done)
 		s.conn.Close() // unblock the reader goroutines' blocking ReadFrom
+		if s.bond != nil {
+			s.closeBond() // close every path socket (conns[0] == s.conn, idempotent)
+		}
 	})
 }
 
