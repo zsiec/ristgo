@@ -161,7 +161,7 @@ Everything below is implemented and tested.
 | PSK encryption (AES-CTR, PBKDF2-HMAC-SHA256) | Main, Advanced | TR-06-2 |
 | EAP-SRP (SRP-SHA256) authentication and key-as-passphrase keying | Main | TR-06-2 |
 | Null-packet deletion + 32-bit extended-seq NACK | Main | TR-06-2 |
-| Out-of-band data side channel (WriteOOB/ReadOOB) | Main, Advanced | TR-06-2 |
+| Out-of-band side channel, full-IP passthrough / stream IP preservation (WriteOOB/ReadOOB) | Main, Advanced | TR-06-2 |
 | DTLS 1.2 transport security (pure Go: PSK + ECDHE-ECDSA) | Main | TR-06-2 §6 |
 | Advanced header + control messages | Advanced | TR-06-3 |
 | AEAD (AES-GCM, ChaCha20-Poly1305) | Advanced | TR-06-3 |

@@ -368,10 +368,16 @@ func (s *Sender) SetWriteDeadline(t time.Time) error {
 }
 
 // WriteOOB sends one out-of-band datagram to the peer (Main and Advanced
-// profiles). OOB is a fire-and-forget side channel — it rides the same socket as
+// profiles). OOB is a fire-and-forget side channel: it rides the same socket as
 // the media but bypasses ARQ recovery, so a lost OOB datagram is not
 // retransmitted. The payload must be at most MaxMediaPayload bytes. It returns
 // ErrOOBUnsupported on a Simple-profile sender.
+//
+// The payload is carried verbatim in a GRE full frame (protocol type 0x0800),
+// byte-identical to libRIST's out-of-band data path. A complete IP packet, with
+// its original headers including a multicast destination, therefore survives the
+// tunnel intact: this is RIST stream IP preservation. The application builds and
+// parses the IP packet; ristgo carries it transparently.
 func (s *Sender) WriteOOB(p []byte) error {
 	if len(p) > MaxMediaPayload {
 		return fmt.Errorf("rist: OOB payload %d bytes exceeds MaxMediaPayload %d", len(p), MaxMediaPayload)
