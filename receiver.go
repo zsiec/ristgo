@@ -108,8 +108,32 @@ func newSimpleReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) 
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.AdaptLQM = cfg.SourceAdaptation
 	sc.OneWay = oneWay
+	// Separate-port SMPTE 2022-1 FEC binds dedicated column/row sockets next to the
+	// media port (the session owns and closes them).
+	if cfg.FEC != nil && cfg.FEC.carriage(false) == FECCarriageSeparatePorts {
+		if err := bindFECSockets(&sc, host, conn.MediaPort()); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
 	sess := session.NewReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
+}
+
+// bindFECSockets binds the column (mediaPort+2) and row (mediaPort+4) FEC sockets
+// for the separate-port carriage and stores them on the session config.
+func bindFECSockets(sc *session.Config, host string, mediaPort int) error {
+	col, err := socket.BindUDP(host, mediaPort+2)
+	if err != nil {
+		return fmt.Errorf("rist: bind column FEC port %d: %w", mediaPort+2, err)
+	}
+	row, err := socket.BindUDP(host, mediaPort+4)
+	if err != nil {
+		col.Close()
+		return fmt.Errorf("rist: bind row FEC port %d: %w", mediaPort+4, err)
+	}
+	sc.FECColumn, sc.FECRow = col, row
+	return nil
 }
 
 // newMainReceiver binds a Main-profile receiver: the GRE-tunnelled flow (with

@@ -278,6 +278,12 @@ func (s *Session) shutdown(reason error) {
 				s.closeBond() // close every path socket (conns[0] == s.conn, idempotent)
 			}
 		}
+		if s.fecCol != nil { // separate-port FEC sockets, owned by the session
+			s.fecCol.Close()
+		}
+		if s.fecRow != nil {
+			s.fecRow.Close()
+		}
 		// An injected (MultiReceiver-driven) session never owns its socket(s); the
 		// MultiReceiver closes them.
 	})

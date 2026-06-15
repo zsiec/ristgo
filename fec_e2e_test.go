@@ -1,6 +1,7 @@
 package ristgo_test
 
 import (
+	crand "crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	mrand "math/rand/v2"
@@ -100,6 +101,204 @@ func (p *fecLossyProxy) backward() {
 
 func (p *fecLossyProxy) Dropped() uint64 { return p.dropped.Load() }
 func (p *fecLossyProxy) Close()          { p.front.Close(); p.back.Close(); p.wg.Wait() }
+
+// fecSepProxy is a one-way 3-port proxy for the separate-port FEC test: it relays
+// the media port (dropping one media packet per matrix, deterministically, after a
+// warmup) and relays the column and row FEC ports reliably. Because FEC rides
+// dedicated ports, it can drop media only — so a one-way receiver (no ARQ) must
+// recover the drops by FEC alone.
+type fecSepProxy struct {
+	inMedia, inCol, inRow *net.UDPConn
+	out                   *net.UDPConn
+	dstIP                 net.IP
+	dstMedia              int
+	warmup, period, off   int
+	mu                    sync.Mutex
+	seen                  int
+	dropped               atomic.Uint64
+	wg                    sync.WaitGroup
+}
+
+func startFECSepProxy(t *testing.T, proxyMedia int, dstHost string, dstMedia, warmup, period, off int) *fecSepProxy {
+	t.Helper()
+	bindp := func(port int) *net.UDPConn {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		if err != nil {
+			t.Fatalf("fec proxy bind %d: %v", port, err)
+		}
+		return c
+	}
+	out, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("fec proxy out: %v", err)
+	}
+	p := &fecSepProxy{
+		inMedia: bindp(proxyMedia), inCol: bindp(proxyMedia + 2), inRow: bindp(proxyMedia + 4),
+		out:      out,
+		dstIP:    net.IPv4(127, 0, 0, 1),
+		dstMedia: dstMedia, warmup: warmup, period: period, off: off,
+	}
+	p.wg.Add(3)
+	go p.relayMedia()
+	go p.relay(p.inCol, dstMedia+2)
+	go p.relay(p.inRow, dstMedia+4)
+	return p
+}
+
+func (p *fecSepProxy) relayMedia() {
+	defer p.wg.Done()
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := p.inMedia.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		p.mu.Lock()
+		i := p.seen
+		p.seen++
+		p.mu.Unlock()
+		if i >= p.warmup && (i-p.warmup)%p.period == p.off {
+			p.dropped.Add(1)
+			continue // drop one media packet per matrix (FEC-recoverable)
+		}
+		p.out.WriteToUDP(buf[:n], &net.UDPAddr{IP: p.dstIP, Port: p.dstMedia})
+	}
+}
+
+func (p *fecSepProxy) relay(in *net.UDPConn, dstPort int) {
+	defer p.wg.Done()
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := in.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		p.out.WriteToUDP(buf[:n], &net.UDPAddr{IP: p.dstIP, Port: dstPort})
+	}
+}
+
+func (p *fecSepProxy) Dropped() uint64 { return p.dropped.Load() }
+func (p *fecSepProxy) Close() {
+	p.inMedia.Close()
+	p.inCol.Close()
+	p.inRow.Close()
+	p.out.Close()
+	p.wg.Wait()
+}
+
+// TestE2EFECSeparatePortsSimple runs a one-way Simple-profile stream with 2-D
+// SMPTE 2022-1 FEC on separate UDP ports (the standard, interoperable carriage),
+// dropping one media packet per matrix. With no return channel (no ARQ), the
+// stream still reconstructs bit-exact, proving FEC alone recovered every loss.
+func TestE2EFECSeparatePortsSimple(t *testing.T) {
+	const totalBytes = 256 * 1024
+	const chunk = 1316
+	const cols, rows = 5, 5
+
+	recvMedia := distinctEvenPort(t)
+	proxyMedia := distinctEvenPort(t, recvMedia)
+
+	cfg := ristgo.DefaultConfig() // Simple profile
+	cfg.BufferMin = 600 * time.Millisecond
+	cfg.BufferMax = 600 * time.Millisecond
+	cfg.FEC = &ristgo.FECConfig{Columns: cols, Rows: rows}
+
+	rx, err := ristgo.NewOneWayReceiver(fmt.Sprintf("127.0.0.1:%d", recvMedia), cfg)
+	if err != nil {
+		t.Fatalf("NewOneWayReceiver: %v", err)
+	}
+	defer rx.Close()
+
+	// Drop one media packet per 25-packet matrix, after a one-matrix warmup so the
+	// first packet (and the receiver's matrix alignment) survives.
+	proxy := startFECSepProxy(t, proxyMedia, "127.0.0.1", recvMedia, cols*rows, cols*rows, 7)
+	defer proxy.Close()
+
+	tx, err := ristgo.NewOneWaySender(fmt.Sprintf("127.0.0.1:%d", proxyMedia), cfg)
+	if err != nil {
+		t.Fatalf("NewOneWaySender: %v", err)
+	}
+	defer tx.Close()
+
+	data := make([]byte, totalBytes)
+	if _, err := crand.Read(data); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	want := sha256.Sum256(data)
+
+	go func() {
+		tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+		for off := 0; off < len(data); off += chunk {
+			end := off + chunk
+			if end > len(data) {
+				end = len(data)
+			}
+			if _, werr := tx.Write(data[off:end]); werr != nil {
+				return
+			}
+			if (off/chunk)%4 == 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		flush := make([]byte, chunk)
+		for i := 0; i < 60; i++ {
+			tx.Write(flush)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+	got := make([]byte, 0, totalBytes)
+	buf := make([]byte, 4096)
+	h := sha256.New()
+	for len(got) < totalBytes {
+		n, rerr := rx.Read(buf)
+		if n > 0 {
+			take := n
+			if len(got)+take > totalBytes {
+				take = totalBytes - len(got)
+			}
+			h.Write(buf[:take])
+			got = append(got, buf[:take]...)
+		}
+		if rerr != nil {
+			st := rx.Stats()
+			t.Fatalf("Read ended early at %d/%d: %v (dropped=%d fecRecovered=%d lost=%d)",
+				len(got), totalBytes, rerr, proxy.Dropped(), st.FECRecovered, st.Lost)
+		}
+	}
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	st := rx.Stats()
+	if sum != want {
+		t.Fatalf("hash mismatch (dropped=%d fecRecovered=%d)", proxy.Dropped(), st.FECRecovered)
+	}
+	if proxy.Dropped() == 0 {
+		t.Fatal("proxy dropped nothing")
+	}
+	if st.FECRecovered < proxy.Dropped() {
+		t.Fatalf("FEC recovered %d but %d were dropped (one-way: every drop must be FEC-recovered)", st.FECRecovered, proxy.Dropped())
+	}
+	t.Logf("separate-port FEC e2e: dropped=%d fecRecovered=%d", proxy.Dropped(), st.FECRecovered)
+}
+
+// distinctEvenPort returns a free even port distinct from any given.
+func distinctEvenPort(t *testing.T, avoid ...int) int {
+	t.Helper()
+	for {
+		p := freeEvenPort(t)
+		ok := true
+		for _, a := range avoid {
+			// keep the +2/+4 FEC ports clear of each other too
+			if p == a || p == a+2 || p == a+4 || p+2 == a || p+4 == a {
+				ok = false
+			}
+		}
+		if ok {
+			return p
+		}
+	}
+}
 
 // TestE2EFECRecoversAdvanced runs an Advanced-profile stream with 2-D SMPTE 2022-1
 // FEC over a lossy link and verifies the receiver recovers losses by FEC. The

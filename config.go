@@ -396,11 +396,15 @@ func (cfg *Config) validate() error {
 		}
 	}
 	if cfg.FEC != nil {
-		if cfg.Profile != ProfileAdvanced {
-			return errors.New("rist: FEC (SMPTE ST 2022-1) requires ProfileAdvanced in this release")
-		}
 		if err := cfg.FEC.validate(); err != nil {
 			return err
+		}
+		carriage := cfg.FEC.carriage(cfg.Profile == ProfileAdvanced)
+		switch {
+		case carriage == FECCarriageInBand && cfg.Profile != ProfileAdvanced:
+			return errors.New("rist: in-band FEC carriage requires ProfileAdvanced")
+		case carriage == FECCarriageSeparatePorts && cfg.Profile == ProfileMain:
+			return errors.New("rist: separate-port FEC carriage is not supported on ProfileMain in this release")
 		}
 	}
 

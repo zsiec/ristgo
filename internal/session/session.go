@@ -109,6 +109,11 @@ type Config struct {
 	// the receiver recovers single losses per row/column without a NACK round trip.
 	FEC *FECParams
 
+	// FECColumn and FECRow are the receiver's bound column/row FEC sockets for the
+	// separate-port carriage (FEC.SeparatePorts); nil otherwise and on a sender.
+	// The session owns and closes them.
+	FECColumn, FECRow *net.UDPConn
+
 	// OneWay runs the session as one-way / no-return-channel transport: the
 	// host emits no RTCP at all (no Sender/Receiver Reports, SDES, NACKs, RTT
 	// echoes, keepalives, GRE keepalives, LQM, or buffer negotiation), only
@@ -266,8 +271,14 @@ type Session struct {
 	fecEnc       *fec.Encoder
 	fecDec       *fec.Decoder
 	fecMediaSSRC uint32        // SSRC stamped on recovered packets (learned from received media)
-	fecBuf       []byte        // scratch for framing FEC control messages
+	fecBuf       []byte        // scratch for framing FEC packets
 	fecRecovered atomic.Uint64 // packets reconstructed by FEC
+	// Separate-port FEC carriage: fecCol/fecRow are the receiver's bound column/row
+	// FEC sockets; fecIn forwards their RTP-stripped FEC bodies to the loop; the
+	// per-stream RTP sequence counters number the outbound FEC streams.
+	fecCol, fecRow       *net.UDPConn
+	fecIn                chan []byte
+	fecColSeq, fecRowSeq uint16
 
 	// advGRE is the Main-profile GRE control substrate used in Advanced mode.
 	// libRIST's Advanced profile begins with the Main-profile GRE handshake —
@@ -562,6 +573,12 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	} else {
 		s.delivery = make(chan []byte, 4096)
 	}
+	// Separate-port FEC carriage: the receiver binds column/row FEC sockets and
+	// forwards their bodies to the loop over fecIn (created before the loop starts).
+	s.fecCol, s.fecRow = cfg.FECColumn, cfg.FECRow
+	if s.fecCol != nil {
+		s.fecIn = make(chan []byte, 64)
+	}
 	s.authed.Store(true) // no EAP gate by default (Simple, or Main without auth)
 	if cfg.Main != nil || cfg.Adv != nil {
 		// OOB side channel is available on the Main and Advanced profiles only.
@@ -617,6 +634,11 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 func (s *Session) start() {
 	s.wg.Add(1)
 	go s.loop()
+	if s.fecCol != nil { // separate-port FEC: read the column and row FEC sockets
+		s.wg.Add(2)
+		go s.readFEC(s.fecCol)
+		go s.readFEC(s.fecRow)
+	}
 	if s.injected {
 		return // a MultiReceiver owns the socket read and feeds Inject*
 	}
@@ -716,7 +738,16 @@ func (s *Session) loop() {
 			s.peer.Observe(now)
 			if pkt, err := s.mdec.decode(m.data); err == nil {
 				s.feedMedia(now, 0, pkt)
+				if s.fecEnabled() {
+					// uint32(refTicks) is the raw on-the-wire RTP timestamp (widening
+					// only touches the high bits), the value the FEC XOR is keyed on.
+					s.fecOnRecvMedia(now, uint32(s.mdec.refTicks), pkt)
+				}
 			}
+			s.afterInput(now, timer)
+		case body := <-s.fecIn:
+			now := s.clk.Now()
+			s.fecOnRecvFEC(now, body)
 			s.afterInput(now, timer)
 		case r := <-s.rtcpIn:
 			now := s.clk.Now()

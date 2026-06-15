@@ -23,6 +23,37 @@ type FECConfig struct {
 	Rows int
 	// ColumnOnly suppresses the row FEC, leaving 1-D column-only protection.
 	ColumnOnly bool
+	// Carriage selects how the FEC packets are carried. The zero value picks a
+	// sensible default per profile: in-band Advanced control messages for the
+	// Advanced profile, separate UDP ports for the Simple profile.
+	Carriage FECCarriage
+}
+
+// FECCarriage selects how SMPTE ST 2022-1 FEC packets travel.
+type FECCarriage int
+
+const (
+	// FECCarriageDefault picks per profile: in-band for Advanced, separate-ports
+	// for Simple.
+	FECCarriageDefault FECCarriage = iota
+	// FECCarriageInBand carries FEC as Advanced control messages on the data port
+	// (TR-06-3 §5.3.5). Advanced profile only.
+	FECCarriageInBand
+	// FECCarriageSeparatePorts carries FEC as standard ST 2022-1 RTP packets on
+	// dedicated UDP ports (the media port + 2 for column FEC, + 4 for row FEC).
+	// This is the interoperable carriage (GStreamer/FFmpeg 2022-1).
+	FECCarriageSeparatePorts
+)
+
+// carriage resolves the effective carriage for the given profile.
+func (f *FECConfig) carriage(advanced bool) FECCarriage {
+	if f.Carriage != FECCarriageDefault {
+		return f.Carriage
+	}
+	if advanced {
+		return FECCarriageInBand
+	}
+	return FECCarriageSeparatePorts
 }
 
 // validate enforces the TR-06-3 ST 2022-1 matrix bounds: L in [1,20] (column-only)
@@ -44,10 +75,16 @@ func (f *FECConfig) validate() error {
 	return nil
 }
 
-// toSessionFEC maps the public FEC config to the session params, or nil.
-func toSessionFEC(f *FECConfig) *session.FECParams {
+// toSessionFEC maps the public FEC config to the session params, or nil,
+// resolving the carriage against the profile.
+func toSessionFEC(f *FECConfig, advanced bool) *session.FECParams {
 	if f == nil {
 		return nil
 	}
-	return &session.FECParams{Cols: f.Columns, Rows: f.Rows, ColumnOnly: f.ColumnOnly}
+	return &session.FECParams{
+		Cols:          f.Columns,
+		Rows:          f.Rows,
+		ColumnOnly:    f.ColumnOnly,
+		SeparatePorts: f.carriage(advanced) == FECCarriageSeparatePorts,
+	}
 }

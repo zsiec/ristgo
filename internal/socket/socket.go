@@ -195,6 +195,12 @@ func bind(host string, port int) (*net.UDPConn, error) {
 	return bindNet("udp", host, port)
 }
 
+// BindUDP opens an unconnected UDP socket on host:port, for an auxiliary stream
+// the host layer manages itself (e.g. the separate-port SMPTE 2022-1 FEC sockets).
+func BindUDP(host string, port int) (*net.UDPConn, error) {
+	return bind(host, port)
+}
+
 // bindNet opens an unconnected UDP socket on host:port in the given network
 // ("udp", "udp4", or "udp6"). An empty network defaults to "udp".
 func bindNet(network, host string, port int) (*net.UDPConn, error) {
