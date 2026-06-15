@@ -48,16 +48,22 @@ func NewMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 }
 
 func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
-	if cfg.Username != "" || cfg.DTLS != nil {
-		return nil, fmt.Errorf("%w: multi-flow Main with EAP-SRP or DTLS is not yet supported", ErrInvalidConfig)
+	if cfg.DTLS != nil {
+		// DTLS is a single secure channel per socket; it cannot demultiplex
+		// several peers/flows on one port.
+		return nil, fmt.Errorf("%w: multi-flow Main with DTLS is not supported", ErrInvalidConfig)
 	}
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
 	}
-	// Validate the crypto config once; the per-flow factory rebuilds it (so this
-	// error becomes impossible there) to give each flow its own key state.
+	// Validate the per-flow config once (PSK keys, and the EAP authenticator when
+	// credentials are set); the factory rebuilds both so this error is impossible
+	// there, giving each flow its own key/auth state.
 	if _, err := buildMainParams(cfg); err != nil {
+		return nil, err
+	}
+	if _, err := buildEAPServer(cfg); err != nil {
 		return nil, err
 	}
 	conn, err := socket.ListenSingle(host, port)
@@ -73,6 +79,7 @@ func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	sc.AdaptLQM = cfg.SourceAdaptation
 	mkFlow := func(c *socket.Conn, flowCfg session.Config) *session.Session {
 		mp, _ := buildMainParams(cfg) // validated above; fresh PSK key state per flow
+		mp.EAPServer, _ = buildEAPServer(cfg)
 		flowCfg.Main = mp
 		return session.NewInjectedMainReceiver(c, flowCfg)
 	}

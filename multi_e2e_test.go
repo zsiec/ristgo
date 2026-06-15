@@ -38,6 +38,19 @@ func TestE2EMultiReceiverMainTwoFlows(t *testing.T) {
 	runMultiTwoFlows(t, cfg, freeMainPort(t))
 }
 
+// TestE2EMultiReceiverMainEAPTwoFlows demultiplexes two EAP-SRP-authenticated
+// Main flows: each source authenticates independently via its own per-flow
+// authenticator and keys its media from its own SRP session key.
+func TestE2EMultiReceiverMainEAPTwoFlows(t *testing.T) {
+	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileMain
+	cfg.Username = "rist"
+	cfg.Password = "multiflow"
+	cfg.BufferMin = 1000 * time.Millisecond
+	cfg.BufferMax = 1000 * time.Millisecond
+	runMultiTwoFlows(t, cfg, freeMainPort(t))
+}
+
 // TestE2EMultiReceiverAdvancedTwoFlows streams two distinct Advanced-profile
 // flows from two senders into one bound port and verifies the MultiReceiver
 // demultiplexes them (by source address) into two independent recovered streams.
