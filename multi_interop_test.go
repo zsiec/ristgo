@@ -77,6 +77,72 @@ func TestInteropMultiReceiverTwoLibristSenders(t *testing.T) {
 	}
 }
 
+// TestInteropMultiBondedReceiverTwoLibristSenders proves stream multiplexing and
+// SMPTE 2022-7 bonding at once, interoperably: two libRIST -p 0 senders, each
+// duplicating its flow to two peers (weight=0), feed one ristgo MultiBondedReceiver
+// bound to those two paths. ristgo demultiplexes by SSRC into two flows and merges
+// each across both paths, recovering both byte-exact.
+func TestInteropMultiBondedReceiverTwoLibristSenders(t *testing.T) {
+	sender := libristTool(t, "ristsender")
+	pA, pB := twoEvenPorts(t)
+	feedA := freeUDPPort(t, pA, pA+1, pB, pB+1)
+	feedB := freeUDPPort(t, pA, pA+1, pB, pB+1, feedA)
+
+	mrx, err := ristgo.NewMultiBondedReceiver(
+		[]string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}, bondConfig())
+	if err != nil {
+		t.Fatalf("NewMultiBondedReceiver: %v", err)
+	}
+	defer mrx.Close()
+
+	spawnTool(t, sender, "-p", "0", "-b", "200",
+		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedA),
+		"-o", libristBondedOut(pA, pB))
+	spawnTool(t, sender, "-p", "0", "-b", "200",
+		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedB),
+		"-o", libristBondedOut(pA, pB))
+	waitToolReady(t, feedA, 5*time.Second)
+	waitToolReady(t, feedB, 5*time.Second)
+
+	dataA, shaA := randomData(t, interopN)
+	dataB, shaB := randomData(t, interopN)
+	go feedUDP(t, feedA, dataA)
+	go feedUDP(t, feedB, dataB)
+
+	type result struct {
+		sha [32]byte
+		n   int
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		rx, err := mrx.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		go func(rx *ristgo.Receiver) {
+			defer rx.Close()
+			got := readN(t, rx, len(dataA))
+			results <- result{sha256.Sum256(got), len(got)}
+		}(rx)
+	}
+
+	seen := map[[32]byte]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.n != len(dataA) {
+				t.Fatalf("a bonded flow received %d/%d bytes", r.n, len(dataA))
+			}
+			seen[r.sha] = true
+		case <-time.After(30 * time.Second):
+			t.Fatal("timed out waiting for both bonded libRIST flows")
+		}
+	}
+	if !seen[shaA] || !seen[shaB] {
+		t.Fatal("bonded demux mismatch: the two libRIST flows did not reconstruct")
+	}
+}
+
 // TestInteropMultiReceiverTwoLibristMainSenders proves Main-profile multiplexing
 // interop with PSK: two libRIST -p 1 AES-256 senders are demultiplexed by source
 // address into two Main flows, each decrypted with its own key state and

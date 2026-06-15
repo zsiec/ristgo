@@ -140,14 +140,17 @@ func newAdvMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 // combines stream multiplexing with link bonding: N flows, each reconstructed
 // over M redundant paths. Call Accept in a loop for a [Receiver] per flow.
 //
-// Currently the Simple profile (the flow SSRC must be in cleartext to group the
-// paths of one flow).
+// All three profiles are supported. The Simple profile groups a flow's paths by
+// RTP SSRC; the Main and Advanced profiles (cleartext or PSK) group by source
+// address (a bonded sender uses one source socket duplicated to every path), so
+// PSK works without reading the encrypted SSRC. DTLS and EAP-SRP are not
+// supported over bonding.
 func NewMultiBondedReceiver(addrs []string, cfg Config) (*MultiReceiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
-	if cfg.Profile != ProfileSimple {
-		return nil, fmt.Errorf("%w: multi-flow bonding currently supports only the Simple profile", ErrInvalidConfig)
+	if err := bondedSupported(cfg); err != nil {
+		return nil, err
 	}
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("%w: a bonded receiver needs at least one address", ErrInvalidConfig)
@@ -162,10 +165,24 @@ func NewMultiBondedReceiver(addrs []string, cfg Config) (*MultiReceiver, error) 
 		conns = append(conns, c)
 	}
 	fc := toFlowConfig(cfg)
-	sc := toSessionConfig(cfg, fc, randomEvenSSRC()) // per-flow SSRC set by the demuxer
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC()) // per-flow SSRC set by the demuxer (Simple)
 	sc.AdaptLQM = cfg.SourceAdaptation
 	newGroup := func() *bonding.Group { return newBondingGroup(cfg) }
-	return &MultiReceiver{m: session.NewMultiBondedReceiver(conns, sc, newGroup)}, nil
+
+	if cfg.Profile == ProfileSimple {
+		return &MultiReceiver{m: session.NewMultiBondedReceiver(conns, sc, newGroup)}, nil
+	}
+	// Main/Advanced: validate the profile params once, then build fresh per-flow
+	// params (PSK key state) in the factory.
+	if err := applyBondProfile(&sc, cfg); err != nil {
+		closeConns(conns)
+		return nil, err
+	}
+	mkBonded := func(c []*socket.Conn, g *bonding.Group, flowCfg session.Config) *session.Session {
+		_ = applyBondProfile(&flowCfg, cfg) // validated above; fresh params per flow
+		return session.NewBondedInjectedReceiver(c, g, flowCfg)
+	}
+	return &MultiReceiver{m: session.NewMultiBondedReceiverSingle(conns, sc, newGroup, mkBonded)}, nil
 }
 
 // Accept blocks until a new flow appears on the port and returns a Receiver for

@@ -127,6 +127,11 @@ func NewBondedInjectedReceiver(conns []*socket.Conn, group *bonding.Group, cfg C
 // FlowFactory builds an injected per-flow receiver session on the shared conn.
 type FlowFactory func(conn *socket.Conn, cfg Config) *Session
 
+// BondFactory builds an injected per-flow bonded session over the shared path
+// sockets, with this flow's own group. It lets a caller build fresh per-flow
+// profile params (e.g. PSK keys) before constructing the session.
+type BondFactory func(conns []*socket.Conn, group *bonding.Group, cfg Config) *Session
+
 // MultiReceiver binds one socket and demultiplexes the media flows arriving on it
 // into independent receiver Sessions. New flows are surfaced via Accept. It is
 // the receiver-side of RIST stream multiplexing.
@@ -142,6 +147,7 @@ type MultiReceiver struct {
 	bonded    bool
 	bondConns []*socket.Conn
 	newGroup  func() *bonding.Group
+	mkBonded  BondFactory
 
 	mu    sync.Mutex
 	flows map[any]*Session // key: uint32 SSRC (Simple) or netip.AddrPort (single)
@@ -190,21 +196,65 @@ func newMulti(conn *socket.Conn, cfg Config, single bool, mkFlow FlowFactory) *M
 // path liveness/routing group. This is stream multiplexing and link bonding at
 // once (N flows, each over M paths).
 func NewMultiBondedReceiver(conns []*socket.Conn, cfg Config, newGroup func() *bonding.Group) *MultiReceiver {
-	m := &MultiReceiver{
-		cfg:       cfg,
-		bonded:    true,
-		bondConns: conns,
-		newGroup:  newGroup,
-		flows:     make(map[any]*Session),
-		accept:    make(chan *Session, 64),
-		done:      make(chan struct{}),
-	}
+	m := newMultiBonded(conns, cfg, false, newGroup, func(c []*socket.Conn, g *bonding.Group, fc Config) *Session {
+		return NewBondedInjectedReceiver(c, g, fc)
+	})
 	for i, c := range conns {
 		m.wg.Add(2)
 		go m.readBondPath(uint8(i), false, c.ReadMedia)
 		go m.readBondPath(uint8(i), true, c.ReadRTCP)
 	}
 	return m
+}
+
+// NewMultiBondedReceiverSingle is NewMultiBondedReceiver for the single-socket
+// profiles (Main/Advanced): each path is one socket and flows are keyed by source
+// address (a bonded sender uses one source socket duplicated to every path, so
+// the source identifies the flow and the path is the receiver socket it arrived
+// on). This works with PSK without reading the encrypted SSRC. mkBonded builds
+// each flow's session, with fresh profile params.
+func NewMultiBondedReceiverSingle(conns []*socket.Conn, cfg Config, newGroup func() *bonding.Group, mkBonded BondFactory) *MultiReceiver {
+	m := newMultiBonded(conns, cfg, true, newGroup, mkBonded)
+	for i, c := range conns {
+		m.wg.Add(1)
+		go m.readBondPathSingle(uint8(i), c.ReadMedia)
+	}
+	return m
+}
+
+func newMultiBonded(conns []*socket.Conn, cfg Config, single bool, newGroup func() *bonding.Group, mkBonded BondFactory) *MultiReceiver {
+	return &MultiReceiver{
+		cfg:       cfg,
+		single:    single,
+		bonded:    true,
+		bondConns: conns,
+		newGroup:  newGroup,
+		mkBonded:  mkBonded,
+		flows:     make(map[any]*Session),
+		accept:    make(chan *Session, 64),
+		done:      make(chan struct{}),
+	}
+}
+
+// readBondPathSingle reads one single-socket bonded path (Main/Advanced), keys
+// each datagram by source address, and injects it tagged with the path index.
+func (m *MultiReceiver) readBondPathSingle(idx uint8, read func([]byte) (int, netip.AddrPort, error)) {
+	defer m.wg.Done()
+	buf := make([]byte, maxDatagram)
+	for {
+		n, src, err := read(buf)
+		if err != nil {
+			return
+		}
+		s, stop := m.flowFor(src, 0)
+		if stop {
+			return
+		}
+		if s == nil {
+			continue // flow cap reached
+		}
+		s.InjectBond(idx, false, clone(buf[:n]), src)
+	}
 }
 
 // readBondPath reads one bonded path socket (media or RTCP), keys each datagram
@@ -336,7 +386,7 @@ func (m *MultiReceiver) flowFor(key any, ssrc uint32) (s *Session, stop bool) {
 		cfg.SSRC = ssrc // tag this flow's RR/NACK with the flow SSRC (libRIST flow_id)
 	}
 	if m.bonded {
-		s = NewBondedInjectedReceiver(m.bondConns, m.newGroup(), cfg)
+		s = m.mkBonded(m.bondConns, m.newGroup(), cfg)
 	} else {
 		s = m.mkFlow(m.conn, cfg)
 	}

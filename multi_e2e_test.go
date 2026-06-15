@@ -387,6 +387,112 @@ func TestE2EMultiBondedReceiverSeamlessLoss(t *testing.T) {
 	}
 }
 
+// acceptAndMatchTwo accepts two flows, reads perFlowBytes from each, and asserts
+// the two reconstructed streams equal the two expected SHA-256s (set equality).
+func acceptAndMatchTwo(t *testing.T, mrx *ristgo.MultiReceiver, want1, want2 [32]byte, perFlowBytes int) {
+	t.Helper()
+	type result struct {
+		sha [32]byte
+		n   int
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		rx, err := mrx.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		go func(rx *ristgo.Receiver) {
+			defer rx.Close()
+			rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+			got := 0
+			buf := make([]byte, 4096)
+			h := sha256.New()
+			for got < perFlowBytes {
+				n, rerr := rx.Read(buf)
+				if n > 0 {
+					take := n
+					if got+take > perFlowBytes {
+						take = perFlowBytes - got
+					}
+					h.Write(buf[:take])
+					got += take
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			var sum [32]byte
+			copy(sum[:], h.Sum(nil))
+			results <- result{sum, got}
+		}(rx)
+	}
+	seen := map[[32]byte]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.n != perFlowBytes {
+				t.Fatalf("a flow received %d/%d bytes", r.n, perFlowBytes)
+			}
+			seen[r.sha] = true
+		case <-time.After(30 * time.Second):
+			t.Fatal("timed out waiting for both flows")
+		}
+	}
+	if !seen[want1] || !seen[want2] {
+		t.Fatal("demux mismatch: the two flows did not reconstruct the two streams")
+	}
+}
+
+// TestE2EMultiBondedReceiverAdvancedPSK combines PSK-encrypted Advanced with both
+// multiplexing and bonding: two AES-256 bonded senders, each duplicating one flow
+// over two single-port paths, demultiplexed by source address (no SSRC peek) into
+// two flows, each decrypted with its own key and merged across both paths.
+func TestE2EMultiBondedReceiverAdvancedPSK(t *testing.T) {
+	const perFlowBytes = 64 * 1024
+	const chunk = 1316
+
+	pA := freeMainPort(t)
+	pB := freeMainPort(t)
+	for pB == pA {
+		pB = freeMainPort(t)
+	}
+	addrs := []string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}
+	cfg := advConfig("ristgo-multibond-psk", 256, false)
+	cfg.BufferMin = 400 * time.Millisecond
+	cfg.BufferMax = 400 * time.Millisecond
+
+	mrx, err := ristgo.NewMultiBondedReceiver(addrs, cfg)
+	if err != nil {
+		t.Fatalf("NewMultiBondedReceiver: %v", err)
+	}
+	defer mrx.Close()
+
+	dataA := make([]byte, perFlowBytes)
+	dataB := make([]byte, perFlowBytes)
+	if _, err := rand.Read(dataA); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if _, err := rand.Read(dataB); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+
+	txA, err := ristgo.NewBondedSender(addrs, cfg)
+	if err != nil {
+		t.Fatalf("NewBondedSender A: %v", err)
+	}
+	defer txA.Close()
+	txB, err := ristgo.NewBondedSender(addrs, cfg)
+	if err != nil {
+		t.Fatalf("NewBondedSender B: %v", err)
+	}
+	defer txB.Close()
+
+	go streamBonded(txA, dataA, chunk)
+	go streamBonded(txB, dataB, chunk)
+
+	acceptAndMatchTwo(t, mrx, sha256.Sum256(dataA), sha256.Sum256(dataB), perFlowBytes)
+}
+
 // TestE2EMultiReceiverLossRecovery sends one flow through a 10%-loss proxy into a
 // MultiReceiver and verifies the demuxed flow recovers every byte by ARQ, proving
 // the injected session's NACK/retransmit path works through the shared socket.
