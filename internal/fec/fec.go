@@ -2,11 +2,6 @@ package fec
 
 import "github.com/zsiec/ristgo/internal/seq"
 
-// maxRcvHistory bounds how many matrix series the decoder tracks before dropping
-// the oldest, so a long run or a large sequence jump cannot grow state without
-// bound.
-const maxRcvHistory = 10
-
 // Config sizes the FEC matrix: Cols (L) columns by Rows (D) rows. ColumnOnly
 // suppresses the row (horizontal) FEC, keeping only column (vertical) FEC.
 type Config struct {
@@ -36,13 +31,19 @@ type Recovered struct {
 func seqAdd(base uint32, off int) uint32 { return seq.Num32(base).Add(int64(off)).Value() }
 func seqDiff(base, s uint32) int         { return int(seq.Num32(base).Distance(seq.Num32(s))) }
 
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 // fecGroup accumulates the XOR of one row or column's packets. lengthClip,
 // ptClip, and tsClip recover the missing packet's payload length, RTP payload
 // type, and timestamp; payloadClip recovers its payload.
 type fecGroup struct {
 	base        uint32
 	collected   int
-	hasFEC      bool
 	lengthClip  uint16
 	ptClip      uint8
 	tsClip      uint32
@@ -56,7 +57,6 @@ func newGroup(base uint32, payloadSize int) fecGroup {
 func (g *fecGroup) reset(base uint32) {
 	g.base = base
 	g.collected = 0
-	g.hasFEC = false
 	g.lengthClip = 0
 	g.ptClip = 0
 	g.tsClip = 0
@@ -71,18 +71,6 @@ func (g *fecGroup) clip(length uint16, pt uint8, ts uint32, payload []byte) {
 	g.tsClip ^= ts
 	for i := 0; i < len(payload) && i < len(g.payloadClip); i++ {
 		g.payloadClip[i] ^= payload[i]
-	}
-}
-
-// clipFEC XORs a received FEC packet's recovery fields into the accumulator, so
-// the group holds the XOR of (FEC packet) ^ (all received members) — which is the
-// single missing member.
-func (g *fecGroup) clipFEC(h Header, fecPayload []byte) {
-	g.lengthClip ^= h.LengthRecovery
-	g.ptClip ^= h.PTRecovery & 0x7f
-	g.tsClip ^= h.TSRecovery
-	for i := 0; i < len(fecPayload) && i < len(g.payloadClip); i++ {
-		g.payloadClip[i] ^= fecPayload[i]
 	}
 }
 
@@ -175,65 +163,68 @@ func (e *Encoder) emit(g *fecGroup, dir Direction) Packet {
 
 // ---------------- Decoder (receiver) ----------------
 
-// Decoder collects media and FEC packets and rebuilds any single packet missing
-// from a row or column, recursively recovering across dimensions. Recovered
-// packets are returned for the host to feed into the flow.
+// Decoder reconstructs lost media from FEC packets. It is driven entirely by the
+// FEC packets' own SNBase and geometry (Offset/NA) rather than any assumed matrix
+// alignment, so it recovers correctly even when the first media packet of a stream
+// is lost: a FEC packet defines its group's exact sequence numbers, the decoder
+// checks them against the media it has stored in a sliding window, and rebuilds
+// the single missing member by XOR. Recovered packets re-enter the window, so a
+// 2-D loss recovered along one dimension cascades into the other.
 type Decoder struct {
 	cfg         Config
 	payloadSize int
+	window      int
 
-	rows       []fecGroup // sliding window of row groups
-	cols       []fecGroup // column groups across the tracked matrix series
-	colSeries  int
-	colBaseISN uint32
-
-	cells map[uint32]bool // seqs known received (media or recovered)
+	media   map[uint32]storedMedia // received and recovered media in the window
+	fecs    []storedFEC            // FEC packets in the window not yet fully resolved
+	lastSeq uint32                 // highest media sequence seen (window anchor)
+	haveSeq bool
 
 	out []Recovered
 }
 
-// NewDecoder builds a Decoder for the matrix in cfg. isn is the first expected
-// media sequence number.
+// storedMedia holds the recoverable fields of one media packet in the window.
+type storedMedia struct {
+	ts      uint32
+	pt      uint8
+	payload []byte
+}
+
+// storedFEC holds one received FEC packet: the group it protects (base, stride,
+// count) and the recovery fields/payload to XOR.
+type storedFEC struct {
+	base          uint32
+	stride, count int
+	lengthRec     uint16
+	ptRec         uint8
+	tsRec         uint32
+	payload       []byte
+	done          bool // group fully resolved (recovered or complete)
+}
+
+// NewDecoder builds a Decoder for the matrix in cfg. isn seeds the window anchor;
+// it need not be exact (the window self-corrects from the first media packet).
 func NewDecoder(cfg Config, payloadSize int, isn uint32) *Decoder {
-	d := &Decoder{
+	return &Decoder{
 		cfg:         cfg,
 		payloadSize: payloadSize,
-		colBaseISN:  isn,
-		cells:       make(map[uint32]bool, cfg.matrixSize()),
+		window:      cfg.matrixSize()*3 + cfg.Cols + 8, // a few matrices, enough for column FEC
+		media:       make(map[uint32]storedMedia, cfg.matrixSize()*2),
+		lastSeq:     isn,
 	}
-	initRows := 2
-	if cfg.Rows > 1 {
-		initRows = cfg.Rows + 1
-	}
-	for i := 0; i < initRows; i++ {
-		d.rows = append(d.rows, newGroup(seqAdd(isn, i*cfg.Cols), payloadSize))
-	}
-	if cfg.Rows > 1 {
-		d.extendColumns(isn)
-	}
-	return d
 }
 
-func (d *Decoder) extendColumns(base uint32) {
-	for i := 0; i < d.cfg.Cols; i++ {
-		d.cols = append(d.cols, newGroup(seqAdd(base, i), d.payloadSize))
-	}
-	d.colSeries++
-}
-
-// PushMedia clips one received media packet and returns any packets its arrival
+// PushMedia stores one received media packet and returns any packets its arrival
 // allowed FEC to recover.
 func (d *Decoder) PushMedia(s, ts uint32, pt uint8, payload []byte) []Recovered {
 	d.out = d.out[:0]
-	d.trim(s)
-	if d.cells[s] {
+	d.advance(s)
+	if _, ok := d.media[s]; ok {
 		return nil // duplicate (ARQ/2022-7 already delivered it)
 	}
-	d.cells[s] = true
-	d.hangRowData(s, ts, pt, payload)
-	if d.cfg.Rows > 1 {
-		d.hangColData(s, ts, pt, payload)
-	}
+	d.store(s, ts, pt, payload)
+	d.recoverAll()
+	d.evict()
 	return d.out
 }
 
@@ -245,294 +236,137 @@ func (d *Decoder) PushFEC(fec []byte) []Recovered {
 	if err != nil {
 		return nil
 	}
-	payload := fec[off:]
-	if h.Direction == Row {
-		d.hangRowFEC(h, payload)
-	} else if d.cfg.Rows > 1 {
-		d.hangColFEC(h, payload)
+	stride, count := int(h.Offset), int(h.NA)
+	if stride <= 0 || count <= 1 || count > 256 {
+		return nil // malformed geometry; ignore
 	}
+	d.fecs = append(d.fecs, storedFEC{
+		base:      d.widen(h.base24()),
+		stride:    stride,
+		count:     count,
+		lengthRec: h.LengthRecovery,
+		ptRec:     h.PTRecovery & 0x7f,
+		tsRec:     h.TSRecovery,
+		payload:   append([]byte(nil), fec[off:]...),
+	})
+	d.recoverAll()
+	d.evict()
 	return d.out
 }
 
-// rowIndex returns the row-group slot for seq, growing the window as needed, or
-// -1 if seq is behind the window or too far ahead.
-func (d *Decoder) rowIndex(s uint32) int {
-	if len(d.rows) == 0 {
-		return -1
-	}
-	off := seqDiff(d.rows[0].base, s)
-	if off < 0 {
-		return -1
-	}
-	idx := off / d.cfg.Cols
-	if idx >= maxRcvHistory*max(d.cfg.Rows, 1) {
-		return -1
-	}
-	for idx >= len(d.rows) {
-		d.rows = append(d.rows, newGroup(seqAdd(d.rows[len(d.rows)-1].base, d.cfg.Cols), d.payloadSize))
-	}
-	return idx
+func (d *Decoder) store(s, ts uint32, pt uint8, payload []byte) {
+	d.media[s] = storedMedia{ts: ts, pt: pt, payload: append([]byte(nil), payload...)}
 }
 
-// colIndex returns the column-group slot for seq, extending the series deque as
-// needed, or -1.
-func (d *Decoder) colIndex(s uint32) int {
-	if len(d.cols) == 0 {
-		return -1
-	}
-	off := seqDiff(d.colBaseISN, s)
-	if off < 0 {
-		return -1
-	}
-	colx := off % d.cfg.Cols
-	series := off / d.cfg.matrixSize()
-	maxSeries := d.colSeries - 1
-	if series > maxSeries {
-		need := series - maxSeries
-		if d.colSeries+need > maxRcvHistory {
-			return -1
-		}
-		for i := 0; i < need; i++ {
-			d.extendColumns(seqAdd(d.colBaseISN, d.colSeries*d.cfg.matrixSize()))
-		}
-	}
-	firstSeries := seqDiff(d.colBaseISN, d.cols[0].base) / d.cfg.matrixSize()
-	local := series - firstSeries
-	if local < 0 {
-		return -1
-	}
-	idx := local*d.cfg.Cols + colx
-	if idx < 0 || idx >= len(d.cols) {
-		return -1
-	}
-	return idx
-}
-
-func (d *Decoder) hangRowData(s, ts uint32, pt uint8, payload []byte) {
-	i := d.rowIndex(s)
-	if i < 0 {
-		return
-	}
-	g := &d.rows[i]
-	g.clip(uint16(len(payload)), pt, ts, payload)
-	g.collected++
-	if g.hasFEC && g.collected == d.cfg.Cols-1 {
-		d.recoverRow(g)
+func (d *Decoder) advance(s uint32) {
+	if !d.haveSeq || seqDiff(d.lastSeq, s) > 0 {
+		d.lastSeq = s
+		d.haveSeq = true
 	}
 }
 
-func (d *Decoder) hangRowFEC(h Header, payload []byte) {
-	i := d.rowIndexForBase(h.base24())
-	if i < 0 {
-		return
-	}
-	g := &d.rows[i]
-	if g.hasFEC {
-		return
-	}
-	g.hasFEC = true
-	g.clipFEC(h, payload)
-	if g.collected == d.cfg.Cols-1 {
-		d.recoverRow(g)
-	}
-}
-
-// rowIndexForBase maps a FEC header's base seq (which may carry only 24 bits) to
-// a row slot by widening it against the current window.
-func (d *Decoder) rowIndexForBase(base24 uint32) int {
-	if len(d.rows) == 0 {
-		return -1
-	}
-	return d.rowIndex(d.widen(base24))
-}
-
-func (d *Decoder) hangColData(s, ts uint32, pt uint8, payload []byte) {
-	i := d.colIndex(s)
-	if i < 0 {
-		return
-	}
-	g := &d.cols[i]
-	g.clip(uint16(len(payload)), pt, ts, payload)
-	g.collected++
-	if g.hasFEC && g.collected == d.cfg.Rows-1 {
-		d.recoverCol(g)
-	}
-}
-
-func (d *Decoder) hangColFEC(h Header, payload []byte) {
-	i := d.colIndex(d.widen(h.base24()))
-	if i < 0 {
-		return
-	}
-	g := &d.cols[i]
-	if g.hasFEC {
-		return
-	}
-	g.hasFEC = true
-	g.clipFEC(h, payload)
-	if g.collected == d.cfg.Rows-1 {
-		d.recoverCol(g)
-	}
-}
-
-// widen maps a 24-bit FEC base sequence to the full 32-bit space using the most
-// recent row base as context (the base is always within the active window).
+// widen maps a 24-bit FEC base sequence to the full 32-bit space using the latest
+// media sequence as context (a FEC packet always protects sequences near the
+// current window).
 func (d *Decoder) widen(base24 uint32) uint32 {
-	if len(d.rows) == 0 {
-		return base24
-	}
-	ref := d.rows[0].base
-	hi := ref &^ 0xFFFFFF
-	cand := hi | (base24 & 0xFFFFFF)
-	// Resolve the 24-bit wrap by picking the candidate closest to ref.
-	for _, c := range [3]uint32{cand, cand + (1 << 24), cand - (1 << 24)} {
-		if abs(seqDiff(ref, c)) <= abs(seqDiff(ref, cand)) {
-			cand = c
+	cand := (d.lastSeq &^ 0xFFFFFF) | (base24 & 0xFFFFFF)
+	best := cand
+	for _, c := range [2]uint32{cand + (1 << 24), cand - (1 << 24)} {
+		if abs(seqDiff(d.lastSeq, c)) < abs(seqDiff(d.lastSeq, best)) {
+			best = c
 		}
 	}
-	return cand
+	return best
 }
 
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
-func (d *Decoder) recoverRow(g *fecGroup) {
-	lost := d.findLost(g.base, 1, d.cfg.Cols)
-	if lost < 0 {
-		return
-	}
-	d.rebuild(g, uint32(lost), Row)
-}
-
-func (d *Decoder) recoverCol(g *fecGroup) {
-	lost := d.findLost(g.base, d.cfg.Cols, d.cfg.Rows)
-	if lost < 0 {
-		return
-	}
-	d.rebuild(g, uint32(lost), Column)
-}
-
-// findLost returns the single missing sequence in a group (base, stride, count),
-// or -1 if zero or more than one are missing.
-func (d *Decoder) findLost(base uint32, stride, count int) int {
-	lost := -1
-	for i := 0; i < count; i++ {
-		s := seqAdd(base, i*stride)
-		if !d.cells[s] {
-			if lost >= 0 {
-				return -1 // more than one missing: unrecoverable in this dimension
+// recoverAll repeatedly scans the stored FEC packets, recovering every group that
+// has exactly one missing member, until a full pass recovers nothing — so a packet
+// recovered in one dimension cascades into the FEC of the other.
+func (d *Decoder) recoverAll() {
+	for {
+		recovered := false
+		for i := range d.fecs {
+			if d.tryRecover(&d.fecs[i]) {
+				recovered = true
 			}
-			lost = int(s)
+		}
+		if !recovered {
+			return
 		}
 	}
-	return lost
 }
 
-// rebuild reconstructs the lost packet from the group accumulator and, for a 2-D
-// matrix, feeds it into the opposite dimension to cascade further recovery.
-func (d *Decoder) rebuild(g *fecGroup, s uint32, dir Direction) {
-	length := int(g.lengthClip)
-	if length > d.payloadSize || length < 0 {
-		return
+// tryRecover rebuilds the single missing member of sf's group, if exactly one is
+// missing, and stores it back into the window (so the opposite dimension can use
+// it). It returns true only when it recovers a packet.
+func (d *Decoder) tryRecover(sf *storedFEC) bool {
+	if sf.done {
+		return false
 	}
-	rp := Recovered{
-		Seq:         s,
-		Timestamp:   g.tsClip,
-		PayloadType: g.ptClip,
-		Payload:     append([]byte(nil), g.payloadClip[:length]...),
+	// Only recover while the whole group is inside the window. sf.base is the oldest
+	// member (stride > 0), so once it ages below the floor a member may have been
+	// evicted, and treating an evicted (but received) member as missing would
+	// "recover" a packet that was never lost. Give the group to ARQ instead.
+	if seqDiff(seqAdd(d.lastSeq, -d.window), sf.base) < 0 {
+		sf.done = true
+		return false
 	}
+	var missing uint32
+	missingCount := 0
+	for i := 0; i < sf.count; i++ {
+		s := seqAdd(sf.base, i*sf.stride)
+		if _, ok := d.media[s]; !ok {
+			missingCount++
+			if missingCount > 1 {
+				return false // more than one missing: not recoverable yet
+			}
+			missing = s
+		}
+	}
+	if missingCount == 0 {
+		sf.done = true
+		return false
+	}
+	length := sf.lengthRec
+	pt := sf.ptRec
+	ts := sf.tsRec
+	payload := make([]byte, d.payloadSize)
+	copy(payload, sf.payload)
+	for i := 0; i < sf.count; i++ {
+		m, ok := d.media[seqAdd(sf.base, i*sf.stride)]
+		if !ok {
+			continue
+		}
+		length ^= uint16(len(m.payload))
+		pt ^= m.pt & 0x7f
+		ts ^= m.ts
+		for j := 0; j < len(m.payload) && j < len(payload); j++ {
+			payload[j] ^= m.payload[j]
+		}
+	}
+	if int(length) > d.payloadSize {
+		return false // implausible recovered length: leave the loss to ARQ
+	}
+	rp := Recovered{Seq: missing, Timestamp: ts, PayloadType: pt, Payload: append([]byte(nil), payload[:length]...)}
 	d.out = append(d.out, rp)
-	d.cells[s] = true
-
-	if d.cfg.Rows <= 1 {
-		return
-	}
-	if dir == Row {
-		d.crossCol(rp)
-	} else {
-		d.crossRow(rp)
-	}
+	d.media[missing] = storedMedia{ts: ts, pt: pt, payload: rp.Payload}
+	sf.done = true
+	return true
 }
 
-func (d *Decoder) crossRow(rp Recovered) {
-	i := d.rowIndex(rp.Seq)
-	if i < 0 {
-		return
-	}
-	g := &d.rows[i]
-	g.clip(uint16(len(rp.Payload)), rp.PayloadType, rp.Timestamp, rp.Payload)
-	g.collected++
-	if g.hasFEC && g.collected == d.cfg.Cols-1 {
-		d.recoverRow(g)
-	}
-}
-
-func (d *Decoder) crossCol(rp Recovered) {
-	i := d.colIndex(rp.Seq)
-	if i < 0 {
-		return
-	}
-	g := &d.cols[i]
-	g.clip(uint16(len(rp.Payload)), rp.PayloadType, rp.Timestamp, rp.Payload)
-	g.collected++
-	if g.hasFEC && g.collected == d.cfg.Rows-1 {
-		d.recoverCol(g)
-	}
-}
-
-// trim drops groups and cells the sliding window has passed, bounding memory.
-func (d *Decoder) trim(s uint32) {
-	if len(d.rows) == 0 {
-		return
-	}
-	off := seqDiff(d.rows[0].base, s)
-	matSz := d.cfg.matrixSize()
-	if matSz > 0 && off/matSz >= maxRcvHistory {
-		d.fullReset(s)
-		return
-	}
-	threshold := matSz * 2
-	if d.cfg.Rows <= 1 {
-		threshold = d.cfg.Cols * 2
-	}
-	for off >= threshold && len(d.rows) > 1 {
-		d.rows = d.rows[1:]
-		off = seqDiff(d.rows[0].base, s)
-		d.cleanCells()
-	}
-	if d.cfg.Rows > 1 {
-		for d.colSeries > 2 && len(d.cols) > d.cfg.Cols {
-			d.cols = d.cols[d.cfg.Cols:]
-			d.colSeries--
+// evict drops media and FEC packets older than the window, bounding memory.
+func (d *Decoder) evict() {
+	lo := seqAdd(d.lastSeq, -d.window)
+	for s := range d.media {
+		if seqDiff(lo, s) < 0 {
+			delete(d.media, s)
 		}
 	}
-}
-
-func (d *Decoder) fullReset(s uint32) {
-	base := seqAdd(s, -(seqDiff(0, s) % max(d.cfg.Cols, 1)))
-	d.rows = d.rows[:0]
-	d.rows = append(d.rows, newGroup(base, d.payloadSize))
-	d.cols = d.cols[:0]
-	d.colSeries = 0
-	d.colBaseISN = base
-	if d.cfg.Rows > 1 {
-		d.extendColumns(base)
-	}
-	clear(d.cells)
-}
-
-func (d *Decoder) cleanCells() {
-	if len(d.rows) == 0 {
-		return
-	}
-	base := d.rows[0].base
-	for s := range d.cells {
-		if seqDiff(base, s) < 0 {
-			delete(d.cells, s)
+	keep := d.fecs[:0]
+	for _, f := range d.fecs {
+		if seqDiff(lo, f.base) >= 0 {
+			keep = append(keep, f)
 		}
 	}
+	d.fecs = keep
 }

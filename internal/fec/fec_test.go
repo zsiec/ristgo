@@ -76,14 +76,20 @@ func encodeStream(cfg Config, isn uint32, n int) ([]event, map[uint32][]byte) {
 // replay feeds the transmission sequence through a Decoder, dropping the media
 // packets in drop, and returns the set of recovered sequences with their payloads.
 func replay(cfg Config, isn int, events []event, drop map[uint32]bool, orig map[uint32][]byte, t *testing.T) map[uint32]bool {
-	dec := NewDecoder(cfg, testPayloadSize, uint32(isn))
+	_ = isn // the decoder is created lazily from the first received media, like the session
+	var dec *Decoder
 	recovered := map[uint32]bool{}
 	for _, e := range events {
 		var rs []Recovered
 		if e.isFEC {
-			rs = dec.PushFEC(e.fec)
+			if dec != nil {
+				rs = dec.PushFEC(e.fec)
+			}
 		} else if !drop[e.seq] {
 			s := e.seq
+			if dec == nil {
+				dec = NewDecoder(cfg, testPayloadSize, s) // anchor on the first packet that ARRIVES
+			}
 			rs = dec.PushMedia(s, mkTS(s), mkPT(s), orig[s])
 		}
 		for _, r := range rs {
@@ -154,6 +160,31 @@ func TestTwoDRecursiveRecovery(t *testing.T) {
 	for s := range drop {
 		if !rec[s] {
 			t.Fatalf("recursive 2-D FEC failed to recover seq %d", s)
+		}
+	}
+}
+
+// TestDecoderRobustToLostFirstPacket verifies the decoder recovers even when the
+// very first media packet (the matrix origin) is lost, so the decoder anchors on a
+// misaligned sequence. A decoder that assumed matrix alignment from the first
+// received packet would fail every subsequent recovery; the SNBase-driven decoder
+// recovers regardless. The dropped first packet is itself recovered by its column.
+func TestDecoderRobustToLostFirstPacket(t *testing.T) {
+	cfg := Config{Cols: 5, Rows: 5}
+	const isn = 9000
+	events, orig := encodeStream(cfg, isn, cfg.matrixSize()*3)
+	// Drop the matrix origin (isn, column 0 row 0) plus one isolated packet in each
+	// of the first two matrices. Each is the single loss of its column, so all are
+	// recoverable even though the decoder never saw the true ISN.
+	drop := map[uint32]bool{
+		seqAdd(isn, 0):                  true, // the lost first packet
+		seqAdd(isn, 12):                 true, // column 2 row 2 of matrix 0
+		seqAdd(isn, cfg.matrixSize()+8): true, // matrix 1
+	}
+	rec := replay(cfg, isn, events, drop, orig, t)
+	for s := range drop {
+		if !rec[s] {
+			t.Fatalf("decoder failed to recover seq %d after the first packet was lost", s)
 		}
 	}
 }
