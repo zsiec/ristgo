@@ -205,6 +205,13 @@ type Session struct {
 	flow   *flow.Flow
 	peer   *peer.Peer
 	sender bool // role
+	// injected runs the session without its own socket reader goroutines: an
+	// external demultiplexer (a MultiReceiver) owns the socket read, peeks the
+	// flow's SSRC, and feeds this session's inbound channels via InjectMedia /
+	// InjectRTCP / InjectMain / InjectAdv. The session still owns its event loop,
+	// flow core, timers, and feedback writes (which go out the shared conn). On
+	// shutdown it does not close the shared conn (the MultiReceiver does).
+	injected bool
 	// announce makes a receiver send an immediate startup keepalive (a Receiver
 	// Report) to its seeded peer.RTCP — the caller-receive (pull) mode, where the
 	// receiver dials a listening sender and must announce itself so that sender
@@ -587,6 +594,9 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 func (s *Session) start() {
 	s.wg.Add(1)
 	go s.loop()
+	if s.injected {
+		return // a MultiReceiver owns the socket read and feeds Inject*
+	}
 	if s.bond != nil {
 		s.startBondReaders()
 		return

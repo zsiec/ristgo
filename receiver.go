@@ -315,6 +315,11 @@ func (r *Receiver) ReadOOB(buf []byte) (int, error) { return r.sess.ReadOOB(buf)
 // profiles). OOB is a fire-and-forget side channel that bypasses ARQ recovery.
 // The payload must be at most MaxMediaPayload bytes. It returns ErrOOBUnsupported
 // on a Simple-profile receiver.
+//
+// The payload is carried verbatim in a GRE full frame (protocol type 0x0800),
+// byte-identical to libRIST's out-of-band data path, so a complete IP packet
+// (with its original headers, including a multicast destination) survives the
+// tunnel intact. This is RIST stream IP preservation.
 func (r *Receiver) WriteOOB(p []byte) error {
 	if len(p) > MaxMediaPayload {
 		return fmt.Errorf("rist: OOB payload %d bytes exceeds MaxMediaPayload %d", len(p), MaxMediaPayload)
@@ -327,6 +332,10 @@ func (r *Receiver) LocalPort() int { return r.sess.MediaPort() }
 
 // Stats returns a snapshot of the receiver's counters.
 func (r *Receiver) Stats() Stats { return toStats(r.sess.Stats()) }
+
+// SSRC returns the flow's SSRC. It is most useful for a Receiver obtained from
+// [MultiReceiver.Accept], where it identifies which demultiplexed flow this is.
+func (r *Receiver) SSRC() uint32 { return r.sess.SSRC() }
 
 // Authenticated reports whether the data channel is open. For a Main-profile
 // receiver configured with EAP-SRP credentials it becomes true once the sender
