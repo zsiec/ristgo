@@ -217,6 +217,42 @@ counts packets reconstructed by FEC. libRIST does not implement FEC, so this is 
 ristgo capability (interoperable with other ST 2022-1 receivers on the separate-port
 carriage).
 
+### Source-adaptive bitrate (TR-06-4 Part 1)
+
+The receiver measures link quality and reports it to the sender, whose AIMD
+controller turns sustained loss into an encoder-rate target delivered through a
+callback. Use it to back an encoder off a congested link and probe back up when it
+clears.
+
+```go
+// Receiver: emit Link Quality Messages.
+rx, _ := ristgo.Listen(ctx, ":5000", ristgo.WithSourceAdaptation())
+
+// Sender: drive the encoder from the reported quality, within bounds.
+tx, _ := ristgo.Dial(ctx, "host:5000",
+	ristgo.WithMinBitrate(2000), ristgo.WithMaxBitrate(8000), // kbps
+	ristgo.WithRateAdapt(func(targetKbps int) {
+		encoder.SetBitrate(targetKbps) // your encoder
+	}))
+```
+
+### IP multicast
+
+A multicast group address makes the receiver join the group and the sender egress
+to it (the standard library's `net.UDPConn` cannot, so this uses `golang.org/x/net`).
+Set the hop limit for routed delivery, the egress/join interface, or source-specific
+multicast (SSM) via `Config`.
+
+```go
+rx, _ := ristgo.Listen(ctx, "239.1.2.3:5004") // auto-joins the group
+// Receiver Config options: MulticastSource (source-specific multicast),
+// Interface (the join interface).
+
+cfg := ristgo.DefaultConfig()
+cfg.MulticastTTL = 16 // routed delivery (default 1 = local link only)
+tx, _ := ristgo.NewSender("239.1.2.3:5004", cfg)
+```
+
 ## Features
 
 Everything below is implemented and tested.
