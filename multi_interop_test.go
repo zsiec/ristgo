@@ -76,3 +76,67 @@ func TestInteropMultiReceiverTwoLibristSenders(t *testing.T) {
 		t.Fatal("demux mismatch: the two libRIST flows did not reconstruct as two distinct streams")
 	}
 }
+
+// TestInteropMultiReceiverTwoLibristAdvSenders proves Advanced-profile
+// multiplexing interop: two libRIST -p 2 senders (distinct sources) are
+// demultiplexed by source address into two independent Advanced flows by one
+// ristgo MultiReceiver, each recovered byte-exact.
+func TestInteropMultiReceiverTwoLibristAdvSenders(t *testing.T) {
+	sender := libristTool(t, "ristsender")
+	goPort := freeMainPort(t)
+	feedA := freeUDPPort(t, goPort)
+	feedB := freeUDPPort(t, goPort, feedA)
+
+	mrx, err := ristgo.NewMultiReceiver(fmt.Sprintf("127.0.0.1:%d", goPort), advInteropConfig(0, false))
+	if err != nil {
+		t.Fatalf("NewMultiReceiver: %v", err)
+	}
+	defer mrx.Close()
+
+	spawnTool(t, sender, append(advToolArgs(0),
+		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedA),
+		"-o", fmt.Sprintf("rist://127.0.0.1:%d", goPort))...)
+	spawnTool(t, sender, append(advToolArgs(0),
+		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedB),
+		"-o", fmt.Sprintf("rist://127.0.0.1:%d", goPort))...)
+	waitToolReady(t, feedA, 5*time.Second)
+	waitToolReady(t, feedB, 5*time.Second)
+
+	dataA, shaA := randomData(t, interopN)
+	dataB, shaB := randomData(t, interopN)
+	go feedUDP(t, feedA, dataA)
+	go feedUDP(t, feedB, dataB)
+
+	type result struct {
+		sha [32]byte
+		n   int
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		rx, err := mrx.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		go func(rx *ristgo.Receiver) {
+			defer rx.Close()
+			got := readN(t, rx, len(dataA))
+			results <- result{sha256.Sum256(got), len(got)}
+		}(rx)
+	}
+
+	seen := map[[32]byte]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.n != len(dataA) {
+				t.Fatalf("an Advanced flow received %d/%d bytes", r.n, len(dataA))
+			}
+			seen[r.sha] = true
+		case <-time.After(30 * time.Second):
+			t.Fatal("timed out waiting for both libRIST Advanced flows")
+		}
+	}
+	if !seen[shaA] || !seen[shaB] {
+		t.Fatal("Advanced demux mismatch: the two libRIST flows did not reconstruct")
+	}
+}
