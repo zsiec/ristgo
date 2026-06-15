@@ -5,7 +5,9 @@ import (
 	"net/netip"
 	"sync"
 
+	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/flow"
+	"github.com/zsiec/ristgo/internal/peer"
 	"github.com/zsiec/ristgo/internal/rtp"
 	"github.com/zsiec/ristgo/internal/socket"
 )
@@ -92,6 +94,36 @@ func NewInjectedMainReceiver(conn *socket.Conn, cfg Config) *Session {
 	return s
 }
 
+// InjectBond hands one raw bonded datagram to an injected bonded session, tagged
+// with the path index it arrived on and whether it is RTCP.
+func (s *Session) InjectBond(idx uint8, isRTCP bool, data []byte, src netip.AddrPort) {
+	select {
+	case s.bondIn <- bondInbound{idx: idx, isRTCP: isRTCP, data: data, src: src}:
+	case <-s.done:
+	}
+}
+
+// NewBondedInjectedReceiver builds a Simple-profile bonded receiver session in
+// injected mode: it merges one flow across the shared path sockets (the 2022-7
+// dedup ring), but the MultiReceiver owns the reads and demultiplexes by SSRC.
+// group is this flow's own path liveness/routing state.
+func NewBondedInjectedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *Session {
+	s := newSession(conns[0], cfg, false)
+	s.injected = true
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	bs := &bondState{group: group, conns: conns, peers: make([]*peer.Peer, len(conns))}
+	for i := range conns {
+		bs.peers[i] = peer.New(cfg.SessionTimeout)
+		if !group.HasPath(uint8(i)) {
+			group.AddPath(uint8(i), bonding.WeightDuplicate, 0)
+		}
+	}
+	s.bond = bs
+	s.bondIn = make(chan bondInbound, 256*len(conns))
+	s.start()
+	return s
+}
+
 // FlowFactory builds an injected per-flow receiver session on the shared conn.
 type FlowFactory func(conn *socket.Conn, cfg Config) *Session
 
@@ -103,6 +135,13 @@ type MultiReceiver struct {
 	cfg    Config // template; the Simple path overwrites SSRC per flow
 	single bool   // single-socket source-keyed demux (Main/Advanced)
 	mkFlow FlowFactory
+
+	// Bonded multiplexing (N flows, each merged over M paths): the demuxer owns M
+	// path sockets and keys by SSRC; each flow is a bonded injected session with
+	// its own group from newGroup. bondConns is nil for non-bonded receivers.
+	bonded    bool
+	bondConns []*socket.Conn
+	newGroup  func() *bonding.Group
 
 	mu    sync.Mutex
 	flows map[any]*Session // key: uint32 SSRC (Simple) or netip.AddrPort (single)
@@ -142,6 +181,60 @@ func newMulti(conn *socket.Conn, cfg Config, single bool, mkFlow FlowFactory) *M
 		flows:  make(map[any]*Session),
 		accept: make(chan *Session, 64),
 		done:   make(chan struct{}),
+	}
+}
+
+// NewMultiBondedReceiver starts demultiplexing Simple-profile media across M
+// bonded path sockets, keyed by RTP SSRC: each flow_id is merged over all paths
+// (SMPTE 2022-7) into its own bonded session. newGroup builds a fresh per-flow
+// path liveness/routing group. This is stream multiplexing and link bonding at
+// once (N flows, each over M paths).
+func NewMultiBondedReceiver(conns []*socket.Conn, cfg Config, newGroup func() *bonding.Group) *MultiReceiver {
+	m := &MultiReceiver{
+		cfg:       cfg,
+		bonded:    true,
+		bondConns: conns,
+		newGroup:  newGroup,
+		flows:     make(map[any]*Session),
+		accept:    make(chan *Session, 64),
+		done:      make(chan struct{}),
+	}
+	for i, c := range conns {
+		m.wg.Add(2)
+		go m.readBondPath(uint8(i), false, c.ReadMedia)
+		go m.readBondPath(uint8(i), true, c.ReadRTCP)
+	}
+	return m
+}
+
+// readBondPath reads one bonded path socket (media or RTCP), keys each datagram
+// by SSRC, and injects it into the flow's bonded session tagged with the path.
+func (m *MultiReceiver) readBondPath(idx uint8, isRTCP bool, read func([]byte) (int, netip.AddrPort, error)) {
+	defer m.wg.Done()
+	buf := make([]byte, maxDatagram)
+	for {
+		n, src, err := read(buf)
+		if err != nil {
+			return
+		}
+		var ssrc uint32
+		var ok bool
+		if isRTCP {
+			ssrc, ok = peekRTCPSSRC(buf[:n])
+		} else {
+			ssrc, ok = peekMediaSSRC(buf[:n])
+		}
+		if !ok {
+			continue
+		}
+		s, stop := m.flowFor(ssrc, ssrc)
+		if stop {
+			return
+		}
+		if s == nil {
+			continue // flow cap reached
+		}
+		s.InjectBond(idx, isRTCP, clone(buf[:n]), src)
 	}
 }
 
@@ -242,7 +335,11 @@ func (m *MultiReceiver) flowFor(key any, ssrc uint32) (s *Session, stop bool) {
 	if !m.single {
 		cfg.SSRC = ssrc // tag this flow's RR/NACK with the flow SSRC (libRIST flow_id)
 	}
-	s = m.mkFlow(m.conn, cfg)
+	if m.bonded {
+		s = NewBondedInjectedReceiver(m.bondConns, m.newGroup(), cfg)
+	} else {
+		s = m.mkFlow(m.conn, cfg)
+	}
 	m.flows[key] = s
 	m.wg.Add(1)
 	go m.retire(key, s)
@@ -280,14 +377,25 @@ func (m *MultiReceiver) Accept() (*Session, error) {
 	}
 }
 
-// MediaPort returns the bound media port.
-func (m *MultiReceiver) MediaPort() int { return m.conn.MediaPort() }
+// MediaPort returns the bound media port (the first path for a bonded receiver).
+func (m *MultiReceiver) MediaPort() int {
+	if m.bonded {
+		return m.bondConns[0].MediaPort()
+	}
+	return m.conn.MediaPort()
+}
 
-// Close stops demultiplexing, closes the shared socket, and closes every flow.
+// Close stops demultiplexing, closes the shared socket(s), and closes every flow.
 func (m *MultiReceiver) Close() error {
 	m.closeOnce.Do(func() {
 		close(m.done)
-		m.conn.Close()
+		if m.bonded {
+			for _, c := range m.bondConns {
+				c.Close()
+			}
+		} else {
+			m.conn.Close()
+		}
 	})
 	m.wg.Wait()
 	m.mu.Lock()

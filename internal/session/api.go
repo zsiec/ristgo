@@ -271,10 +271,12 @@ func (s *Session) shutdown(reason error) {
 		close(s.done)
 		if !s.injected {
 			s.conn.Close() // unblock the reader goroutines' blocking ReadFrom
+			if s.bond != nil {
+				s.closeBond() // close every path socket (conns[0] == s.conn, idempotent)
+			}
 		}
-		if s.bond != nil {
-			s.closeBond() // close every path socket (conns[0] == s.conn, idempotent)
-		}
+		// An injected (MultiReceiver-driven) session never owns its socket(s); the
+		// MultiReceiver closes them.
 	})
 }
 

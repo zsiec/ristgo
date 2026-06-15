@@ -163,6 +163,230 @@ func runMultiTwoFlows(t *testing.T, cfg ristgo.Config, port int) {
 	}
 }
 
+// streamBonded writes data to a bonded sender in chunk-sized Writes, lightly
+// paced.
+func streamBonded(tx *ristgo.BondedSender, data []byte, chunk int) {
+	tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	for off := 0; off < len(data); off += chunk {
+		end := off + chunk
+		if end > len(data) {
+			end = len(data)
+		}
+		if _, err := tx.Write(data[off:end]); err != nil {
+			return
+		}
+		if (off/chunk)%8 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// TestE2EMultiBondedReceiverTwoFlows combines multiplexing and SMPTE 2022-7
+// bonding: two bonded senders each duplicate one flow over two paths, and one
+// MultiBondedReceiver demultiplexes by SSRC into two flows, each merged across
+// both paths, both recovered bit-exact.
+func TestE2EMultiBondedReceiverTwoFlows(t *testing.T) {
+	const perFlowBytes = 96 * 1024
+	const chunk = 1316
+
+	pA, pB := twoEvenPorts(t)
+	addrs := []string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}
+
+	mrx, err := ristgo.NewMultiBondedReceiver(addrs, bondConfig())
+	if err != nil {
+		t.Fatalf("NewMultiBondedReceiver: %v", err)
+	}
+	defer mrx.Close()
+
+	dataA := make([]byte, perFlowBytes)
+	dataB := make([]byte, perFlowBytes)
+	if _, err := rand.Read(dataA); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if _, err := rand.Read(dataB); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	shaA := sha256.Sum256(dataA)
+	shaB := sha256.Sum256(dataB)
+
+	txA, err := ristgo.NewBondedSender(addrs, bondConfig())
+	if err != nil {
+		t.Fatalf("NewBondedSender A: %v", err)
+	}
+	defer txA.Close()
+	txB, err := ristgo.NewBondedSender(addrs, bondConfig())
+	if err != nil {
+		t.Fatalf("NewBondedSender B: %v", err)
+	}
+	defer txB.Close()
+
+	go streamBonded(txA, dataA, chunk)
+	go streamBonded(txB, dataB, chunk)
+
+	type result struct {
+		sha [32]byte
+		n   int
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		rx, err := mrx.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		go func(rx *ristgo.Receiver) {
+			defer rx.Close()
+			rx.SetReadDeadline(time.Now().Add(15 * time.Second))
+			got := make([]byte, 0, perFlowBytes)
+			buf := make([]byte, 4096)
+			h := sha256.New()
+			for len(got) < perFlowBytes {
+				n, rerr := rx.Read(buf)
+				if n > 0 {
+					take := n
+					if len(got)+take > perFlowBytes {
+						take = perFlowBytes - len(got)
+					}
+					h.Write(buf[:take])
+					got = append(got, buf[:take]...)
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			var sum [32]byte
+			copy(sum[:], h.Sum(nil))
+			results <- result{sum, len(got)}
+		}(rx)
+	}
+
+	seen := map[[32]byte]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.n != perFlowBytes {
+				t.Fatalf("a bonded flow received %d/%d bytes", r.n, perFlowBytes)
+			}
+			seen[r.sha] = true
+		case <-time.After(25 * time.Second):
+			t.Fatal("timed out waiting for both bonded flows")
+		}
+	}
+	if !seen[shaA] || !seen[shaB] {
+		t.Fatal("bonded demux mismatch: the two flows did not reconstruct")
+	}
+}
+
+// TestE2EMultiBondedReceiverSeamlessLoss drops 40% on one path of a two-path,
+// two-flow bonded multiplex and verifies both flows still reconstruct bit-exact
+// with zero loss: each flow's dropped packets on the lossy path are covered by
+// the clean path (2022-7 redundancy), per flow, through the demuxer.
+func TestE2EMultiBondedReceiverSeamlessLoss(t *testing.T) {
+	const perFlowBytes = 64 * 1024
+	const chunk = 1316
+
+	pA, pB := twoEvenPorts(t)
+	relayPort := freeEvenPort(t)
+	for relayPort == pA || relayPort == pB {
+		relayPort = freeEvenPort(t)
+	}
+	recvAddrs := []string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}
+	sendAddrs := []string{fmt.Sprintf("127.0.0.1:%d", relayPort), fmt.Sprintf("127.0.0.1:%d", pB)}
+
+	mrx, err := ristgo.NewMultiBondedReceiver(recvAddrs, bondConfig())
+	if err != nil {
+		t.Fatalf("NewMultiBondedReceiver: %v", err)
+	}
+	defer mrx.Close()
+
+	// Path 0 (relayPort -> pA) loses 40%; path 1 (pB) is clean.
+	relay := startMediaRelay(t, relayPort, pA, 0.40, 17)
+	defer relay.Close()
+
+	dataA := make([]byte, perFlowBytes)
+	dataB := make([]byte, perFlowBytes)
+	if _, err := rand.Read(dataA); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if _, err := rand.Read(dataB); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	shaA := sha256.Sum256(dataA)
+	shaB := sha256.Sum256(dataB)
+
+	txA, err := ristgo.NewBondedSender(sendAddrs, bondConfig())
+	if err != nil {
+		t.Fatalf("NewBondedSender A: %v", err)
+	}
+	defer txA.Close()
+	txB, err := ristgo.NewBondedSender(sendAddrs, bondConfig())
+	if err != nil {
+		t.Fatalf("NewBondedSender B: %v", err)
+	}
+	defer txB.Close()
+
+	go streamBonded(txA, dataA, chunk)
+	go streamBonded(txB, dataB, chunk)
+
+	type result struct {
+		sha  [32]byte
+		n    int
+		lost uint64
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		rx, err := mrx.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		go func(rx *ristgo.Receiver) {
+			defer rx.Close()
+			rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+			got := make([]byte, 0, perFlowBytes)
+			buf := make([]byte, 4096)
+			h := sha256.New()
+			for len(got) < perFlowBytes {
+				n, rerr := rx.Read(buf)
+				if n > 0 {
+					take := n
+					if len(got)+take > perFlowBytes {
+						take = perFlowBytes - len(got)
+					}
+					h.Write(buf[:take])
+					got = append(got, buf[:take]...)
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			var sum [32]byte
+			copy(sum[:], h.Sum(nil))
+			results <- result{sum, len(got), rx.Stats().Lost}
+		}(rx)
+	}
+
+	seen := map[[32]byte]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.n != perFlowBytes {
+				t.Fatalf("a bonded flow received %d/%d bytes (lost=%d, relay dropped=%d)", r.n, perFlowBytes, r.lost, relay.Dropped())
+			}
+			if r.lost != 0 {
+				t.Fatalf("flow Lost=%d under one-path loss; the clean path should cover it", r.lost)
+			}
+			seen[r.sha] = true
+		case <-time.After(30 * time.Second):
+			t.Fatal("timed out waiting for both bonded flows under loss")
+		}
+	}
+	if !seen[shaA] || !seen[shaB] {
+		t.Fatal("bonded demux mismatch under loss")
+	}
+	if relay.Dropped() == 0 {
+		t.Fatal("relay dropped nothing; the loss path was not exercised")
+	}
+}
+
 // TestE2EMultiReceiverLossRecovery sends one flow through a 10%-loss proxy into a
 // MultiReceiver and verifies the demuxed flow recovers every byte by ARQ, proving
 // the injected session's NACK/retransmit path works through the shared socket.

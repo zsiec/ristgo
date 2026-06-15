@@ -3,6 +3,7 @@ package ristgo
 import (
 	"fmt"
 
+	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/session"
 	"github.com/zsiec/ristgo/internal/socket"
 )
@@ -132,6 +133,39 @@ func newAdvMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 		return session.NewInjectedAdvReceiver(c, flowCfg)
 	}
 	return &MultiReceiver{m: session.NewMultiReceiverSingle(conn, sc, mkFlow)}, nil
+}
+
+// NewMultiBondedReceiver binds several paths (addrs) and demultiplexes the media
+// flows arriving on them, merging each flow across all paths (SMPTE 2022-7). It
+// combines stream multiplexing with link bonding: N flows, each reconstructed
+// over M redundant paths. Call Accept in a loop for a [Receiver] per flow.
+//
+// Currently the Simple profile (the flow SSRC must be in cleartext to group the
+// paths of one flow).
+func NewMultiBondedReceiver(addrs []string, cfg Config) (*MultiReceiver, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, wrapInvalid(err)
+	}
+	if cfg.Profile != ProfileSimple {
+		return nil, fmt.Errorf("%w: multi-flow bonding currently supports only the Simple profile", ErrInvalidConfig)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("%w: a bonded receiver needs at least one address", ErrInvalidConfig)
+	}
+	conns := make([]*socket.Conn, 0, len(addrs))
+	for _, a := range addrs {
+		c, err := listenBondPath(a, cfg)
+		if err != nil {
+			closeConns(conns)
+			return nil, err
+		}
+		conns = append(conns, c)
+	}
+	fc := toFlowConfig(cfg)
+	sc := toSessionConfig(cfg, fc, randomEvenSSRC()) // per-flow SSRC set by the demuxer
+	sc.AdaptLQM = cfg.SourceAdaptation
+	newGroup := func() *bonding.Group { return newBondingGroup(cfg) }
+	return &MultiReceiver{m: session.NewMultiBondedReceiver(conns, sc, newGroup)}, nil
 }
 
 // Accept blocks until a new flow appears on the port and returns a Receiver for
