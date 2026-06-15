@@ -38,6 +38,10 @@ func (s *Session) InjectRTCP(data []byte, src netip.AddrPort) {
 // SSRC returns the flow's media SSRC (the demux key the MultiReceiver assigned).
 func (s *Session) SSRC() uint32 { return s.cfg.SSRC }
 
+// Done returns a channel closed when the session has shut down (clean Close or a
+// timeout/overflow teardown). A MultiReceiver watches it to retire a dead flow.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
 // NewInjectedReceiver builds a Simple-profile receiver session driven by an
 // external demultiplexer rather than its own socket readers. conn is the shared
 // socket the MultiReceiver owns; cfg.SSRC must be the flow's (even) SSRC so the
@@ -145,11 +149,32 @@ func (m *MultiReceiver) flowFor(ssrc uint32) *Session {
 	cfg.SSRC = ssrc // tag this flow's RR/NACK with the flow SSRC (libRIST flow_id)
 	s := NewInjectedReceiver(m.conn, cfg)
 	m.flows[ssrc] = s
+	// Retire the flow when its session shuts down (idle timeout, overflow, or a
+	// Receiver Close), so a later resumption of the same flow_id is re-created
+	// rather than fed to a dead session.
+	m.wg.Add(1)
+	go m.retire(ssrc, s)
 	select {
 	case m.accept <- s:
 	default: // Accept backlog full; the flow still recovers and delivers
 	}
 	return s
+}
+
+// retire removes a flow from the map once its session ends, but only if the map
+// still holds this exact session (a re-created flow for the same SSRC is kept).
+func (m *MultiReceiver) retire(ssrc uint32, s *Session) {
+	defer m.wg.Done()
+	select {
+	case <-s.Done():
+	case <-m.done:
+		return
+	}
+	m.mu.Lock()
+	if m.flows[ssrc] == s {
+		delete(m.flows, ssrc)
+	}
+	m.mu.Unlock()
 }
 
 // Accept blocks until a new flow appears and returns its session, or returns the
