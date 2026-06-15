@@ -134,6 +134,28 @@ connection direction:
   skipped at playout rather than recovered. Use this for satellite, broadcast, or
   strictly asymmetric paths.
 
+### Stream multiplexing (several flows on one port)
+
+A `MultiReceiver` binds one port and demultiplexes the several media flows that
+arrive on it into independent `Receiver`s, one per flow. Call `Accept` in a loop:
+
+```go
+mrx, _ := ristgo.NewMultiReceiver(":5000", cfg)
+for {
+	rx, err := mrx.Accept() // blocks until a new flow appears
+	if err != nil {
+		break
+	}
+	go handle(rx) // rx is a Receiver for one flow, with its own Stats and SSRC
+}
+```
+
+Each flow has independent ARQ recovery and delivery. The Simple profile
+demultiplexes by RTP SSRC; the Main and Advanced profiles (cleartext or PSK)
+demultiplex by source address, matching libRIST's per-flow model. Proven
+interoperable with libRIST (several `ristsender` instances into one
+`MultiReceiver`).
+
 ### Large payloads (Advanced profile)
 
 `WithFragmentSize` splits a `Write` larger than the configured size into
@@ -167,6 +189,7 @@ Everything below is implemented and tested.
 | AEAD (AES-GCM, ChaCha20-Poly1305) | Advanced | TR-06-3 |
 | LZ4 payload compression | Advanced | TR-06-3 |
 | Payload fragmentation and reassembly (per-fragment ARQ) | Advanced | TR-06-3 |
+| Stream multiplexing (MultiReceiver: N flows demultiplexed per port) | all | TR-06-1..3 |
 | SMPTE 2022-7 bonding, seamless multipath reconstruction | all | TR-06-1..3 |
 | Source adaptation (Link Quality Messages, encoder-rate callback) | all | TR-06-4 Part 1 |
 | IP multicast (group membership, multicast TTL, egress interface, source filter) | all | n/a |

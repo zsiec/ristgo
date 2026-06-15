@@ -82,6 +82,11 @@
 // history and emits no RTCP, and the receiver emits no RTCP and requests no
 // retransmissions.
 //
+// A [MultiReceiver] binds one port and demultiplexes the several media flows
+// arriving on it into independent receivers, one per flow (stream
+// multiplexing): the Simple profile demuxes by RTP SSRC and the Main/Advanced
+// profiles by source address, matching libRIST's per-flow model.
+//
 // # Limitations
 //
 // A few capabilities are ristgo to ristgo only, because libRIST does not
