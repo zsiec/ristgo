@@ -252,9 +252,9 @@ func (s *Session) handleBondSimple(now clock.Timestamp, idx uint8, p *peer.Peer,
 func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, bi bondInbound) {
 	p.LearnMedia(bi.src)
 	p.LearnRTCP(bi.src)
-	if oob, ok, oerr := s.main.peekOOB(bi.data); ok {
+	if oob, proto, ok, oerr := s.main.peekOOB(bi.data); ok {
 		if oerr == nil {
-			s.deliverOOB(oob)
+			s.deliverOOB(proto, oob)
 		}
 		return
 	}
@@ -301,9 +301,9 @@ func (s *Session) handleBondAdv(now clock.Timestamp, idx uint8, p *peer.Peer, bi
 // path (the RTCP/keepalive substrate), feeding any NACK/feedback into the flow
 // with per-path RTT attribution.
 func (s *Session) handleBondAdvGRE(now clock.Timestamp, idx uint8, data []byte) {
-	if oob, ok, oerr := s.advGRE.peekOOB(data); ok {
+	if oob, proto, ok, oerr := s.advGRE.peekOOB(data); ok {
 		if oerr == nil {
-			s.deliverOOB(oob)
+			s.deliverOOB(proto, oob)
 		}
 		return
 	}

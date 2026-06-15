@@ -80,6 +80,20 @@ const (
 	ProtoVSF uint16 = 0xCCE0
 )
 
+// IsReserved reports whether protType is one of the GRE protocol types RIST uses
+// for its own framing (REDUCED media/control, KEEPALIVE, EAPOL, the VSF wrapper).
+// A tunnelled / out-of-band datagram must use a non-reserved protocol type (FULL,
+// 0x0800, by default, or any other EtherType) so the receiver's demux routes it
+// to out-of-band delivery rather than mistaking it for RIST framing.
+func IsReserved(protType uint16) bool {
+	switch protType {
+	case ProtoReduced, ProtoKeepalive, ProtoEAPOL, ProtoVSF:
+		return true
+	default:
+		return false
+	}
+}
+
 // VSF protocol type/subtype values for the version >= 2 wrapper.
 // The 16-bit type is always RIST (0x0000); the subtype names
 // the inner RIST protocol.

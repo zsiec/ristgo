@@ -381,19 +381,32 @@ func (s *Sender) SetWriteDeadline(t time.Time) error {
 // byte-identical to libRIST's out-of-band data path. A complete IP packet, with
 // its original headers including a multicast destination, therefore survives the
 // tunnel intact: this is RIST stream IP preservation. The application builds and
-// parses the IP packet; ristgo carries it transparently.
-func (s *Sender) WriteOOB(p []byte) error {
-	if len(p) > MaxMediaPayload {
-		return fmt.Errorf("rist: OOB payload %d bytes exceeds MaxMediaPayload %d", len(p), MaxMediaPayload)
-	}
-	return s.sess.WriteOOB(p)
-}
+// parses the IP packet; ristgo carries it transparently. Use [Sender.WriteOOBTyped]
+// to tunnel a non-IP protocol identified by its own EtherType.
+func (s *Sender) WriteOOB(p []byte) error { return writeOOBTyped(s.sess, OOBProtocolIP, p) }
+
+// WriteOOBTyped is [Sender.WriteOOB] with an explicit GRE protocol type (EtherType)
+// so the peer can dispatch on the encapsulated protocol — see [Receiver.ReadOOBTyped].
+// proto [OOBProtocolIP] is the libRIST-interoperable default; any other non-reserved
+// EtherType tunnels an arbitrary protocol between two ristgo peers (a libRIST peer
+// drops it). It returns [ErrOOBProtocol] if proto is reserved for RIST framing.
+func (s *Sender) WriteOOBTyped(proto uint16, p []byte) error { return writeOOBTyped(s.sess, proto, p) }
 
 // ReadOOB returns the next out-of-band datagram received from the peer,
 // truncated to len(buf) (OOB is datagram-oriented, not a stream). It blocks
 // until one arrives, the deadline passes (ErrTimeout), or the sender closes
 // (ErrClosed). It returns ErrOOBUnsupported on a Simple-profile sender.
-func (s *Sender) ReadOOB(buf []byte) (int, error) { return s.sess.ReadOOB(buf) }
+func (s *Sender) ReadOOB(buf []byte) (int, error) {
+	n, _, err := s.sess.ReadOOB(buf)
+	return n, err
+}
+
+// ReadOOBTyped is [Sender.ReadOOB] but also returns the datagram's GRE protocol
+// type (EtherType), so an application tunnelling several protocols can dispatch on
+// it. A datagram from libRIST, or a plain WriteOOB, reports [OOBProtocolIP].
+func (s *Sender) ReadOOBTyped(buf []byte) (n int, proto uint16, err error) {
+	return s.sess.ReadOOB(buf)
+}
 
 // Stats returns a snapshot of the sender's counters.
 func (s *Sender) Stats() Stats { return toStats(s.sess.Stats()) }

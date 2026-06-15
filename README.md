@@ -179,6 +179,23 @@ tx, _ := ristgo.Dial(ctx, "host:5000",
 	ristgo.WithFragmentSize(1316))
 ```
 
+### Out-of-band tunnel (Main, Advanced)
+
+`WriteOOB`/`ReadOOB` carry an opaque datagram alongside the media flow, bypassing
+ARQ. The payload rides a GRE full frame (protocol type `0x0800`), byte-identical to
+libRIST's out-of-band data, so a complete IP packet survives the tunnel intact
+(stream IP preservation). `WriteOOBTyped`/`ReadOOBTyped` set and read the GRE
+protocol type (an EtherType), so a receiver can dispatch by encapsulated protocol.
+The default `OOBProtocolIP` (0x0800) interoperates with libRIST; any other EtherType
+tunnels an arbitrary protocol between two ristgo peers (libRIST drops protocol types
+it does not recognize).
+
+```go
+tx.WriteOOBTyped(0x86DD, ipv6Frame)           // tunnel IPv6 (ristgo to ristgo)
+n, proto, _ := rx.ReadOOBTyped(buf)           // dispatch on the protocol tag
+// proto == ristgo.OOBProtocolIP for libRIST and default WriteOOB
+```
+
 ## Features
 
 Everything below is implemented and tested.
@@ -193,6 +210,7 @@ Everything below is implemented and tested.
 | EAP-SRP (SRP-SHA256) authentication and key-as-passphrase keying | Main | TR-06-2 |
 | Null-packet deletion + 32-bit extended-seq NACK | Main | TR-06-2 |
 | Out-of-band side channel, full-IP passthrough / stream IP preservation (WriteOOB/ReadOOB) | Main, Advanced | TR-06-2 |
+| Any-protocol encapsulation: typed GRE tunnel by EtherType (WriteOOBTyped/ReadOOBTyped) | Main, Advanced | libRIST GRE |
 | DTLS 1.2 transport security (pure Go: PSK + ECDHE-ECDSA) | Main | TR-06-2 §6 |
 | Advanced header + control messages | Advanced | TR-06-3 |
 | AEAD (AES-GCM, ChaCha20-Poly1305) | Advanced | TR-06-3 |

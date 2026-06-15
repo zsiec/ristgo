@@ -96,17 +96,19 @@ func (s *Session) Read(buf []byte) (int, error) {
 	}
 }
 
-// WriteOOB enqueues one out-of-band datagram for transmission (Main/Advanced
-// profiles only). OOB rides the same socket as media but bypasses ARQ entirely
-// — fire-and-forget, like libRIST's rist_oob_write. It returns ErrOOBUnsupported
-// when the session has no OOB channel (the Simple profile). It blocks under
-// back-pressure, honoring the write deadline (ErrTimeout) and close (ErrClosed).
-func (s *Session) WriteOOB(p []byte) error {
+// WriteOOB enqueues one out-of-band datagram for transmission under GRE protocol
+// type proto (Main/Advanced profiles only). OOB rides the same socket as media but
+// bypasses ARQ entirely — fire-and-forget, like libRIST's rist_oob_write. It
+// returns ErrOOBUnsupported when the session has no OOB channel (the Simple
+// profile). It blocks under back-pressure, honoring the write deadline (ErrTimeout)
+// and close (ErrClosed). The caller is responsible for proto being non-reserved.
+func (s *Session) WriteOOB(proto uint16, p []byte) error {
 	if s.oobIn == nil {
 		return s.cfg.ErrOOBUnsupported
 	}
 	cp := make([]byte, len(p))
 	copy(cp, p)
+	od := oobData{proto: proto, data: cp}
 	for {
 		select {
 		case <-s.done:
@@ -122,7 +124,7 @@ func (s *Session) WriteOOB(p []byte) error {
 			timeout = timer.C
 		}
 		select {
-		case s.oobIn <- cp:
+		case s.oobIn <- od:
 			stopOptTimer(timer)
 			return nil
 		case <-s.done:
@@ -136,43 +138,44 @@ func (s *Session) WriteOOB(p []byte) error {
 	}
 }
 
-// ReadOOB returns the next received out-of-band datagram (Main/Advanced only).
-// Unlike Read it is datagram-oriented: each call returns exactly one OOB payload,
-// truncated to len(buf). It returns ErrOOBUnsupported on the Simple profile, and
-// blocks until an OOB datagram arrives, the read deadline passes (ErrTimeout), or
-// the session closes (ErrClosed, after draining buffered OOB).
-func (s *Session) ReadOOB(buf []byte) (int, error) {
+// ReadOOB returns the next received out-of-band datagram and its GRE protocol type
+// (Main/Advanced only). Unlike Read it is datagram-oriented: each call returns
+// exactly one OOB payload, truncated to len(buf). It returns ErrOOBUnsupported on
+// the Simple profile, and blocks until an OOB datagram arrives, the read deadline
+// passes (ErrTimeout), or the session closes (ErrClosed, after draining buffered
+// OOB).
+func (s *Session) ReadOOB(buf []byte) (n int, proto uint16, err error) {
 	if s.oobOut == nil {
-		return 0, s.cfg.ErrOOBUnsupported
+		return 0, 0, s.cfg.ErrOOBUnsupported
 	}
 	for {
 		select {
-		case p := <-s.oobOut:
-			return copy(buf, p), nil
+		case od := <-s.oobOut:
+			return copy(buf, od.data), od.proto, nil
 		default:
 		}
 		timer, expired := s.deadlineTimerFor(s.readDeadline.Load())
 		if expired {
-			return 0, s.cfg.ErrTimeout
+			return 0, 0, s.cfg.ErrTimeout
 		}
 		var timeout <-chan time.Time
 		if timer != nil {
 			timeout = timer.C
 		}
 		select {
-		case p := <-s.oobOut:
+		case od := <-s.oobOut:
 			stopOptTimer(timer)
-			return copy(buf, p), nil
+			return copy(buf, od.data), od.proto, nil
 		case <-s.done:
 			stopOptTimer(timer)
 			select {
-			case p := <-s.oobOut:
-				return copy(buf, p), nil
+			case od := <-s.oobOut:
+				return copy(buf, od.data), od.proto, nil
 			default:
-				return 0, s.closeReason()
+				return 0, 0, s.closeReason()
 			}
 		case <-timeout:
-			return 0, s.cfg.ErrTimeout
+			return 0, 0, s.cfg.ErrTimeout
 		case <-s.readWake:
 			stopOptTimer(timer)
 		}

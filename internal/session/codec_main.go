@@ -561,18 +561,21 @@ func (c *mainCodec) peekControl(b []byte) (kind controlKind, ka gre.Keepalive, v
 }
 
 // encodeOOB frames an out-of-band data payload (libRIST RIST_PAYLOAD_TYPE_DATA_OOB):
-// GRE FULL framing (prot_type 0x0800) with NO reduced-overhead header and NO RTP
-// header — the raw OOB bytes follow the GRE header directly, encrypted under the
-// PSK when one is configured (matching libRIST's send_data: OOB participates in
-// PSK but never in ARQ). The GRE sequence counter is shared with media/RTCP (it
-// is the AES IV), so OOB and media advance one monotonic sequence.
-func (c *mainCodec) encodeOOB(dst, payload []byte) ([]byte, error) {
+// GRE framing carrying protType (FULL, 0x0800, by default) with NO reduced-overhead
+// header and NO RTP header — the raw OOB bytes follow the GRE header directly,
+// encrypted under the PSK when one is configured (matching libRIST's send_data: OOB
+// participates in PSK but never in ARQ). The GRE sequence counter is shared with
+// media/RTCP (it is the AES IV), so OOB and media advance one monotonic sequence.
+// protType is the GRE protocol type stamped into the header (an EtherType): FULL
+// (0x0800) is libRIST's out-of-band data type, while any other non-reserved value
+// tunnels an arbitrary protocol for a ristgo peer to dispatch on.
+func (c *mainCodec) encodeOOB(dst, payload []byte, protType uint16) ([]byte, error) {
 	seq := c.greSeq
 	c.greSeq++
 	hdr := gre.Header{
 		Version:  gre.VersionMin,
 		HasSeq:   true,
-		ProtType: gre.ProtoFull,
+		ProtType: protType,
 		Seq:      seq,
 	}
 	if c.sendKey == nil {
@@ -596,32 +599,37 @@ func (c *mainCodec) encodeOOB(dst, payload []byte) ([]byte, error) {
 	return append(out, ct...), nil
 }
 
-// peekOOB reports whether b is an out-of-band data datagram (GRE FULL framing)
-// and, if so, returns its decrypted payload. It mirrors peekEAPOL but, unlike
-// EAPOL, OOB participates in PSK encryption, so it uses the codec's decryptor.
-// ok is true whenever b is GRE-FULL (an OOB datagram) regardless of decode
-// success, so the caller routes it to OOB delivery rather than the media demux.
-// It never panics on arbitrary input.
-func (c *mainCodec) peekOOB(b []byte) (oob []byte, ok bool, err error) {
+// peekOOB reports whether b is a tunnelled / out-of-band datagram (a GRE frame
+// with a non-reserved protocol type) and, if so, returns its decrypted payload and
+// that protocol type. It mirrors peekEAPOL but, unlike EAPOL, OOB participates in
+// PSK encryption, so it uses the codec's decryptor. ok is true whenever b is a
+// tunnelled datagram regardless of decode success, so the caller routes it to OOB
+// delivery rather than the media demux. It never panics on arbitrary input.
+func (c *mainCodec) peekOOB(b []byte) (oob []byte, protType uint16, ok bool, err error) {
 	hdr, off, perr := gre.Parse(b)
-	if perr != nil || hdr.ProtType != gre.ProtoFull {
-		return nil, false, nil
+	// A tunnelled datagram is any GRE frame whose protocol type is not one RIST
+	// uses for its own framing: FULL (0x0800, libRIST's OOB) or an arbitrary
+	// EtherType a ristgo peer tunnelled. RIST's own types (REDUCED/KEEPALIVE/
+	// EAPOL/VSF) are handled by the media/keepalive/EAP/VSF paths instead.
+	if perr != nil || gre.IsReserved(hdr.ProtType) {
+		return nil, 0, false, nil
 	}
+	protType = hdr.ProtType
 	region := b[off:]
 	// Honor the per-packet K bit (see decodeMain): a cleartext OOB datagram is
 	// returned as cleartext even when a decryptor is configured.
 	if hdr.HasKey {
 		if c.recvKey == nil {
-			return nil, true, fmt.Errorf("rist: main: encrypted OOB but no decryptor configured")
+			return nil, protType, true, fmt.Errorf("rist: main: encrypted OOB but no decryptor configured")
 		}
 		c.recvKey.SetKeyBits(hBitKeySize(hdr.KeySize256))
 		pt, derr := c.recvKey.Decrypt(hdr.Nonce, hdr.Seq, nil, region)
 		if derr != nil {
-			return nil, true, derr
+			return nil, protType, true, derr
 		}
-		return pt, true, nil
+		return pt, protType, true, nil
 	}
-	return region, true, nil
+	return region, protType, true, nil
 }
 
 // encodeEAPOL frames an EAP-over-GRE authentication payload: the GRE header

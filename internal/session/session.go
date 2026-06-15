@@ -339,10 +339,11 @@ type Session struct {
 
 	// Out-of-band side channel (Main/Advanced only). oobIn carries application
 	// WriteOOB payloads to the loop; oobOut carries received OOB datagrams to
-	// ReadOOB. OOB bypasses the flow core entirely (no ARQ/reorder/dedup), like
-	// EAPOL — it is purely a host concern.
-	oobIn  chan []byte
-	oobOut chan []byte
+	// ReadOOB. Each carries the GRE protocol type so a tunnelled datagram's
+	// protocol survives the round trip. OOB bypasses the flow core entirely (no
+	// ARQ/reorder/dedup), like EAPOL — it is purely a host concern.
+	oobIn  chan oobData
+	oobOut chan oobData
 
 	// delivery to Read
 	delivery chan []byte
@@ -548,8 +549,8 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	s.authed.Store(true) // no EAP gate by default (Simple, or Main without auth)
 	if cfg.Main != nil || cfg.Adv != nil {
 		// OOB side channel is available on the Main and Advanced profiles only.
-		s.oobIn = make(chan []byte, 16)
-		s.oobOut = make(chan []byte, 16)
+		s.oobIn = make(chan oobData, 16)
+		s.oobOut = make(chan oobData, 16)
 	}
 	if cfg.Main != nil {
 		mp := cfg.Main
@@ -736,13 +737,13 @@ func (s *Session) loop() {
 			} else if eapPayload, ok := s.main.peekEAPOL(d.data); ok {
 				// Authentication frame: route to the EAP state machine.
 				s.handleEAP(now, eapPayload)
-			} else if oob, ok, oerr := s.main.peekOOB(d.data); ok {
-				// Out-of-band data (GRE FULL framing): deliver via ReadOOB,
-				// bypassing the media flow entirely.
+			} else if oob, proto, ok, oerr := s.main.peekOOB(d.data); ok {
+				// Tunnelled / out-of-band data: deliver via ReadOOB tagged with its
+				// protocol type, bypassing the media flow entirely.
 				if oerr != nil {
 					s.logf("main: drop undecodable OOB (%d bytes): %v", len(d.data), oerr)
 				} else {
-					s.deliverOOB(oob)
+					s.deliverOOB(proto, oob)
 				}
 			} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
 				if isMedia {
@@ -790,9 +791,9 @@ func (s *Session) loop() {
 			now := s.clk.Now()
 			s.pushApp(now, p)
 			s.afterInput(now, timer)
-		case p := <-s.oobIn:
+		case od := <-s.oobIn:
 			now := s.clk.Now()
-			s.sendOOB(now, p)
+			s.sendOOB(now, od)
 			s.afterInput(now, timer)
 		case <-timer.C:
 			now := s.clk.Now()
@@ -1143,11 +1144,11 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 // (they served their handshake/liveness purpose at the peer layer). A decode
 // error (e.g. a GRE keepalive, whose protocol type is not REDUCED) is ignored.
 func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
-	if oob, ok, oerr := s.advGRE.peekOOB(data); ok {
+	if oob, proto, ok, oerr := s.advGRE.peekOOB(data); ok {
 		if oerr != nil {
 			s.logf("adv: drop undecodable OOB: %v", oerr)
 		} else {
-			s.deliverOOB(oob)
+			s.deliverOOB(proto, oob)
 		}
 		return
 	}
@@ -1199,9 +1200,9 @@ func dropAdvEchoRequests(fbs []wire.Feedback) []wire.Feedback {
 // configured) and writes it to the learned peer. OOB is a Main/Advanced-only
 // side channel that bypasses the flow core (no ARQ); it is dropped, with a log,
 // before the peer's address is known.
-func (s *Session) sendOOB(now clock.Timestamp, payload []byte) {
+func (s *Session) sendOOB(now clock.Timestamp, od oobData) {
 	if !s.peer.Media.IsValid() {
-		s.logf("oob: peer not learned yet, dropping %d-byte datagram", len(payload))
+		s.logf("oob: peer not learned yet, dropping %d-byte datagram", len(od.data))
 		return
 	}
 	var (
@@ -1210,9 +1211,9 @@ func (s *Session) sendOOB(now clock.Timestamp, payload []byte) {
 	)
 	switch {
 	case s.main != nil:
-		b, err = s.main.encodeOOB(nil, payload)
+		b, err = s.main.encodeOOB(nil, od.data, od.proto)
 	case s.advGRE != nil:
-		b, err = s.advGRE.encodeOOB(nil, payload)
+		b, err = s.advGRE.encodeOOB(nil, od.data, od.proto)
 	default:
 		return // not a Main/Advanced session
 	}
@@ -1227,13 +1228,22 @@ func (s *Session) sendOOB(now clock.Timestamp, payload []byte) {
 	s.lastTx = now
 }
 
-// deliverOOB queues a received OOB payload for ReadOOB, copying it (the decode
-// buffer is reused downstream) and dropping it non-blocking if the consumer is
-// too slow — OOB is best-effort and must never stall the media event loop.
-func (s *Session) deliverOOB(oob []byte) {
+// oobData is one out-of-band datagram and the GRE protocol type (EtherType) it
+// is tunnelled under, carried on the oobIn/oobOut channels so the protocol type
+// survives the application round trip.
+type oobData struct {
+	proto uint16
+	data  []byte
+}
+
+// deliverOOB queues a received OOB payload (tagged with its protocol type) for
+// ReadOOB, copying it (the decode buffer is reused downstream) and dropping it
+// non-blocking if the consumer is too slow — OOB is best-effort and must never
+// stall the media event loop.
+func (s *Session) deliverOOB(proto uint16, oob []byte) {
 	cp := append([]byte(nil), oob...)
 	select {
-	case s.oobOut <- cp:
+	case s.oobOut <- oobData{proto: proto, data: cp}:
 	default:
 		s.logf("oob: receive queue full, dropping %d-byte datagram", len(oob))
 	}

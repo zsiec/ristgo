@@ -514,11 +514,13 @@ func FuzzDecodeMain(f *testing.F) {
 		// Plain decoder: must not panic.
 		plain := newMainCodec(nil, nil, false, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, 0x2, "c", false)
 		_, _, _, _ = plain.decodeMain(b, 0)
+		_, _, _, _ = plain.peekOOB(b) // tunnel-type demux must not panic on arbitrary input
 
 		// Encrypting decoder: must not panic on arbitrary ciphertext either.
 		_, rd, k256 := pskPair(t, "fuzz", crypto.KeySize128)
 		cipher := newMainCodec(nil, rd, k256, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, 0x2, "c", false)
 		_, _, _, _ = cipher.decodeMain(b, 0)
+		_, _, _, _ = cipher.peekOOB(b)
 	})
 }
 
@@ -584,30 +586,38 @@ func TestDecodeMainVSFWrapper(t *testing.T) {
 }
 
 // TestOOBRoundTrip verifies the out-of-band codec: encodeOOB/peekOOB round-trip
-// cleartext and PSK-encrypted, OOB is framed as GRE FULL (not reduced), and a
-// media datagram is not misdetected as OOB.
+// cleartext and PSK-encrypted, the GRE protocol type (the default FULL and an
+// arbitrary tunnelled EtherType) survives the round trip, and a media datagram is
+// not misdetected as OOB.
 func TestOOBRoundTrip(t *testing.T) {
-	for _, keyBits := range []int{0, crypto.KeySize128, crypto.KeySize256} {
-		enc, dec := newCodecPair(t, keyBits, false, 0x0BAD_F00E)
-		payload := []byte("out-of-band control metadata \x00\x01\xff\x47")
-		dg, err := enc.encodeOOB(nil, payload)
-		if err != nil {
-			t.Fatalf("keyBits=%d encodeOOB: %v", keyBits, err)
-		}
-		got, ok, err := dec.peekOOB(dg)
-		if !ok || err != nil {
-			t.Fatalf("keyBits=%d peekOOB: ok=%v err=%v", keyBits, ok, err)
-		}
-		if !bytes.Equal(got, payload) {
-			t.Fatalf("keyBits=%d OOB round-trip: got %q want %q", keyBits, got, payload)
-		}
-		// A media datagram must NOT be detected as OOB (it is GRE reduced/VSF).
-		md, err := enc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SSRC: 0x0BAD_F00E, Payload: tsPacket(188, 0x100, 0xAA)})
-		if err != nil {
-			t.Fatalf("encodeMainMedia: %v", err)
-		}
-		if _, ok, _ := dec.peekOOB(md); ok {
-			t.Fatalf("keyBits=%d media datagram misdetected as OOB", keyBits)
+	// FULL is libRIST's OOB type; 0x86DD (IPv6) stands in for an arbitrary
+	// tunnelled protocol a ristgo peer dispatches on.
+	for _, proto := range []uint16{gre.ProtoFull, 0x86DD} {
+		for _, keyBits := range []int{0, crypto.KeySize128, crypto.KeySize256} {
+			enc, dec := newCodecPair(t, keyBits, false, 0x0BAD_F00E)
+			payload := []byte("out-of-band control metadata \x00\x01\xff\x47")
+			dg, err := enc.encodeOOB(nil, payload, proto)
+			if err != nil {
+				t.Fatalf("proto=0x%04X keyBits=%d encodeOOB: %v", proto, keyBits, err)
+			}
+			got, gotProto, ok, err := dec.peekOOB(dg)
+			if !ok || err != nil {
+				t.Fatalf("proto=0x%04X keyBits=%d peekOOB: ok=%v err=%v", proto, keyBits, ok, err)
+			}
+			if gotProto != proto {
+				t.Fatalf("OOB protocol type round-trip: got 0x%04X want 0x%04X", gotProto, proto)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("proto=0x%04X keyBits=%d OOB round-trip: got %q want %q", proto, keyBits, got, payload)
+			}
+			// A media datagram must NOT be detected as OOB (it is GRE reduced/VSF).
+			md, err := enc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SSRC: 0x0BAD_F00E, Payload: tsPacket(188, 0x100, 0xAA)})
+			if err != nil {
+				t.Fatalf("encodeMainMedia: %v", err)
+			}
+			if _, _, ok, _ := dec.peekOOB(md); ok {
+				t.Fatalf("proto=0x%04X keyBits=%d media datagram misdetected as OOB", proto, keyBits)
+			}
 		}
 	}
 }

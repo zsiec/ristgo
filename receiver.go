@@ -306,7 +306,17 @@ func (r *Receiver) SetReadDeadline(t time.Time) error {
 // truncated to len(buf) (OOB is datagram-oriented, not a stream). It blocks
 // until one arrives, the deadline passes (ErrTimeout), or the receiver closes
 // (ErrClosed). It returns ErrOOBUnsupported on a Simple-profile receiver.
-func (r *Receiver) ReadOOB(buf []byte) (int, error) { return r.sess.ReadOOB(buf) }
+func (r *Receiver) ReadOOB(buf []byte) (int, error) {
+	n, _, err := r.sess.ReadOOB(buf)
+	return n, err
+}
+
+// ReadOOBTyped is [Receiver.ReadOOB] but also returns the datagram's GRE protocol
+// type (EtherType), so an application tunnelling several protocols can dispatch on
+// it. A datagram from libRIST, or a plain WriteOOB, reports [OOBProtocolIP].
+func (r *Receiver) ReadOOBTyped(buf []byte) (n int, proto uint16, err error) {
+	return r.sess.ReadOOB(buf)
+}
 
 // WriteOOB sends one out-of-band datagram to the peer (Main and Advanced
 // profiles). OOB is a fire-and-forget side channel that bypasses ARQ recovery.
@@ -316,12 +326,17 @@ func (r *Receiver) ReadOOB(buf []byte) (int, error) { return r.sess.ReadOOB(buf)
 // The payload is carried verbatim in a GRE full frame (protocol type 0x0800),
 // byte-identical to libRIST's out-of-band data path, so a complete IP packet
 // (with its original headers, including a multicast destination) survives the
-// tunnel intact. This is RIST stream IP preservation.
-func (r *Receiver) WriteOOB(p []byte) error {
-	if len(p) > MaxMediaPayload {
-		return fmt.Errorf("rist: OOB payload %d bytes exceeds MaxMediaPayload %d", len(p), MaxMediaPayload)
-	}
-	return r.sess.WriteOOB(p)
+// tunnel intact. This is RIST stream IP preservation. Use [Receiver.WriteOOBTyped]
+// to tunnel a non-IP protocol identified by its own EtherType.
+func (r *Receiver) WriteOOB(p []byte) error { return writeOOBTyped(r.sess, OOBProtocolIP, p) }
+
+// WriteOOBTyped is [Receiver.WriteOOB] with an explicit GRE protocol type
+// (EtherType) so the peer can dispatch on the encapsulated protocol. proto
+// [OOBProtocolIP] is the libRIST-interoperable default; any other non-reserved
+// EtherType tunnels an arbitrary protocol between two ristgo peers (a libRIST peer
+// drops it). It returns [ErrOOBProtocol] if proto is reserved for RIST framing.
+func (r *Receiver) WriteOOBTyped(proto uint16, p []byte) error {
+	return writeOOBTyped(r.sess, proto, p)
 }
 
 // LocalPort returns the bound even media UDP port.

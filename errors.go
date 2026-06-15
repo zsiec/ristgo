@@ -38,4 +38,10 @@ var (
 	// Sender or Receiver. The out-of-band side channel exists only on the Main
 	// and Advanced profiles (libRIST rejects OOB on the Simple profile).
 	ErrOOBUnsupported = errors.New("rist: out-of-band data requires the Main or Advanced profile")
+
+	// ErrOOBProtocol is returned by WriteOOBTyped when the requested GRE protocol
+	// type collides with one RIST uses for its own framing (REDUCED, KEEPALIVE,
+	// EAPOL, or the VSF wrapper); such a datagram would be misrouted by the peer's
+	// demux. Use [OOBProtocolIP] or any other non-reserved EtherType.
+	ErrOOBProtocol = errors.New("rist: OOB protocol type is reserved for RIST framing")
 )
