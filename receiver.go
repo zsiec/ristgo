@@ -119,11 +119,8 @@ func newMainReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	if err != nil {
 		return nil, err
 	}
-	mp, err := buildMainParams(cfg)
+	mp, err := buildMainFlowParams(cfg)
 	if err != nil {
-		return nil, err
-	}
-	if mp.EAPServer, err = buildEAPServer(cfg); err != nil {
 		return nil, err
 	}
 	conn, err := socket.ListenSingle(host, port)

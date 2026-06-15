@@ -90,7 +90,7 @@ func TestFragReassembler(t *testing.T) {
 
 // TestFragReassemblerBoundsRun verifies a peer that opens a run and then streams
 // FragMiddle without ever closing it cannot grow the buffer without bound: once
-// the run reaches maxReassemblyFragments the reassembler abandons it (delivers
+// the run reaches MaxReassemblyFragments the reassembler abandons it (delivers
 // nothing and frees the buffer), and a later FragLast on that dead run is dropped.
 func TestFragReassemblerBoundsRun(t *testing.T) {
 	var r fragReassembler
@@ -101,13 +101,13 @@ func TestFragReassemblerBoundsRun(t *testing.T) {
 	}
 	// Feed far more middles than the cap. None complete, and the buffer must stop
 	// growing at the cap rather than accumulating every fragment.
-	for i := 0; i < maxReassemblyFragments*4; i++ {
+	for i := 0; i < MaxReassemblyFragments*4; i++ {
 		if _, ok := r.push(wire.FragMiddle, chunk, false); ok {
 			t.Fatalf("FragMiddle %d should not complete a payload", i)
 		}
 	}
-	if got := len(r.buf); got > maxReassemblyFragments*len(chunk) {
-		t.Fatalf("buffer grew to %d bytes, want <= %d (run not bounded)", got, maxReassemblyFragments*len(chunk))
+	if got := len(r.buf); got > MaxReassemblyFragments*len(chunk) {
+		t.Fatalf("buffer grew to %d bytes, want <= %d (run not bounded)", got, MaxReassemblyFragments*len(chunk))
 	}
 	// The run was abandoned, so a closing FragLast finds no open run and is dropped.
 	if _, ok := r.push(wire.FragLast, chunk, false); ok {

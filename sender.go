@@ -48,8 +48,10 @@ type Sender struct {
 
 // maxFragmentsPerWrite bounds how many fragments one Write may split into when
 // FragmentSize is configured, capping the per-Write payload and the burst of
-// sequences it enqueues at once.
-const maxFragmentsPerWrite = 64
+// sequences it enqueues at once. It is the receiver's reassembly cap
+// (session.MaxReassemblyFragments), shared so the sender can never split a Write
+// into more fragments than the receiver will reassemble: the two are one value.
+const maxFragmentsPerWrite = session.MaxReassemblyFragments
 
 // NewSender dials a RIST receiver at addr ("host:port" or a rist:// URL whose
 // query parameters override cfg) and returns a ready Sender. For the Simple
@@ -336,11 +338,13 @@ func newAdvListenerSender(addr string, cfg Config) (*Sender, error) {
 }
 
 // Write submits one media payload for transmission and returns len(p). The
-// payload must be at most MaxMediaPayload bytes (one RTP packet, no
-// fragmentation); a larger payload returns an error without sending, rather
-// than silently failing on the wire. Write blocks only briefly under
-// back-pressure; it does not wait for delivery (RIST is best-effort with ARQ
-// recovery). After Close it returns ErrClosed.
+// payload must be at most MaxMediaPayload bytes (one RTP packet), unless the
+// Advanced-profile sender was built with a FragmentSize, in which case a payload
+// up to FragmentSize × the internal fragment cap is split into independently
+// recoverable fragments and reassembled by the receiver. A larger payload returns
+// an error without sending, rather than silently failing on the wire. Write blocks
+// only briefly under back-pressure; it does not wait for delivery (RIST is
+// best-effort with ARQ recovery). After Close it returns ErrClosed.
 func (s *Sender) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		// Conventional io.Writer no-op: a zero-length Write transmits nothing

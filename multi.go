@@ -31,10 +31,10 @@ type MultiReceiver struct {
 //
 // Security: a flow is created on first sight of a datagram and immediately emits
 // feedback (Receiver Reports, NACKs) toward the apparent source address, so the
-// receiver reflects RTCP to whatever source a datagram claims, up to maxFlows
-// concurrent flows. Run it behind a trusted network boundary, or expect that a
-// spoofed-source flood can briefly create reflecting flows (bounded by maxFlows
-// and per-flow buffer overflow).
+// receiver reflects RTCP to whatever source a datagram claims, up to a fixed cap
+// of 256 concurrent flows (matching libRIST's RIST_MAX_FLOWS). Run it behind a
+// trusted network boundary, or expect that a spoofed-source flood can briefly
+// create reflecting flows (bounded by that cap and per-flow buffer overflow).
 func NewMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -66,12 +66,9 @@ func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 		return nil, err
 	}
 	// Validate the per-flow config once (PSK keys, and the EAP authenticator when
-	// credentials are set); the factory rebuilds both so this error is impossible
-	// there, giving each flow its own key/auth state.
-	if _, err := buildMainParams(cfg); err != nil {
-		return nil, err
-	}
-	if _, err := buildEAPServer(cfg); err != nil {
+	// credentials are set); the factory rebuilds them so this error is effectively
+	// impossible there, giving each flow its own key/auth state.
+	if _, err := buildMainFlowParams(cfg); err != nil {
 		return nil, err
 	}
 	conn, err := socket.ListenSingle(host, port)
@@ -86,15 +83,10 @@ func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.AdaptLQM = cfg.SourceAdaptation
 	mkFlow := func(c *socket.Conn, flowCfg session.Config) (*session.Session, error) {
-		mp, err := buildMainParams(cfg) // fresh PSK key state per flow
+		mp, err := buildMainFlowParams(cfg) // fresh per-flow key + authenticator; fails closed
 		if err != nil {
 			return nil, err
 		}
-		eap, err := buildEAPServer(cfg) // fresh authenticator per flow; nil-on-error must not install
-		if err != nil {
-			return nil, err
-		}
-		mp.EAPServer = eap
 		flowCfg.Main = mp
 		return session.NewInjectedMainReceiver(c, flowCfg), nil
 	}

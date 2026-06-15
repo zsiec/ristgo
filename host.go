@@ -238,6 +238,12 @@ func resolveSinglePort(addr string) (host string, port int, err error) {
 // constructing the PSK keys when a Secret is configured (cfg must already be
 // validated, so AESKeyBits is 128 or 256 — defaulted to 256 when Secret is
 // set). With no Secret the Main flow runs in cleartext.
+// randRead reads cryptographic randomness; it is a package var so a test can
+// force the otherwise-effectively-impossible read error and assert the per-flow
+// auth/key build fails closed (drops the flow) rather than installing a nil
+// authenticator. It is crand.Read in production.
+var randRead = crand.Read
+
 func buildMainParams(cfg Config) (*session.MainParams, error) {
 	mp := &session.MainParams{
 		VirtSrcPort: cfg.VirtSrcPort,
@@ -336,7 +342,7 @@ func buildEAPServer(cfg Config) (*eap.Authenticator, error) {
 		return nil, nil
 	}
 	salt := make([]byte, 32)
-	if _, err := crand.Read(salt); err != nil {
+	if _, err := randRead(salt); err != nil {
 		return nil, fmt.Errorf("%w: SRP salt: %w", ErrInvalidConfig, err)
 	}
 	verifier := srp.MakeVerifier(srp.DefaultGroup(), cfg.Username, cfg.Password, salt)
@@ -360,10 +366,30 @@ func buildEAPServer(cfg Config) (*eap.Authenticator, error) {
 	// the wire (libRIST seeds last_identifier from a random byte). A read error
 	// is effectively impossible; leave the identifier at 0 if it ever happens.
 	var seed [1]byte
-	if _, err := crand.Read(seed[:]); err == nil {
+	if _, err := randRead(seed[:]); err == nil {
 		a.SeedIdentifier(seed[0])
 	}
 	return a, nil
+}
+
+// buildMainFlowParams builds a Main flow's complete per-flow profile params:
+// fresh PSK key state plus, when EAP-SRP credentials are configured, a fresh
+// authenticator. It returns an error rather than installing a nil authenticator,
+// so a caller drops the flow (fail closed) instead of delivering unauthenticated
+// media (fail open) on a key/salt derivation failure. Each call mints independent
+// key state, so distinct flows never share one stateful cipher. This is the single
+// composition used by every Main receiver path (single-flow and multiplexed).
+func buildMainFlowParams(cfg Config) (*session.MainParams, error) {
+	mp, err := buildMainParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	eapServer, err := buildEAPServer(cfg)
+	if err != nil {
+		return nil, err
+	}
+	mp.EAPServer = eapServer
+	return mp, nil
 }
 
 // applyRateAdapt wires source-adaptation rate control onto a sender's session
@@ -475,6 +501,11 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 	if cname == "" {
 		cname = "ristgo"
 	}
+	// FragmentSize is deliberately not copied here: it is a sender-only split cap,
+	// set explicitly on the sender paths (NewSender, NewBondedSender). Receive-side
+	// reassembly is driven entirely by the wire FragRole bits, not by this field,
+	// so MultiReceiver and other receivers reassemble correctly without it. Anyone
+	// making reassembly conditional on FragmentSize must revisit this omission.
 	return session.Config{
 		Flow:              fc,
 		SSRC:              ssrc,
