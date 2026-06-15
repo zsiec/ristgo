@@ -11,31 +11,49 @@ import (
 )
 
 // This file implements receiver-side stream multiplexing: one bound socket
-// demultiplexed into N independent media flows keyed by SSRC (flow_id), matching
-// libRIST's per-flow_id receiver model. Each flow is a normal receiver Session
-// run in "injected" mode: the MultiReceiver owns the socket read, peeks the
-// flow's SSRC, and feeds the right session's inbound channels; the session
-// itself owns its flow core, recovery, timers, and feedback (which it writes
-// back out the shared socket to its own learned peer).
+// demultiplexed into N independent media flows, matching libRIST's per-flow
+// receiver model. Each flow is a normal receiver Session run in "injected" mode:
+// the MultiReceiver owns the socket read, decides which flow a datagram belongs
+// to, and feeds the right session; the session itself owns its flow core,
+// recovery, timers, and feedback (written back out the shared socket to its own
+// learned peer).
+//
+// Two demux strategies, by profile:
+//   - Simple (even/odd RTP/RTCP): key by the RTP SSRC, which is in cleartext.
+//   - Main/Advanced (single port): key by the datagram source address. This
+//     matches libRIST's peer->flow routing and is the only option for Main+PSK,
+//     where the SSRC is inside the encrypted payload. Each source becomes its own
+//     session, which decrypts and authenticates independently, exactly as a
+//     libRIST peer does.
 
-// InjectMedia hands one raw media datagram (from src) to an injected session's
-// event loop. It is how a MultiReceiver feeds a demultiplexed flow.
-func (s *Session) InjectMedia(data []byte, src netip.AddrPort) {
-	select {
-	case s.mediaIn <- inbound{data: data, src: src}:
-	case <-s.done:
-	}
-}
+// InjectMedia hands one raw media datagram (from src) to an injected session.
+func (s *Session) InjectMedia(data []byte, src netip.AddrPort) { s.inject(s.mediaIn, data, src) }
 
 // InjectRTCP hands one raw RTCP datagram (from src) to an injected session.
-func (s *Session) InjectRTCP(data []byte, src netip.AddrPort) {
+func (s *Session) InjectRTCP(data []byte, src netip.AddrPort) { s.inject(s.rtcpIn, data, src) }
+
+// Inject hands one raw single-socket datagram (Main GRE or Advanced) to an
+// injected session, routing to whichever inbound channel the profile uses.
+func (s *Session) Inject(data []byte, src netip.AddrPort) {
+	switch {
+	case s.main != nil:
+		s.inject(s.mainIn, data, src)
+	case s.adv != nil:
+		s.inject(s.advIn, data, src)
+	default:
+		s.inject(s.mediaIn, data, src)
+	}
+}
+
+func (s *Session) inject(ch chan inbound, data []byte, src netip.AddrPort) {
 	select {
-	case s.rtcpIn <- inbound{data: data, src: src}:
+	case ch <- inbound{data: data, src: src}:
 	case <-s.done:
 	}
 }
 
-// SSRC returns the flow's media SSRC (the demux key the MultiReceiver assigned).
+// SSRC returns the flow's media SSRC (the demux key the MultiReceiver assigned
+// for the Simple profile; for source-keyed profiles it is the reporter SSRC).
 func (s *Session) SSRC() uint32 { return s.cfg.SSRC }
 
 // Done returns a channel closed when the session has shut down (clean Close or a
@@ -44,9 +62,8 @@ func (s *Session) Done() <-chan struct{} { return s.done }
 
 // NewInjectedReceiver builds a Simple-profile receiver session driven by an
 // external demultiplexer rather than its own socket readers. conn is the shared
-// socket the MultiReceiver owns; cfg.SSRC must be the flow's (even) SSRC so the
-// session tags its Receiver Reports and NACKs with the flow identity libRIST
-// expects.
+// socket; cfg.SSRC must be the flow's (even) SSRC so the session tags its
+// Receiver Reports and NACKs with the flow identity libRIST expects.
 func NewInjectedReceiver(conn *socket.Conn, cfg Config) *Session {
 	s := newSession(conn, cfg, false)
 	s.injected = true
@@ -55,15 +72,40 @@ func NewInjectedReceiver(conn *socket.Conn, cfg Config) *Session {
 	return s
 }
 
-// MultiReceiver binds one socket and demultiplexes the media flows arriving on
-// it into independent receiver Sessions, one per SSRC. New flows are surfaced
-// via Accept. It is the receiver-side of RIST stream multiplexing.
+// NewInjectedAdvReceiver builds an Advanced-profile receiver session in injected
+// mode (cfg.Adv must be set).
+func NewInjectedAdvReceiver(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.injected = true
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewInjectedMainReceiver builds a Main-profile receiver session in injected
+// mode (cfg.Main must be set).
+func NewInjectedMainReceiver(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.injected = true
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
+// FlowFactory builds an injected per-flow receiver session on the shared conn.
+type FlowFactory func(conn *socket.Conn, cfg Config) *Session
+
+// MultiReceiver binds one socket and demultiplexes the media flows arriving on it
+// into independent receiver Sessions. New flows are surfaced via Accept. It is
+// the receiver-side of RIST stream multiplexing.
 type MultiReceiver struct {
-	conn *socket.Conn
-	cfg  Config // template; per-flow SSRC is overwritten per flow
+	conn   *socket.Conn
+	cfg    Config // template; the Simple path overwrites SSRC per flow
+	single bool   // single-socket source-keyed demux (Main/Advanced)
+	mkFlow FlowFactory
 
 	mu    sync.Mutex
-	flows map[uint32]*Session
+	flows map[any]*Session // key: uint32 SSRC (Simple) or netip.AddrPort (single)
 
 	accept    chan *Session
 	done      chan struct{}
@@ -71,24 +113,39 @@ type MultiReceiver struct {
 	wg        sync.WaitGroup
 }
 
-// NewMultiReceiver starts demultiplexing Simple-profile media on conn. cfg is the
-// template applied to each demuxed flow (its SSRC is set per flow).
+// NewMultiReceiver starts demultiplexing Simple-profile media on conn (keyed by
+// RTP SSRC).
 func NewMultiReceiver(conn *socket.Conn, cfg Config) *MultiReceiver {
-	m := &MultiReceiver{
-		conn:   conn,
-		cfg:    cfg,
-		flows:  make(map[uint32]*Session),
-		accept: make(chan *Session, 64),
-		done:   make(chan struct{}),
-	}
+	m := newMulti(conn, cfg, false, NewInjectedReceiver)
 	m.wg.Add(2)
 	go m.readMedia()
 	go m.readRTCP()
 	return m
 }
 
-// readMedia reads RTP media datagrams, keys each by its (normalized) SSRC, and
-// feeds the matching flow's session.
+// NewMultiReceiverSingle starts demultiplexing a single-socket profile
+// (Main/Advanced) on conn, keyed by datagram source address. mkFlow builds the
+// per-source injected session for the configured profile.
+func NewMultiReceiverSingle(conn *socket.Conn, cfg Config, mkFlow FlowFactory) *MultiReceiver {
+	m := newMulti(conn, cfg, true, mkFlow)
+	m.wg.Add(1)
+	go m.readSingle()
+	return m
+}
+
+func newMulti(conn *socket.Conn, cfg Config, single bool, mkFlow FlowFactory) *MultiReceiver {
+	return &MultiReceiver{
+		conn:   conn,
+		cfg:    cfg,
+		single: single,
+		mkFlow: mkFlow,
+		flows:  make(map[any]*Session),
+		accept: make(chan *Session, 64),
+		done:   make(chan struct{}),
+	}
+}
+
+// readMedia (Simple) keys each RTP datagram by its normalized SSRC.
 func (m *MultiReceiver) readMedia() {
 	defer m.wg.Done()
 	buf := make([]byte, maxDatagram)
@@ -101,17 +158,15 @@ func (m *MultiReceiver) readMedia() {
 			continue
 		}
 		ssrc := rtp.NormalizeSSRC(binary.BigEndian.Uint32(buf[8:12]))
-		s := m.flowFor(ssrc)
+		s := m.flowFor(ssrc, ssrc)
 		if s == nil {
-			return // closed
+			return
 		}
 		s.InjectMedia(clone(buf[:n]), src)
 	}
 }
 
-// readRTCP reads RTCP from the senders and routes each compound to its flow by
-// the lead report's SSRC (the sender's flow SSRC). RTCP can arrive before the
-// first media packet (the sender's startup SR/SDES), so it can open a flow too.
+// readRTCP (Simple) routes each compound to its flow by the lead report's SSRC.
 func (m *MultiReceiver) readRTCP() {
 	defer m.wg.Done()
 	buf := make([]byte, maxDatagram)
@@ -124,7 +179,7 @@ func (m *MultiReceiver) readRTCP() {
 		if !ok {
 			continue
 		}
-		s := m.flowFor(ssrc)
+		s := m.flowFor(ssrc, ssrc)
 		if s == nil {
 			return
 		}
@@ -132,9 +187,27 @@ func (m *MultiReceiver) readRTCP() {
 	}
 }
 
-// flowFor returns the session for ssrc, creating it (and surfacing it via Accept)
-// on first sight. Returns nil once the MultiReceiver is closed.
-func (m *MultiReceiver) flowFor(ssrc uint32) *Session {
+// readSingle (Main/Advanced) keys each datagram by its source address.
+func (m *MultiReceiver) readSingle() {
+	defer m.wg.Done()
+	buf := make([]byte, maxDatagram)
+	for {
+		n, src, err := m.conn.ReadMedia(buf)
+		if err != nil {
+			return
+		}
+		s := m.flowFor(src, 0)
+		if s == nil {
+			return
+		}
+		s.Inject(clone(buf[:n]), src)
+	}
+}
+
+// flowFor returns the session for key, creating it (and surfacing it via Accept)
+// on first sight. For the Simple path, ssrc is the flow's SSRC (tagged into its
+// reports); for the source-keyed path it is 0. Returns nil once closed.
+func (m *MultiReceiver) flowFor(key any, ssrc uint32) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	select {
@@ -142,18 +215,17 @@ func (m *MultiReceiver) flowFor(ssrc uint32) *Session {
 		return nil
 	default:
 	}
-	if s, ok := m.flows[ssrc]; ok {
+	if s, ok := m.flows[key]; ok {
 		return s
 	}
 	cfg := m.cfg
-	cfg.SSRC = ssrc // tag this flow's RR/NACK with the flow SSRC (libRIST flow_id)
-	s := NewInjectedReceiver(m.conn, cfg)
-	m.flows[ssrc] = s
-	// Retire the flow when its session shuts down (idle timeout, overflow, or a
-	// Receiver Close), so a later resumption of the same flow_id is re-created
-	// rather than fed to a dead session.
+	if !m.single {
+		cfg.SSRC = ssrc // tag this flow's RR/NACK with the flow SSRC (libRIST flow_id)
+	}
+	s := m.mkFlow(m.conn, cfg)
+	m.flows[key] = s
 	m.wg.Add(1)
-	go m.retire(ssrc, s)
+	go m.retire(key, s)
 	select {
 	case m.accept <- s:
 	default: // Accept backlog full; the flow still recovers and delivers
@@ -162,8 +234,8 @@ func (m *MultiReceiver) flowFor(ssrc uint32) *Session {
 }
 
 // retire removes a flow from the map once its session ends, but only if the map
-// still holds this exact session (a re-created flow for the same SSRC is kept).
-func (m *MultiReceiver) retire(ssrc uint32, s *Session) {
+// still holds this exact session (a re-created flow for the same key is kept).
+func (m *MultiReceiver) retire(key any, s *Session) {
 	defer m.wg.Done()
 	select {
 	case <-s.Done():
@@ -171,8 +243,8 @@ func (m *MultiReceiver) retire(ssrc uint32, s *Session) {
 		return
 	}
 	m.mu.Lock()
-	if m.flows[ssrc] == s {
-		delete(m.flows, ssrc)
+	if m.flows[key] == s {
+		delete(m.flows, key)
 	}
 	m.mu.Unlock()
 }
@@ -188,7 +260,7 @@ func (m *MultiReceiver) Accept() (*Session, error) {
 	}
 }
 
-// MediaPort returns the bound even media port.
+// MediaPort returns the bound media port.
 func (m *MultiReceiver) MediaPort() int { return m.conn.MediaPort() }
 
 // Close stops demultiplexing, closes the shared socket, and closes every flow.
