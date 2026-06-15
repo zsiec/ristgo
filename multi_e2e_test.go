@@ -48,6 +48,16 @@ func TestE2EMultiReceiverAdvancedTwoFlows(t *testing.T) {
 	runMultiTwoFlows(t, cfg, freeMainPort(t))
 }
 
+// TestE2EMultiReceiverAdvancedPSKTwoFlows demultiplexes two PSK-encrypted
+// Advanced flows: each demuxed flow gets its own AES key state and decrypts
+// independently.
+func TestE2EMultiReceiverAdvancedPSKTwoFlows(t *testing.T) {
+	cfg := advConfig("ristgo-multi-psk", 256, false)
+	cfg.BufferMin = 300 * time.Millisecond
+	cfg.BufferMax = 300 * time.Millisecond
+	runMultiTwoFlows(t, cfg, freeMainPort(t))
+}
+
 // runMultiTwoFlows streams two distinct flows from two senders into one
 // MultiReceiver and asserts both reconstruct bit-exact (set equality on SHA-256).
 func runMultiTwoFlows(t *testing.T, cfg ristgo.Config, port int) {

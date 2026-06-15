@@ -48,15 +48,16 @@ func NewMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 }
 
 func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
-	if cfg.Secret != "" || cfg.Username != "" || cfg.DTLS != nil {
-		return nil, fmt.Errorf("%w: multi-flow Main with PSK, EAP-SRP, or DTLS is not yet supported", ErrInvalidConfig)
+	if cfg.Username != "" || cfg.DTLS != nil {
+		return nil, fmt.Errorf("%w: multi-flow Main with EAP-SRP or DTLS is not yet supported", ErrInvalidConfig)
 	}
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
 	}
-	mp, err := buildMainParams(cfg)
-	if err != nil {
+	// Validate the crypto config once; the per-flow factory rebuilds it (so this
+	// error becomes impossible there) to give each flow its own key state.
+	if _, err := buildMainParams(cfg); err != nil {
 		return nil, err
 	}
 	conn, err := socket.ListenSingle(host, port)
@@ -69,9 +70,13 @@ func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	}
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
-	sc.Main = mp // cleartext GRE params are stateless across flows
 	sc.AdaptLQM = cfg.SourceAdaptation
-	return &MultiReceiver{m: session.NewMultiReceiverSingle(conn, sc, session.NewInjectedMainReceiver)}, nil
+	mkFlow := func(c *socket.Conn, flowCfg session.Config) *session.Session {
+		mp, _ := buildMainParams(cfg) // validated above; fresh PSK key state per flow
+		flowCfg.Main = mp
+		return session.NewInjectedMainReceiver(c, flowCfg)
+	}
+	return &MultiReceiver{m: session.NewMultiReceiverSingle(conn, sc, mkFlow)}, nil
 }
 
 func newSimpleMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
@@ -96,15 +101,11 @@ func newSimpleMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 }
 
 func newAdvMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
-	if cfg.Secret != "" {
-		return nil, fmt.Errorf("%w: multi-flow Advanced with PSK encryption is not yet supported", ErrInvalidConfig)
-	}
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
 	}
-	ap, err := buildAdvParams(cfg)
-	if err != nil {
+	if _, err := buildAdvParams(cfg); err != nil {
 		return nil, err
 	}
 	conn, err := socket.ListenSingle(host, port)
@@ -117,9 +118,13 @@ func newAdvMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	}
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
-	sc.Adv = ap // cleartext params are stateless, so flows share them safely
 	sc.AdaptLQM = cfg.SourceAdaptation
-	return &MultiReceiver{m: session.NewMultiReceiverSingle(conn, sc, session.NewInjectedAdvReceiver)}, nil
+	mkFlow := func(c *socket.Conn, flowCfg session.Config) *session.Session {
+		ap, _ := buildAdvParams(cfg) // validated above; fresh PSK key state per flow
+		flowCfg.Adv = ap
+		return session.NewInjectedAdvReceiver(c, flowCfg)
+	}
+	return &MultiReceiver{m: session.NewMultiReceiverSingle(conn, sc, mkFlow)}, nil
 }
 
 // Accept blocks until a new flow appears on the port and returns a Receiver for
