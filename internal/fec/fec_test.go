@@ -205,6 +205,59 @@ func TestUnrecoverable(t *testing.T) {
 	}
 }
 
+// splitmix64 is a tiny deterministic RNG so the property test reproduces by seed.
+type splitmix64 uint64
+
+func (s *splitmix64) next() uint64 {
+	*s += 0x9E3779B97F4A7C15
+	z := uint64(*s)
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+// TestDecoderRandomLossProperty drives many seeded random loss patterns through
+// the decoder and asserts the two FEC invariants: no fabricated data (every
+// recovered payload/header equals the original — enforced inside replay), and
+// completeness under recoverable loss (when at most one packet per matrix is lost,
+// 2-D FEC recovers all of them).
+func TestDecoderRandomLossProperty(t *testing.T) {
+	for seed := uint64(1); seed <= 60; seed++ {
+		rng := splitmix64(seed)
+		cfg := Config{Cols: 4 + int(rng.next()%5), Rows: 4 + int(rng.next()%5)} // 4..8 each
+		matrices := 4
+		isn := uint32(rng.next())
+		events, orig := encodeStream(cfg, isn, cfg.matrixSize()*matrices)
+
+		// Sparse mode (every 3rd seed): at most one drop per matrix — fully
+		// recoverable by 2-D FEC. Otherwise: arbitrary heavier loss, where replay
+		// still guarantees nothing is fabricated.
+		sparse := seed%3 == 0
+		drop := map[uint32]bool{}
+		if sparse {
+			for m := 1; m < matrices; m++ { // skip matrix 0 so the window aligns
+				pos := int(rng.next()) % cfg.matrixSize()
+				drop[seqAdd(isn, m*cfg.matrixSize()+pos)] = true
+			}
+		} else {
+			for i := 0; i < cfg.matrixSize()*matrices; i++ {
+				if rng.next()%100 < 12 { // ~12% loss
+					drop[seqAdd(isn, i)] = true
+				}
+			}
+		}
+
+		rec := replay(cfg, int(isn), events, drop, orig, t) // fatals on any fabricated recovery
+		if sparse {
+			for s := range drop {
+				if !rec[s] {
+					t.Fatalf("seed %d (L=%d D=%d): single per-matrix loss seq %d not recovered", seed, cfg.Cols, cfg.Rows, s)
+				}
+			}
+		}
+	}
+}
+
 // FuzzParseHeader asserts the header parser never panics on arbitrary input.
 func FuzzParseHeader(f *testing.F) {
 	f.Add([]byte(nil))

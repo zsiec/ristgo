@@ -4,8 +4,9 @@ A pure-Go implementation of the **RIST** (Reliable Internet Stream Transport)
 protocol, the VSF TR-06 family of technical recommendations.
 
 > **Status: feature-complete, pre-1.0.** The full RIST stack is implemented and
-> tested, covering all three profiles, SMPTE 2022-7 bonding, source adaptation,
-> and a pure-Go DTLS transport, and it interoperates with libRIST and OpenSSL.
+> tested, covering all three profiles, SMPTE 2022-7 bonding, SMPTE ST 2022-1 FEC,
+> source adaptation, and a pure-Go DTLS transport, and it interoperates with
+> libRIST and OpenSSL.
 > The public API is small and stable in shape. No compatibility guarantees are
 > made before a tagged 1.0, so expect occasional changes.
 
@@ -196,6 +197,26 @@ n, proto, _ := rx.ReadOOBTyped(buf)           // dispatch on the protocol tag
 // proto == ristgo.OOBProtocolIP for libRIST and default WriteOOB
 ```
 
+### Forward error correction (SMPTE ST 2022-1)
+
+`WithFEC` adds 2-D (row + column) XOR FEC over the media: the sender emits FEC
+packets for each row and column of an L×D matrix, and the receiver recovers any
+single loss per row or column with no NACK round trip, complementing ARQ. The
+decoder is driven by each FEC packet's own sequence base, so it recovers correctly
+even if the first packet of the stream is lost.
+
+```go
+tx, _ := ristgo.Dial(ctx, "host:5000", ristgo.WithFEC(10, 5)) // 10x5 matrix
+// ristgo.WithColumnOnlyFEC() for 1-D column-only (half the overhead)
+```
+
+Two carriages (`FECConfig.Carriage`): standard ST 2022-1 on dedicated UDP ports
+(the media port + 2 / + 4 — the interoperable form), or, on the Advanced profile,
+in-band control messages on the data port (TR-06-3 §5.3.5). `Stats.FECRecovered`
+counts packets reconstructed by FEC. libRIST does not implement FEC, so this is a
+ristgo capability (interoperable with other ST 2022-1 receivers on the separate-port
+carriage).
+
 ## Features
 
 Everything below is implemented and tested.
@@ -219,6 +240,7 @@ Everything below is implemented and tested.
 | Stream multiplexing (MultiReceiver: N flows demultiplexed per port) | all | TR-06-1..3 |
 | SMPTE 2022-7 bonding, seamless multipath reconstruction | all | TR-06-1..3 |
 | Weighted load-share bonding (per-path weights, runtime SetWeight) | all | libRIST weight |
+| Forward error correction (SMPTE ST 2022-1, 2-D XOR; separate-port + Advanced in-band carriage) | Simple, Advanced | TR-06-2 §8.4, TR-06-3 §5.3.5 |
 | Source adaptation (Link Quality Messages, encoder-rate callback) | all | TR-06-4 Part 1 |
 | IP multicast (group membership, multicast TTL, egress interface, source filter) | all | n/a |
 | Reversed-role transport (caller-receive, listener-send) | all | n/a |
