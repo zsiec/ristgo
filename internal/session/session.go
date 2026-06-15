@@ -339,6 +339,7 @@ type Session struct {
 	rxRetransBytes      uint64
 	lqmPrevBytes        uint64
 	lqmPrevRetransBytes uint64
+	lqmPrevFEC          uint64 // fecRecovered at the last LQM, for the per-period FEC delta
 	lqmSeq              uint32
 	lqmPrev             flow.Stats
 	lqmLast             clock.Timestamp

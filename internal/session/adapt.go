@@ -65,18 +65,31 @@ func (s *Session) computeLQM(now clock.Timestamp) adapt.LQM {
 	prevRetrans := s.lqmPrevRetransBytes
 	s.lqmPrevRetransBytes = retransBytes
 
+	// FEC-recovered packets are fed into the flow like any arrival, so the flow
+	// counts them in Received but not in Recovered (which is ARQ-only). TR-06-4 §5.1
+	// requires the LQM's recovered count to include packets recovered "through
+	// retransmission OR FEC", so move this period's FEC recoveries from
+	// SourceReceived into Recovered.
+	fecNow := s.fecRecovered.Load()
+	fecDelta := uint32(fecNow - s.lqmPrevFEC)
+	s.lqmPrevFEC = fecNow
+	srcReceived := uint32(st.Received - prev.Received)
+	if fecDelta <= srcReceived {
+		srcReceived -= fecDelta
+	}
+
 	s.lqmSeq++
 	return adapt.LQM{
 		SequenceNumber:    s.lqmSeq,
 		ReportingPeriodMS: periodMS,
 		NACKWindowMS:      uint32(int64(s.cfg.Flow.RecoveryBuffer()) / int64(clock.Millisecond)),
-		SourceReceived:    uint32(st.Received - prev.Received),
+		SourceReceived:    srcReceived,
 		OriginalLost:      uint32(st.Missing - prev.Missing),
 		// RetransmittedReceived counts all retransmits actually received this
 		// period (the flow's dedicated counter, distinct from Recovered, which
 		// counts gaps filled by ARQ). TR-06-4 §5.1 treats these as two fields.
 		RetransmittedReceived: uint32(st.RetransmittedReceived - prev.RetransmittedReceived),
-		Recovered:             uint32(st.Recovered - prev.Recovered),
+		Recovered:             uint32(st.Recovered-prev.Recovered) + fecDelta,
 		Unrecovered:           uint32(st.Lost - prev.Lost),
 		// Late counts original packets that arrived too late, excluding
 		// retransmitted packets received late (§5.1): subtract the too-late
