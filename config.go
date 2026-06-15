@@ -228,6 +228,13 @@ type Config struct {
 	// one-packet-per-Write limit.
 	FragmentSize int
 
+	// FEC, when non-nil, enables SMPTE ST 2022-1 forward error correction
+	// (TR-06-3 §5.3.5): the sender emits row/column FEC packets and the receiver
+	// recovers single losses per row/column with no NACK round trip, complementing
+	// ARQ. Advanced profile only in this release (the FEC rides the data port as
+	// Advanced control messages). See [FECConfig].
+	FEC *FECConfig
+
 	// Weight is the load-balancing weight applied uniformly to every path of a
 	// bonded sender built from the []string form (NewBondedSender / DialBonded /
 	// WithWeight / the ?weight= URL parameter). 0 (the default, libRIST
@@ -386,6 +393,14 @@ func (cfg *Config) validate() error {
 		}
 		if cfg.FragmentSize < 0 || cfg.FragmentSize > MaxMediaPayload {
 			return fmt.Errorf("rist: FragmentSize must be between 0 and MaxMediaPayload (%d)", MaxMediaPayload)
+		}
+	}
+	if cfg.FEC != nil {
+		if cfg.Profile != ProfileAdvanced {
+			return errors.New("rist: FEC (SMPTE ST 2022-1) requires ProfileAdvanced in this release")
+		}
+		if err := cfg.FEC.validate(); err != nil {
+			return err
 		}
 	}
 

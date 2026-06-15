@@ -17,6 +17,9 @@ type Stats struct {
 	Lost uint64
 	// Recovered counts packets recovered by retransmission after a NACK.
 	Recovered uint64
+	// FECRecovered counts packets reconstructed by SMPTE ST 2022-1 FEC (no NACK
+	// round trip), distinct from Recovered (ARQ retransmission).
+	FECRecovered uint64
 	// Duplicates counts dropped duplicate packets (ARQ re-sends and extra
 	// SMPTE 2022-7 path copies).
 	Duplicates uint64

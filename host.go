@@ -509,6 +509,7 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 	return session.Config{
 		Flow:              fc,
 		SSRC:              ssrc,
+		FEC:               toSessionFEC(cfg.FEC),
 		CNAME:             cname,
 		Bitmask:           cfg.NACKType == NACKBitmask,
 		KeepaliveInterval: clock.FromDuration(cfg.KeepaliveInterval),

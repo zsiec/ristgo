@@ -24,6 +24,7 @@ import (
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/eap"
+	"github.com/zsiec/ristgo/internal/fec"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/gre"
 	"github.com/zsiec/ristgo/internal/peer"
@@ -102,6 +103,11 @@ type Config struct {
 	// This is a ristgo<->ristgo capability: libRIST implements neither
 	// fragmentation nor reassembly.
 	FragmentSize int
+
+	// FEC, when non-nil, enables SMPTE ST 2022-1 forward error correction over the
+	// media stream (TR-06-3 §5.3.5). The sender emits row/column FEC packets and
+	// the receiver recovers single losses per row/column without a NACK round trip.
+	FEC *FECParams
 
 	// OneWay runs the session as one-way / no-return-channel transport: the
 	// host emits no RTCP at all (no Sender/Receiver Reports, SDES, NACKs, RTT
@@ -252,6 +258,16 @@ type Session struct {
 	// bond holds the link-bonding / SMPTE 2022-7 multipath state (N paths onto
 	// one flow), non-nil in bonded mode. See bonded.go.
 	bond *bondState
+
+	// FEC (SMPTE ST 2022-1) state, non-nil/active only when cfg.FEC is set. fecEnc
+	// generates row/column FEC from sent media; fecDec recovers lost media on
+	// receive and feeds it into the flow like a retransmit. Both are lazily
+	// constructed from the first packet's sequence. See fec.go.
+	fecEnc       *fec.Encoder
+	fecDec       *fec.Decoder
+	fecMediaSSRC uint32        // SSRC stamped on recovered packets (learned from received media)
+	fecBuf       []byte        // scratch for framing FEC control messages
+	fecRecovered atomic.Uint64 // packets reconstructed by FEC
 
 	// advGRE is the Main-profile GRE control substrate used in Advanced mode.
 	// libRIST's Advanced profile begins with the Main-profile GRE handshake —
@@ -938,6 +954,9 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		s.logAt(LogWarning, CatSocket, "write media: %v", err)
 	}
 	s.lastTx = now
+	if s.fecEnabled() {
+		s.fecOnSend(now, pkt) // generate row/column FEC from this original media
+	}
 }
 
 // inferSenderMediaFromRTCP gives a Simple-profile listener-sender its media
@@ -1120,9 +1139,20 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 					s.handleAdvGRE(now, p.Payload)
 					return
 				}
+				// SMPTE 2022-1 FEC control message: route to the FEC decoder rather
+				// than the feedback path (it is neither media nor RTCP feedback).
+				if s.fecEnabled() && p.EncType == adv.TypeControl {
+					if ci, body, cerr := adv.ParseControl(p.Payload); cerr == nil && fecIsControlIndex(ci) {
+						s.fecOnRecvFEC(now, body)
+						return
+					}
+				}
 				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(p); derr == nil {
 					if isMedia {
 						s.feedMedia(now, 0, pkt)
+						if s.fecEnabled() {
+							s.fecOnRecvMedia(now, p.Timestamp, pkt) // wire TS + cleartext for FEC
+						}
 					} else {
 						s.feedAdvFeedback(now, fbs)
 					}

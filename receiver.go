@@ -343,7 +343,11 @@ func (r *Receiver) WriteOOBTyped(proto uint16, p []byte) error {
 func (r *Receiver) LocalPort() int { return r.sess.MediaPort() }
 
 // Stats returns a snapshot of the receiver's counters.
-func (r *Receiver) Stats() Stats { return toStats(r.sess.Stats()) }
+func (r *Receiver) Stats() Stats {
+	st := toStats(r.sess.Stats())
+	st.FECRecovered = r.sess.FECRecovered()
+	return st
+}
 
 // SSRC returns the flow's reporter SSRC. For a Receiver from [MultiReceiver.Accept]
 // it identifies the demultiplexed flow only on the Simple profile, which keys

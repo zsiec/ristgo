@@ -118,6 +118,23 @@ func WithCompression() Option { return func(c *Config) { c.Compression = true } 
 // corrupted delivery, not an error. Enable it only when both ends are ristgo.
 func WithFragmentSize(n int) Option { return func(c *Config) { c.FragmentSize = n } }
 
+// WithFEC enables SMPTE ST 2022-1 forward error correction with a Columns (L) by
+// Rows (D) matrix (Advanced profile). It is 2-D (column + row) FEC; pair it with
+// [WithColumnOnlyFEC] for 1-D column-only. See [FECConfig].
+func WithFEC(columns, rows int) Option {
+	return func(c *Config) { c.FEC = &FECConfig{Columns: columns, Rows: rows} }
+}
+
+// WithColumnOnlyFEC restricts FEC (see [WithFEC]) to column-only (1-D) protection,
+// halving the overhead. It is a no-op unless FEC is enabled.
+func WithColumnOnlyFEC() Option {
+	return func(c *Config) {
+		if c.FEC != nil {
+			c.FEC.ColumnOnly = true
+		}
+	}
+}
+
 // WithWeight sets the uniform load-balancing weight for a bonded sender's paths
 // (Config.Weight): 0 (the default) keeps full SMPTE 2022-7 duplication, a positive
 // value splits the stream evenly across the paths. For per-path weights use
