@@ -333,8 +333,11 @@ func (r *Receiver) LocalPort() int { return r.sess.MediaPort() }
 // Stats returns a snapshot of the receiver's counters.
 func (r *Receiver) Stats() Stats { return toStats(r.sess.Stats()) }
 
-// SSRC returns the flow's SSRC. It is most useful for a Receiver obtained from
-// [MultiReceiver.Accept], where it identifies which demultiplexed flow this is.
+// SSRC returns the flow's reporter SSRC. For a Receiver from [MultiReceiver.Accept]
+// it identifies the demultiplexed flow only on the Simple profile, which keys
+// flows by SSRC. On Main and Advanced, flows are keyed by source address and all
+// share one reporter SSRC, so SSRC does not distinguish them there — each flow is
+// still its own independent Receiver returned by a separate Accept.
 func (r *Receiver) SSRC() uint32 { return r.sess.SSRC() }
 
 // Authenticated reports whether the data channel is open. For a Main-profile

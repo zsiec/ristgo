@@ -20,7 +20,14 @@ import "github.com/zsiec/ristgo/internal/wire"
 type fragReassembler struct {
 	buf    []byte
 	active bool
+	count  int // fragments folded into the open run (bounds the buffer)
 }
+
+// maxReassemblyFragments bounds the fragments one run may absorb before it is
+// abandoned. It matches the sender's maxFragmentsPerWrite cap: a well-behaved
+// ristgo sender never splits a Write into more, so a longer run is a peer that
+// never sends FragLast and must not be allowed to grow the buffer without bound.
+const maxReassemblyFragments = 64
 
 // push folds one delivered fragment into the run. It returns (payload, true)
 // when a payload completes — a FragLast closing an open run, or a FragStandalone
@@ -35,16 +42,18 @@ func (r *fragReassembler) push(frag wire.FragRole, payload []byte, discontinuity
 		// run, so it does not invalidate the new run.
 		r.buf = append(r.buf[:0], payload...)
 		r.active = true
+		r.count = 1
 		return nil, false
 	case wire.FragMiddle:
-		if !r.active || discontinuity {
-			r.reset() // a lost fragment broke the run
+		if !r.active || discontinuity || r.count >= maxReassemblyFragments {
+			r.reset() // a lost fragment, or an over-long run, broke this payload
 			return nil, false
 		}
 		r.buf = append(r.buf, payload...)
+		r.count++
 		return nil, false
 	case wire.FragLast:
-		if !r.active || discontinuity {
+		if !r.active || discontinuity || r.count >= maxReassemblyFragments {
 			r.reset()
 			return nil, false
 		}
@@ -61,4 +70,5 @@ func (r *fragReassembler) push(frag wire.FragRole, payload []byte, discontinuity
 func (r *fragReassembler) reset() {
 	r.buf = r.buf[:0]
 	r.active = false
+	r.count = 0
 }

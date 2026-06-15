@@ -221,9 +221,11 @@ type Config struct {
 	// independently recoverable sequence; the receiver reassembles them. It
 	// lets a caller submit payloads larger than MaxMediaPayload (up to
 	// FragmentSize × the internal fragment cap). Advanced profile only — and a
-	// ristgo<->ristgo capability, as libRIST implements neither fragmentation
-	// nor reassembly. Must be in [0, MaxMediaPayload]; 0 (the default) disables
-	// it and keeps the one-packet-per-Write limit.
+	// ristgo<->ristgo capability: libRIST has no reassembly path and delivers
+	// each fragment as a complete packet, so enabling this against a non-ristgo
+	// receiver produces silently corrupted delivery, not an error. Must be in
+	// [0, MaxMediaPayload]; 0 (the default) disables it and keeps the
+	// one-packet-per-Write limit.
 	FragmentSize int
 
 	// Weight is the load-balancing weight of this peer when a sender

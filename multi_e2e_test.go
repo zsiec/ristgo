@@ -4,11 +4,82 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
 	ristgo "github.com/zsiec/ristgo"
 )
+
+// TestMultiReceiverCloseNoLeak opens two flows on a MultiReceiver, then closes
+// the whole receiver and verifies every goroutine it spawned returns to the
+// pre-construction baseline: the two socket reader goroutines, the per-flow
+// retire watchers, and each demuxed injected session's event loop. This is the
+// most goroutine-dense transport (readers + one watcher and one session per
+// flow), and its injected sessions take the no-socket-close shutdown path, so a
+// leak here would be unique to multiplexing.
+func TestMultiReceiverCloseNoLeak(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	const perFlowBytes = 32 * 1024
+	const chunk = 1316
+
+	port := freeEvenPort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	mrx, err := ristgo.NewMultiReceiver(addr, fastConfig())
+	if err != nil {
+		t.Fatalf("NewMultiReceiver: %v", err)
+	}
+
+	dataA := make([]byte, perFlowBytes)
+	dataB := make([]byte, perFlowBytes)
+	if _, err := rand.Read(dataA); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if _, err := rand.Read(dataB); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+
+	txA, err := ristgo.NewSender(addr, fastConfig())
+	if err != nil {
+		t.Fatalf("NewSender A: %v", err)
+	}
+	txB, err := ristgo.NewSender(addr, fastConfig())
+	if err != nil {
+		t.Fatalf("NewSender B: %v", err)
+	}
+	go streamChunks(txA, dataA, chunk)
+	go streamChunks(txB, dataB, chunk)
+
+	// Accept both flows and read one payload from each so the sessions are fully
+	// spun up before we tear everything down.
+	for i := 0; i < 2; i++ {
+		rx, err := mrx.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		rx.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 4096)
+		if _, err := rx.Read(buf); err != nil {
+			t.Fatalf("Read flow %d: %v", i, err)
+		}
+		rx.Close()
+	}
+
+	txA.Close()
+	txB.Close()
+	if err := mrx.Close(); err != nil {
+		t.Fatalf("MultiReceiver.Close: %v", err)
+	}
+
+	for i := 0; i < 40; i++ {
+		if runtime.NumGoroutine() <= baseline+1 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("goroutines did not return to baseline: have %d, baseline %d", runtime.NumGoroutine(), baseline)
+}
 
 // streamChunks writes data to tx in chunk-sized Writes with light pacing, then
 // returns. It ignores write errors after a close (the test drives lifetime).

@@ -103,10 +103,11 @@ func (s *Session) InjectBond(idx uint8, isRTCP bool, data []byte, src netip.Addr
 	}
 }
 
-// NewBondedInjectedReceiver builds a Simple-profile bonded receiver session in
-// injected mode: it merges one flow across the shared path sockets (the 2022-7
-// dedup ring), but the MultiReceiver owns the reads and demultiplexes by SSRC.
-// group is this flow's own path liveness/routing state.
+// NewBondedInjectedReceiver builds a bonded receiver session in injected mode: it
+// merges one flow across the shared path sockets (the 2022-7 dedup ring), while
+// the MultiReceiver owns the reads and demultiplexes (by SSRC on Simple, by source
+// address on Main/Advanced). The profile follows cfg (cfg.Main / cfg.Adv set the
+// secure profiles); group is this flow's own path liveness/routing state.
 func NewBondedInjectedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *Session {
 	s := newSession(conns[0], cfg, false)
 	s.injected = true
@@ -124,13 +125,15 @@ func NewBondedInjectedReceiver(conns []*socket.Conn, group *bonding.Group, cfg C
 	return s
 }
 
-// FlowFactory builds an injected per-flow receiver session on the shared conn.
-type FlowFactory func(conn *socket.Conn, cfg Config) *Session
+// FlowFactory builds an injected per-flow receiver session on the shared conn,
+// or returns an error (e.g. a per-flow crypto/auth key derivation failed) so the
+// demuxer drops the datagram rather than installing a broken or shared session.
+type FlowFactory func(conn *socket.Conn, cfg Config) (*Session, error)
 
 // BondFactory builds an injected per-flow bonded session over the shared path
-// sockets, with this flow's own group. It lets a caller build fresh per-flow
-// profile params (e.g. PSK keys) before constructing the session.
-type BondFactory func(conns []*socket.Conn, group *bonding.Group, cfg Config) *Session
+// sockets, with this flow's own group and fresh per-flow profile params (e.g.
+// PSK keys), or returns an error so the demuxer drops the datagram.
+type BondFactory func(conns []*socket.Conn, group *bonding.Group, cfg Config) (*Session, error)
 
 // MultiReceiver binds one socket and demultiplexes the media flows arriving on it
 // into independent receiver Sessions. New flows are surfaced via Accept. It is
@@ -161,7 +164,9 @@ type MultiReceiver struct {
 // NewMultiReceiver starts demultiplexing Simple-profile media on conn (keyed by
 // RTP SSRC).
 func NewMultiReceiver(conn *socket.Conn, cfg Config) *MultiReceiver {
-	m := newMulti(conn, cfg, false, NewInjectedReceiver)
+	m := newMulti(conn, cfg, false, func(c *socket.Conn, fc Config) (*Session, error) {
+		return NewInjectedReceiver(c, fc), nil // Simple: no per-flow crypto to fail
+	})
 	m.wg.Add(2)
 	go m.readMedia()
 	go m.readRTCP()
@@ -185,7 +190,7 @@ func newMulti(conn *socket.Conn, cfg Config, single bool, mkFlow FlowFactory) *M
 		single: single,
 		mkFlow: mkFlow,
 		flows:  make(map[any]*Session),
-		accept: make(chan *Session, 64),
+		accept: make(chan *Session, maxFlows), // one slot per possible flow: Accept never drops a flow
 		done:   make(chan struct{}),
 	}
 }
@@ -196,8 +201,8 @@ func newMulti(conn *socket.Conn, cfg Config, single bool, mkFlow FlowFactory) *M
 // path liveness/routing group. This is stream multiplexing and link bonding at
 // once (N flows, each over M paths).
 func NewMultiBondedReceiver(conns []*socket.Conn, cfg Config, newGroup func() *bonding.Group) *MultiReceiver {
-	m := newMultiBonded(conns, cfg, false, newGroup, func(c []*socket.Conn, g *bonding.Group, fc Config) *Session {
-		return NewBondedInjectedReceiver(c, g, fc)
+	m := newMultiBonded(conns, cfg, false, newGroup, func(c []*socket.Conn, g *bonding.Group, fc Config) (*Session, error) {
+		return NewBondedInjectedReceiver(c, g, fc), nil // Simple: no per-flow crypto to fail
 	})
 	for i, c := range conns {
 		m.wg.Add(2)
@@ -231,7 +236,7 @@ func newMultiBonded(conns []*socket.Conn, cfg Config, single bool, newGroup func
 		newGroup:  newGroup,
 		mkBonded:  mkBonded,
 		flows:     make(map[any]*Session),
-		accept:    make(chan *Session, 64),
+		accept:    make(chan *Session, maxFlows), // one slot per possible flow: Accept never drops a flow
 		done:      make(chan struct{}),
 	}
 }
@@ -385,17 +390,38 @@ func (m *MultiReceiver) flowFor(key any, ssrc uint32) (s *Session, stop bool) {
 	if !m.single {
 		cfg.SSRC = ssrc // tag this flow's RR/NACK with the flow SSRC (libRIST flow_id)
 	}
+	// Single-socket (Main/Advanced) flows are keyed by source address, not SSRC
+	// (which may be encrypted), so every such flow keeps the template reporter
+	// SSRC. That is harmless: each flow feeds back to a distinct source address,
+	// which is the identity the sender disambiguates on, not the report SSRC.
+
+	var err error
 	if m.bonded {
-		s = m.mkBonded(m.bondConns, m.newGroup(), cfg)
+		s, err = m.mkBonded(m.bondConns, m.newGroup(), cfg)
 	} else {
-		s = m.mkFlow(m.conn, cfg)
+		s, err = m.mkFlow(m.conn, cfg)
+	}
+	if err != nil {
+		// A per-flow crypto/auth key derivation failed (e.g. crypto/rand): drop
+		// this flow's datagrams rather than install a broken or unauthenticated
+		// session. A new datagram will retry building it.
+		if cfg.Logf != nil {
+			cfg.Logf(LogError, CatCrypto, "multi-flow: drop flow, build failed: %v", err)
+		}
+		return nil, false
 	}
 	m.flows[key] = s
 	m.wg.Add(1)
 	go m.retire(key, s)
 	select {
 	case m.accept <- s:
-	default: // Accept backlog full; the flow still recovers and delivers
+	default:
+		// The accept buffer holds one slot per possible flow (maxFlows), so this
+		// only triggers if the caller never drains Accept while flows churn. The
+		// flow still recovers and delivers; it is just not surfaced via Accept.
+		if cfg.Logf != nil {
+			cfg.Logf(LogWarning, CatSession, "multi-flow: Accept backlog full, flow not surfaced (drain Accept)")
+		}
 	}
 	return s, false
 }

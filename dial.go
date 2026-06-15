@@ -110,8 +110,12 @@ func WithCompression() Option { return func(c *Config) { c.Compression = true } 
 // larger than n bytes is split into fragments of at most n bytes, each an
 // independently recoverable sequence, and reassembled by the receiver. It lets a
 // caller submit payloads larger than MaxMediaPayload. n must be in the range
-// [0, MaxMediaPayload]; 0 disables fragmentation. This is a ristgo to ristgo
-// capability, as libRIST implements neither fragmentation nor reassembly.
+// [0, MaxMediaPayload]; 0 disables fragmentation.
+//
+// This is a ristgo-to-ristgo capability. libRIST implements no reassembly: it
+// reads the fragment header bits but delivers each fragment as a complete packet,
+// so enabling this against a libRIST (or any non-ristgo) receiver yields silently
+// corrupted delivery, not an error. Enable it only when both ends are ristgo.
 func WithFragmentSize(n int) Option { return func(c *Config) { c.FragmentSize = n } }
 
 // WithWeight sets this peer's load-balancing weight (0 = SMPTE 2022-7 duplicate).

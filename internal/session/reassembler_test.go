@@ -88,6 +88,40 @@ func TestFragReassembler(t *testing.T) {
 	}
 }
 
+// TestFragReassemblerBoundsRun verifies a peer that opens a run and then streams
+// FragMiddle without ever closing it cannot grow the buffer without bound: once
+// the run reaches maxReassemblyFragments the reassembler abandons it (delivers
+// nothing and frees the buffer), and a later FragLast on that dead run is dropped.
+func TestFragReassemblerBoundsRun(t *testing.T) {
+	var r fragReassembler
+	chunk := []byte("0123456789abcdef") // 16 bytes per fragment
+
+	if _, ok := r.push(wire.FragFirst, chunk, false); ok {
+		t.Fatal("FragFirst should not complete a payload")
+	}
+	// Feed far more middles than the cap. None complete, and the buffer must stop
+	// growing at the cap rather than accumulating every fragment.
+	for i := 0; i < maxReassemblyFragments*4; i++ {
+		if _, ok := r.push(wire.FragMiddle, chunk, false); ok {
+			t.Fatalf("FragMiddle %d should not complete a payload", i)
+		}
+	}
+	if got := len(r.buf); got > maxReassemblyFragments*len(chunk) {
+		t.Fatalf("buffer grew to %d bytes, want <= %d (run not bounded)", got, maxReassemblyFragments*len(chunk))
+	}
+	// The run was abandoned, so a closing FragLast finds no open run and is dropped.
+	if _, ok := r.push(wire.FragLast, chunk, false); ok {
+		t.Fatal("FragLast on an over-long (abandoned) run should be dropped, not delivered")
+	}
+
+	// A fresh, in-bounds run still completes normally after the abandonment.
+	r.push(wire.FragFirst, []byte("aa"), false)
+	out, ok := r.push(wire.FragLast, []byte("bb"), false)
+	if !ok || string(out) != "aabb" {
+		t.Fatalf("recovery run delivered %q ok=%v, want \"aabb\" true", out, ok)
+	}
+}
+
 // TestFragReassemblerNoAllocSteadyState verifies the reassembler reuses its
 // buffer: after a warm-up run sizes it, a same-shape run allocates nothing.
 func TestFragReassemblerNoAllocSteadyState(t *testing.T) {

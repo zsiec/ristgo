@@ -206,11 +206,12 @@ type Session struct {
 	peer   *peer.Peer
 	sender bool // role
 	// injected runs the session without its own socket reader goroutines: an
-	// external demultiplexer (a MultiReceiver) owns the socket read, peeks the
-	// flow's SSRC, and feeds this session's inbound channels via InjectMedia /
-	// InjectRTCP / InjectMain / InjectAdv. The session still owns its event loop,
-	// flow core, timers, and feedback writes (which go out the shared conn). On
-	// shutdown it does not close the shared conn (the MultiReceiver does).
+	// external demultiplexer (a MultiReceiver) owns the socket read, keys each
+	// datagram to its flow, and feeds this session's inbound channels via
+	// InjectMedia / InjectRTCP (Simple), Inject (single-socket Main/Advanced), or
+	// InjectBond (bonded). The session still owns its event loop, flow core,
+	// timers, and feedback writes (which go out the shared conn). On shutdown it
+	// does not close the shared conn (the MultiReceiver does).
 	injected bool
 	// announce makes a receiver send an immediate startup keepalive (a Receiver
 	// Report) to its seeded peer.RTCP — the caller-receive (pull) mode, where the

@@ -17,17 +17,24 @@ import (
 // recovery, in-order delivery, and statistics. Use it when several senders feed
 // one port, or one source emits several flows.
 type MultiReceiver struct {
-	m       *session.MultiReceiver
-	ctxStop func()
+	m *session.MultiReceiver
 }
 
 // NewMultiReceiver binds a RIST receiver at addr ("host:port" or a rist:// URL)
 // and demultiplexes the media flows arriving on it. Call Accept in a loop to
 // obtain a [Receiver] per discovered flow.
 //
-// Supported on the Simple profile (demultiplexed by the cleartext RTP SSRC) and
-// the Advanced profile without encryption (demultiplexed by source address). The
-// Main profile and PSK-encrypted Advanced demux by source address and follow.
+// Supported on all three profiles: the Simple profile demultiplexes by the
+// cleartext RTP SSRC, while Main and Advanced (cleartext or PSK) demultiplex by
+// datagram source address. DTLS cannot be multiplexed (it is one secure channel
+// per socket).
+//
+// Security: a flow is created on first sight of a datagram and immediately emits
+// feedback (Receiver Reports, NACKs) toward the apparent source address, so the
+// receiver reflects RTCP to whatever source a datagram claims, up to maxFlows
+// concurrent flows. Run it behind a trusted network boundary, or expect that a
+// spoofed-source flood can briefly create reflecting flows (bounded by maxFlows
+// and per-flow buffer overflow).
 func NewMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -78,11 +85,18 @@ func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.AdaptLQM = cfg.SourceAdaptation
-	mkFlow := func(c *socket.Conn, flowCfg session.Config) *session.Session {
-		mp, _ := buildMainParams(cfg) // validated above; fresh PSK key state per flow
-		mp.EAPServer, _ = buildEAPServer(cfg)
+	mkFlow := func(c *socket.Conn, flowCfg session.Config) (*session.Session, error) {
+		mp, err := buildMainParams(cfg) // fresh PSK key state per flow
+		if err != nil {
+			return nil, err
+		}
+		eap, err := buildEAPServer(cfg) // fresh authenticator per flow; nil-on-error must not install
+		if err != nil {
+			return nil, err
+		}
+		mp.EAPServer = eap
 		flowCfg.Main = mp
-		return session.NewInjectedMainReceiver(c, flowCfg)
+		return session.NewInjectedMainReceiver(c, flowCfg), nil
 	}
 	return &MultiReceiver{m: session.NewMultiReceiverSingle(conn, sc, mkFlow)}, nil
 }
@@ -127,10 +141,13 @@ func newAdvMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	fc := toFlowConfig(cfg)
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.AdaptLQM = cfg.SourceAdaptation
-	mkFlow := func(c *socket.Conn, flowCfg session.Config) *session.Session {
-		ap, _ := buildAdvParams(cfg) // validated above; fresh PSK key state per flow
+	mkFlow := func(c *socket.Conn, flowCfg session.Config) (*session.Session, error) {
+		ap, err := buildAdvParams(cfg) // fresh PSK key state per flow
+		if err != nil {
+			return nil, err
+		}
 		flowCfg.Adv = ap
-		return session.NewInjectedAdvReceiver(c, flowCfg)
+		return session.NewInjectedAdvReceiver(c, flowCfg), nil
 	}
 	return &MultiReceiver{m: session.NewMultiReceiverSingle(conn, sc, mkFlow)}, nil
 }
@@ -140,11 +157,19 @@ func newAdvMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 // combines stream multiplexing with link bonding: N flows, each reconstructed
 // over M redundant paths. Call Accept in a loop for a [Receiver] per flow.
 //
-// All three profiles are supported. The Simple profile groups a flow's paths by
-// RTP SSRC; the Main and Advanced profiles (cleartext or PSK) group by source
-// address (a bonded sender uses one source socket duplicated to every path), so
-// PSK works without reading the encrypted SSRC. DTLS and EAP-SRP are not
-// supported over bonding.
+// All three profiles are supported, with differing interop reach:
+//
+//   - Simple groups a flow's paths by the cleartext RTP SSRC. A libRIST bonded
+//     sender stamps the same flow_id on every path, so this case is interoperable
+//     with libRIST.
+//   - Main and Advanced (cleartext or PSK) group by datagram source address,
+//     because the SSRC may be encrypted. This relies on a bonded sender using one
+//     source socket duplicated to every path — which is how the ristgo bonded
+//     sender works, so bonded Main/Advanced multiplexing is a ristgo-to-ristgo
+//     capability. A libRIST bonded sender opens a separate socket (distinct source
+//     port) per path, so its paths would not group into one flow here.
+//
+// DTLS and EAP-SRP are not supported over bonding.
 func NewMultiBondedReceiver(addrs []string, cfg Config) (*MultiReceiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
@@ -172,15 +197,20 @@ func NewMultiBondedReceiver(addrs []string, cfg Config) (*MultiReceiver, error) 
 	if cfg.Profile == ProfileSimple {
 		return &MultiReceiver{m: session.NewMultiBondedReceiver(conns, sc, newGroup)}, nil
 	}
-	// Main/Advanced: validate the profile params once, then build fresh per-flow
-	// params (PSK key state) in the factory.
-	if err := applyBondProfile(&sc, cfg); err != nil {
+	// Main/Advanced: validate the profile params once on a throwaway copy so a bad
+	// config fails the constructor, but leave the template sc free of any cipher —
+	// each flow builds its own fresh PSK key state in the factory, and a build error
+	// drops that flow rather than falling back to a shared (stateful) cipher.
+	probe := sc
+	if err := applyBondProfile(&probe, cfg); err != nil {
 		closeConns(conns)
 		return nil, err
 	}
-	mkBonded := func(c []*socket.Conn, g *bonding.Group, flowCfg session.Config) *session.Session {
-		_ = applyBondProfile(&flowCfg, cfg) // validated above; fresh params per flow
-		return session.NewBondedInjectedReceiver(c, g, flowCfg)
+	mkBonded := func(c []*socket.Conn, g *bonding.Group, flowCfg session.Config) (*session.Session, error) {
+		if err := applyBondProfile(&flowCfg, cfg); err != nil { // fresh params per flow
+			return nil, err
+		}
+		return session.NewBondedInjectedReceiver(c, g, flowCfg), nil
 	}
 	return &MultiReceiver{m: session.NewMultiBondedReceiverSingle(conns, sc, newGroup, mkBonded)}, nil
 }
@@ -203,8 +233,5 @@ func (r *MultiReceiver) LocalPort() int { return r.m.MediaPort() }
 // Close stops demultiplexing, releases the socket, and closes every accepted
 // flow's Receiver.
 func (r *MultiReceiver) Close() error {
-	if r.ctxStop != nil {
-		r.ctxStop()
-	}
 	return r.m.Close()
 }
