@@ -10,12 +10,29 @@ import (
 // Rows (D) matrix over the protected media. By default it is 2-D (a column FEC
 // packet per column and a row FEC packet per row), recovering any single loss per
 // row and per column and, by cascade, many 2-D loss patterns. ColumnOnly keeps
-// only the column FEC (1-D), halving the overhead.
+// only the column FEC (1-D), roughly halving the overhead.
 //
-// It is enabled via [Config.FEC] / [WithFEC] on the Advanced profile, where the
-// FEC packets ride the data port as Advanced control messages (TR-06-3 §5.3.5).
-// FEC complements ARQ: it recovers losses with no NACK round trip, while ARQ
-// remains the backstop for losses FEC cannot cover.
+// Enable it via [Config.FEC] or [WithFEC]. FEC complements ARQ: it recovers losses
+// with no NACK round trip, while ARQ remains the backstop for losses FEC cannot
+// cover. The matrix must satisfy the TR-06-3 ST 2022-1 limits: L in [1,20]
+// (column-only) or [4,20] (2-D), D in [4,20], and L*D <= 100.
+//
+// # Domain and interop
+//
+// On the Advanced profile FEC is computed over the full wire datagram after
+// compression and PSK encryption, per TR-06-3 §5.3.5, so a recovery is the missing
+// packet's exact bytes and composes with payload fragmentation, PSK encryption, and
+// flow identification. On the Simple profile FEC is standard ST 2022-1 over the RTP
+// payload, the form that interoperates with any ST 2022-1 receiver (the Advanced
+// in-band carriage is ristgo-to-ristgo).
+//
+// # Not yet supported
+//
+//   - The Main profile, and FEC together with link bonding (2022-7 duplication
+//     already provides seamless multipath recovery) — both rejected by validation.
+//   - ST 2022-5 (the high-bitrate variant; only ST 2022-1 is implemented).
+//   - Encrypted FEC packets, and fragmenting an over-MTU FEC control message, so the
+//     protected datagram should stay within one MTU.
 type FECConfig struct {
 	// Columns is L, the matrix width (the spacing between a column's packets).
 	Columns int

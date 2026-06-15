@@ -118,20 +118,28 @@ func WithCompression() Option { return func(c *Config) { c.Compression = true } 
 // corrupted delivery, not an error. Enable it only when both ends are ristgo.
 func WithFragmentSize(n int) Option { return func(c *Config) { c.FragmentSize = n } }
 
-// WithFEC enables SMPTE ST 2022-1 forward error correction with a Columns (L) by
-// Rows (D) matrix (Advanced profile). It is 2-D (column + row) FEC; pair it with
-// [WithColumnOnlyFEC] for 1-D column-only. See [FECConfig].
+// WithFEC enables SMPTE ST 2022-1 forward error correction over a Columns (L) by
+// Rows (D) matrix. It is 2-D (column + row) FEC, recovering any single loss per row
+// and per column; pair it with [WithColumnOnlyFEC] (in either order) for 1-D
+// column-only. Overhead is about 1/L + 1/D (≈ 2/L for a square matrix); larger
+// matrices add latency. Typical values are 5–10 per side. See [FECConfig] for the
+// carriage and the profile/feature constraints.
 func WithFEC(columns, rows int) Option {
-	return func(c *Config) { c.FEC = &FECConfig{Columns: columns, Rows: rows} }
+	return func(c *Config) {
+		colOnly := c.FEC != nil && c.FEC.ColumnOnly // preserve a prior WithColumnOnlyFEC
+		c.FEC = &FECConfig{Columns: columns, Rows: rows, ColumnOnly: colOnly}
+	}
 }
 
 // WithColumnOnlyFEC restricts FEC (see [WithFEC]) to column-only (1-D) protection,
-// halving the overhead. It is a no-op unless FEC is enabled.
+// roughly halving the overhead at the cost of recovering only column losses. It may
+// be applied before or after WithFEC.
 func WithColumnOnlyFEC() Option {
 	return func(c *Config) {
-		if c.FEC != nil {
-			c.FEC.ColumnOnly = true
+		if c.FEC == nil {
+			c.FEC = &FECConfig{}
 		}
+		c.FEC.ColumnOnly = true
 	}
 }
 

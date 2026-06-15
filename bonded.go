@@ -291,6 +291,12 @@ func bondedSupported(cfg Config) error {
 	if cfg.Username != "" {
 		return fmt.Errorf("%w: bonded EAP-SRP authentication is not supported", ErrInvalidConfig)
 	}
+	if cfg.FEC != nil {
+		// The bonded send path does not feed the FEC encoder, so FEC would silently
+		// do nothing over a bonded session. 2022-7 duplication already provides
+		// seamless multipath recovery; reject the combination rather than mislead.
+		return fmt.Errorf("%w: FEC is not supported with bonding (use 2022-7 duplication for multipath recovery)", ErrInvalidConfig)
+	}
 	return nil
 }
 

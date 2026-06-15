@@ -12,11 +12,16 @@ import (
 )
 
 // This file wires the SMPTE ST 2022-1 FEC core (internal/fec) into the session.
-// FEC is computed over the protected media in the normalized domain (cleartext
-// payload plus the on-the-wire RTP timestamp), so a recovered packet is rebuilt
-// directly into the same wire.MediaPacket the codec would have produced and fed
-// into the flow like an ARQ retransmit — FEC is just another source of packets
-// into the one seq-indexed ring.
+//
+// On the Advanced profile FEC is computed over the FULL wire datagram (after
+// compression and PSK encryption), as TR-06-3 §5.3.5 requires: a recovery is the
+// missing packet's exact bytes, re-injected through the normal decode path so it
+// carries every header field (fragment role, flow id) and decrypts correctly. This
+// makes FEC compose with fragmentation, encryption, and flow identification. On the
+// Simple profile FEC is standard ST 2022-1 over the RTP payload (recovering the RTP
+// header fields), the form a conforming ST 2022-1 receiver interoperates with.
+// Either way a recovered packet re-enters the one seq-indexed flow ring like an ARQ
+// retransmit.
 //
 // Carriage (TR-06-3 §5.3.5): either Advanced in-band control messages (Control
 // Index 0x0022 row / 0x0023 column) on the data port, or standard ST 2022-1 RTP
@@ -55,37 +60,39 @@ func (s *Session) fecConfig() fec.Config {
 	return fec.Config{Cols: s.cfg.FEC.Cols, Rows: s.cfg.FEC.Rows, ColumnOnly: s.cfg.FEC.ColumnOnly}
 }
 
-// fecWireTS maps a source time to the on-the-wire RTP timestamp for the active
-// profile — the exact value the codec stamps and the receiver reads, so the FEC
-// XOR is consistent end to end.
-func (s *Session) fecWireTS(src uint64) uint32 {
-	if s.adv != nil {
-		return advTSFromSource(src)
-	}
-	return rtpTSFromSource(src)
-}
-
-// fecSource reconstructs the normalized source time of a recovered packet from its
-// sequence and recovered wire timestamp, matching what the codec would produce for
-// the real packet (so the flow's (Seq, SourceTime) dedup absorbs a duplicate).
-func (s *Session) fecSource(seq, wireTS uint32) uint64 {
-	if s.adv != nil {
-		return uint64(clock.NTPTimeFromTimestamp(clock.Timestamp(s.adv.advSourceMicros(seq, wireTS))))
-	}
+// fecSourceSimple reconstructs the normalized source time of a Simple-profile
+// recovered packet from its sequence and recovered RTP timestamp, matching what the
+// codec would produce for the real packet (so the flow's (Seq, SourceTime) dedup
+// absorbs a duplicate). The Advanced profile re-decodes the recovered datagram
+// instead, so it needs no equivalent.
+func (s *Session) fecSourceSimple(wireTS uint32) uint64 {
 	ticks := widenTicks(wireTS, s.mdec.refTicks) // widen against the decoder's reference
 	return uint64(clock.NTPTimeFromTimestamp(clock.Timestamp(microsFromRTPTicks(ticks))))
 }
 
-// fecOnSend clips one original (non-retransmit) media packet into the FEC matrix
-// and emits any completed FEC packets via the configured carriage.
-func (s *Session) fecOnSend(now clock.Timestamp, pkt wire.MediaPacket) {
+// fecOnSend clips one original (non-retransmit) media unit into the FEC matrix and
+// emits any completed FEC packets via the configured carriage.
+//
+// On the Advanced profile it protects the FULL wire datagram (post-compression and
+// -encryption), as TR-06-3 §5.3.5 requires, so a recovery is the missing packet's
+// exact bytes — re-decoded through the normal path it carries every header field
+// (fragment role, flow id) and decrypts correctly. On Simple it is standard
+// ST 2022-1 over the RTP payload, recovering the RTP header fields, which a
+// conforming ST 2022-1 receiver interoperates with.
+func (s *Session) fecOnSend(now clock.Timestamp, pkt wire.MediaPacket, datagram []byte) {
 	if pkt.Retransmit {
 		return // FEC protects original transmissions, fed in sequence order
 	}
 	if s.fecEnc == nil {
 		s.fecEnc = fec.NewEncoder(s.fecConfig(), fecPayloadSize, pkt.Seq)
 	}
-	for _, fp := range s.fecEnc.Push(pkt.Seq, s.fecWireTS(pkt.SourceTime), fecPT, pkt.Payload) {
+	var fps []fec.Packet
+	if s.adv != nil {
+		fps = s.fecEnc.Push(pkt.Seq, 0, 0, datagram) // recover exact wire bytes
+	} else {
+		fps = s.fecEnc.Push(pkt.Seq, rtpTSFromSource(pkt.SourceTime), fecPT, pkt.Payload)
+	}
+	for _, fp := range fps {
 		s.sendFEC(now, fp)
 	}
 }
@@ -150,15 +157,26 @@ func fecIsControlIndex(ci uint16) bool {
 	}
 }
 
-// fecOnRecvMedia clips a received media packet into the decoder (cleartext payload
-// and the raw on-the-wire timestamp) and delivers any packets its arrival recovers.
-func (s *Session) fecOnRecvMedia(now clock.Timestamp, wireTS uint32, pkt wire.MediaPacket) {
+// fecRecvSimple feeds one received Simple-profile media packet (its RTP payload and
+// raw on-the-wire timestamp) into the decoder and delivers any packets it recovers.
+func (s *Session) fecRecvSimple(now clock.Timestamp, wireTS uint32, pkt wire.MediaPacket) {
 	if s.fecDec == nil {
 		s.fecDec = fec.NewDecoder(s.fecConfig(), fecPayloadSize, pkt.Seq)
 	}
 	s.fecMediaSSRC = pkt.SSRC
 	for _, r := range s.fecDec.PushMedia(pkt.Seq, wireTS, fecPT, pkt.Payload) {
-		s.fecDeliver(now, r)
+		s.fecHandleRecovered(now, r)
+	}
+}
+
+// fecRecvAdv feeds one received Advanced-profile wire datagram (the raw bytes) into
+// the decoder, keyed by its decoded sequence, and delivers any it recovers.
+func (s *Session) fecRecvAdv(now clock.Timestamp, seq uint32, datagram []byte) {
+	if s.fecDec == nil {
+		s.fecDec = fec.NewDecoder(s.fecConfig(), fecPayloadSize, seq)
+	}
+	for _, r := range s.fecDec.PushMedia(seq, 0, 0, datagram) {
+		s.fecHandleRecovered(now, r)
 	}
 }
 
@@ -169,17 +187,25 @@ func (s *Session) fecOnRecvFEC(now clock.Timestamp, fecBody []byte) {
 		return // no media seen yet; cannot place the FEC group
 	}
 	for _, r := range s.fecDec.PushFEC(fecBody) {
-		s.fecDeliver(now, r)
+		s.fecHandleRecovered(now, r)
 	}
 }
 
-// fecDeliver reconstructs the recovered packet as the exact wire.MediaPacket the
-// codec would have produced and feeds it into the flow.
-func (s *Session) fecDeliver(now clock.Timestamp, r fec.Recovered) {
+// fecHandleRecovered delivers one recovered packet. On the Advanced profile it
+// re-injects the recovered wire datagram through the normal decode path, so the
+// packet's full header (fragment role, flow id) and PSK decryption are honored
+// exactly as for a packet that arrived on the wire — re-feeding it to the decoder
+// is a no-op because the FEC and flow layers both dedup it. On Simple it
+// reconstructs the wire.MediaPacket from the recovered RTP fields.
+func (s *Session) fecHandleRecovered(now clock.Timestamp, r fec.Recovered) {
 	s.fecRecovered.Add(1)
+	if s.adv != nil {
+		s.handleAdvInbound(now, r.Payload)
+		return
+	}
 	s.feedMedia(now, 0, wire.MediaPacket{
 		Seq:        r.Seq,
-		SourceTime: s.fecSource(r.Seq, r.Timestamp),
+		SourceTime: s.fecSourceSimple(r.Timestamp),
 		SSRC:       s.fecMediaSSRC,
 		Payload:    r.Payload,
 	})

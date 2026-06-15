@@ -300,6 +300,98 @@ func distinctEvenPort(t *testing.T, avoid ...int) int {
 	}
 }
 
+// TestE2EFECWithFragmentation proves FEC composes with payload fragmentation on the
+// Advanced profile: large Writes are split into fragments (each its own sequence),
+// the link drops some, and FEC recovers the lost fragments. Because FEC now protects
+// the full wire datagram, a recovered fragment carries its original First/Last role,
+// so reassembly succeeds and the stream is bit-exact. A FEC scheme that recovered
+// only the media payload would mis-tag recovered fragments and corrupt the output.
+func TestE2EFECWithFragmentation(t *testing.T) {
+	const totalBytes = 256 * 1024
+	const chunk = 1500 // splits into 3 fragments at FragmentSize 600
+
+	recvPort := freeMainPort(t)
+	proxyPort := freeMainPort(t)
+	for proxyPort == recvPort {
+		proxyPort = freeMainPort(t)
+	}
+
+	cfg := advConfig("ristgo-fec-frag", 256, false) // PSK too: exercises encryption + FEC + fragmentation
+	cfg.BufferMin = 600 * time.Millisecond
+	cfg.BufferMax = 600 * time.Millisecond
+	cfg.FragmentSize = 600
+	cfg.FEC = &ristgo.FECConfig{Columns: 6, Rows: 6}
+
+	rx, err := ristgo.NewReceiver(fmt.Sprintf("127.0.0.1:%d", recvPort), cfg)
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+
+	proxy := startFECLossyProxy(t, proxyPort, recvPort, 0.06, 36, 0xFEC5)
+	defer proxy.Close()
+
+	tx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", proxyPort), cfg)
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+
+	data := advPayload(t, totalBytes, false)
+	want := sha256.Sum256(data)
+
+	go func() {
+		tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+		for off := 0; off < len(data); off += chunk {
+			end := off + chunk
+			if end > len(data) {
+				end = len(data)
+			}
+			if _, werr := tx.Write(data[off:end]); werr != nil {
+				return
+			}
+			if (off/chunk)%4 == 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		flush := make([]byte, chunk)
+		for i := 0; i < 40; i++ {
+			tx.Write(flush)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+	got := make([]byte, 0, totalBytes)
+	buf := make([]byte, 4096)
+	h := sha256.New()
+	for len(got) < totalBytes {
+		n, rerr := rx.Read(buf)
+		if n > 0 {
+			take := n
+			if len(got)+take > totalBytes {
+				take = totalBytes - len(got)
+			}
+			h.Write(buf[:take])
+			got = append(got, buf[:take]...)
+		}
+		if rerr != nil {
+			st := rx.Stats()
+			t.Fatalf("Read ended early at %d/%d: %v (dropped=%d fecRecovered=%d)", len(got), totalBytes, rerr, proxy.Dropped(), st.FECRecovered)
+		}
+	}
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	st := rx.Stats()
+	if sum != want {
+		t.Fatalf("FEC+fragmentation hash mismatch (dropped=%d fecRecovered=%d)", proxy.Dropped(), st.FECRecovered)
+	}
+	if st.FECRecovered == 0 {
+		t.Fatalf("no fragments recovered by FEC (dropped=%d); composition not exercised", proxy.Dropped())
+	}
+	t.Logf("FEC+fragmentation e2e: dropped=%d fecRecovered=%d", proxy.Dropped(), st.FECRecovered)
+}
+
 // TestE2EFECRecoversAdvanced runs an Advanced-profile stream with 2-D SMPTE 2022-1
 // FEC over a lossy link and verifies the receiver recovers losses by FEC. The
 // stream reconstructs bit-exact and Stats.FECRecovered is non-zero, proving FEC

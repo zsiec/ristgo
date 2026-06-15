@@ -741,7 +741,7 @@ func (s *Session) loop() {
 				if s.fecEnabled() {
 					// uint32(refTicks) is the raw on-the-wire RTP timestamp (widening
 					// only touches the high bits), the value the FEC XOR is keyed on.
-					s.fecOnRecvMedia(now, uint32(s.mdec.refTicks), pkt)
+					s.fecRecvSimple(now, uint32(s.mdec.refTicks), pkt)
 				}
 			}
 			s.afterInput(now, timer)
@@ -986,7 +986,7 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	}
 	s.lastTx = now
 	if s.fecEnabled() {
-		s.fecOnSend(now, pkt) // generate row/column FEC from this original media
+		s.fecOnSend(now, pkt, b) // generate row/column FEC from this original media
 	}
 }
 
@@ -1182,7 +1182,7 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 					if isMedia {
 						s.feedMedia(now, 0, pkt)
 						if s.fecEnabled() {
-							s.fecOnRecvMedia(now, p.Timestamp, pkt) // wire TS + cleartext for FEC
+							s.fecRecvAdv(now, pkt.Seq, data) // protect/recover the full wire datagram
 						}
 					} else {
 						s.feedAdvFeedback(now, fbs)
