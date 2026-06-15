@@ -154,13 +154,16 @@ func (m *MultiReceiver) readMedia() {
 		if err != nil {
 			return
 		}
-		if n < rtpHeaderSize {
+		ssrc, ok := peekMediaSSRC(buf[:n])
+		if !ok {
 			continue
 		}
-		ssrc := rtp.NormalizeSSRC(binary.BigEndian.Uint32(buf[8:12]))
-		s := m.flowFor(ssrc, ssrc)
-		if s == nil {
+		s, stop := m.flowFor(ssrc, ssrc)
+		if stop {
 			return
+		}
+		if s == nil {
+			continue // flow cap reached
 		}
 		s.InjectMedia(clone(buf[:n]), src)
 	}
@@ -179,9 +182,12 @@ func (m *MultiReceiver) readRTCP() {
 		if !ok {
 			continue
 		}
-		s := m.flowFor(ssrc, ssrc)
-		if s == nil {
+		s, stop := m.flowFor(ssrc, ssrc)
+		if stop {
 			return
+		}
+		if s == nil {
+			continue // flow cap reached
 		}
 		s.InjectRTCP(clone(buf[:n]), src)
 	}
@@ -196,33 +202,47 @@ func (m *MultiReceiver) readSingle() {
 		if err != nil {
 			return
 		}
-		s := m.flowFor(src, 0)
-		if s == nil {
+		s, stop := m.flowFor(src, 0)
+		if stop {
 			return
+		}
+		if s == nil {
+			continue // flow cap reached
 		}
 		s.Inject(clone(buf[:n]), src)
 	}
 }
 
+// maxFlows caps the number of concurrent demultiplexed flows, so a burst of
+// datagrams with spurious SSRCs/sources cannot open unbounded sessions. It
+// matches libRIST's RIST_MAX_FLOWS.
+const maxFlows = 256
+
 // flowFor returns the session for key, creating it (and surfacing it via Accept)
 // on first sight. For the Simple path, ssrc is the flow's SSRC (tagged into its
-// reports); for the source-keyed path it is 0. Returns nil once closed.
-func (m *MultiReceiver) flowFor(key any, ssrc uint32) *Session {
+// reports); for the source-keyed path it is 0. stop is true only once the
+// MultiReceiver is closed (the reader should exit); a nil session with stop
+// false means the datagram should be dropped (the flow cap is reached) and the
+// reader should continue.
+func (m *MultiReceiver) flowFor(key any, ssrc uint32) (s *Session, stop bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	select {
 	case <-m.done:
-		return nil
+		return nil, true
 	default:
 	}
 	if s, ok := m.flows[key]; ok {
-		return s
+		return s, false
+	}
+	if len(m.flows) >= maxFlows {
+		return nil, false // at capacity: drop the datagram, keep reading
 	}
 	cfg := m.cfg
 	if !m.single {
 		cfg.SSRC = ssrc // tag this flow's RR/NACK with the flow SSRC (libRIST flow_id)
 	}
-	s := m.mkFlow(m.conn, cfg)
+	s = m.mkFlow(m.conn, cfg)
 	m.flows[key] = s
 	m.wg.Add(1)
 	go m.retire(key, s)
@@ -230,7 +250,7 @@ func (m *MultiReceiver) flowFor(key any, ssrc uint32) *Session {
 	case m.accept <- s:
 	default: // Accept backlog full; the flow still recovers and delivers
 	}
-	return s
+	return s, false
 }
 
 // retire removes a flow from the map once its session ends, but only if the map
@@ -284,6 +304,15 @@ func (m *MultiReceiver) Close() error {
 
 // rtpHeaderSize is the minimum RTP header (no CSRCs): the SSRC ends at byte 12.
 const rtpHeaderSize = 12
+
+// peekMediaSSRC returns the (normalized) SSRC of an RTP media datagram (bytes
+// 8..11), used to route it to a flow. Returns false on a runt datagram.
+func peekMediaSSRC(b []byte) (uint32, bool) {
+	if len(b) < rtpHeaderSize {
+		return 0, false
+	}
+	return rtp.NormalizeSSRC(binary.BigEndian.Uint32(b[8:12])), true
+}
 
 // peekRTCPSSRC returns the (normalized) SSRC of a compound RTCP datagram's lead
 // report (SR/RR/SDES carry the SSRC at offset 4), used to route it to a flow.
