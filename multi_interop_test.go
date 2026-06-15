@@ -77,6 +77,70 @@ func TestInteropMultiReceiverTwoLibristSenders(t *testing.T) {
 	}
 }
 
+// TestInteropMultiReceiverTwoLibristMainSenders proves Main-profile multiplexing
+// interop with PSK: two libRIST -p 1 AES-256 senders are demultiplexed by source
+// address into two Main flows, each decrypted with its own key state and
+// recovered byte-exact.
+func TestInteropMultiReceiverTwoLibristMainSenders(t *testing.T) {
+	sender := libristTool(t, "ristsender")
+	goPort := freeMainPort(t)
+	feedA := freeUDPPort(t, goPort)
+	feedB := freeUDPPort(t, goPort, feedA)
+
+	mrx, err := ristgo.NewMultiReceiver(fmt.Sprintf("127.0.0.1:%d", goPort), mainInteropConfig(256))
+	if err != nil {
+		t.Fatalf("NewMultiReceiver: %v", err)
+	}
+	defer mrx.Close()
+
+	spawnTool(t, sender, "-p", "1", "-s", mainInteropSecret, "-e", "256", "-b", "200",
+		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedA),
+		"-o", fmt.Sprintf("rist://127.0.0.1:%d", goPort))
+	spawnTool(t, sender, "-p", "1", "-s", mainInteropSecret, "-e", "256", "-b", "200",
+		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedB),
+		"-o", fmt.Sprintf("rist://127.0.0.1:%d", goPort))
+	waitToolReady(t, feedA, 5*time.Second)
+	waitToolReady(t, feedB, 5*time.Second)
+
+	dataA, shaA := randomData(t, interopN)
+	dataB, shaB := randomData(t, interopN)
+	go feedUDP(t, feedA, dataA)
+	go feedUDP(t, feedB, dataB)
+
+	type result struct {
+		sha [32]byte
+		n   int
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		rx, err := mrx.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		go func(rx *ristgo.Receiver) {
+			defer rx.Close()
+			got := readN(t, rx, len(dataA))
+			results <- result{sha256.Sum256(got), len(got)}
+		}(rx)
+	}
+
+	seen := map[[32]byte]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.n != len(dataA) {
+				t.Fatalf("a Main flow received %d/%d bytes", r.n, len(dataA))
+			}
+			seen[r.sha] = true
+		case <-time.After(30 * time.Second):
+			t.Fatal("timed out waiting for both libRIST Main flows")
+		}
+	}
+	if !seen[shaA] || !seen[shaB] {
+		t.Fatal("Main demux mismatch: the two libRIST flows did not reconstruct")
+	}
+}
+
 // TestInteropMultiReceiverTwoLibristAdvSenders proves Advanced-profile
 // multiplexing interop: two libRIST -p 2 senders (distinct sources) are
 // demultiplexed by source address into two independent Advanced flows by one
