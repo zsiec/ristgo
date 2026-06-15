@@ -391,6 +391,183 @@ func TestE2EBondedMainAdvanced(t *testing.T) {
 	}
 }
 
+// bondFragConfig is an Advanced-profile bonded config (PSK AES-256) with payload
+// fragmentation enabled, sized so redundancy/recovery has headroom on loopback.
+func bondFragConfig(fragSize int) ristgo.Config {
+	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileAdvanced
+	cfg.Secret = "ristgo-bonded-frag"
+	cfg.AESKeyBits = 256
+	cfg.BufferMin = 400 * time.Millisecond
+	cfg.BufferMax = 400 * time.Millisecond
+	cfg.FragmentSize = fragSize
+	return cfg
+}
+
+// streamBondedFrag sends payload in writeSize-byte Writes (each larger than the
+// fragment size, so each is split across consecutive sequences) over a bonded
+// sender and reads the merged, reassembled stream back, returning its SHA-256
+// and the number of payload Writes issued. A trailing flush gives the tail a
+// successor so playout releases it.
+func streamBondedFrag(t *testing.T, tx *ristgo.BondedSender, rx *ristgo.BondedReceiver, payload []byte, writeSize int) ([32]byte, int) {
+	t.Helper()
+	got := make(chan [32]byte, 1)
+	go func() {
+		rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+		acc := make([]byte, 0, len(payload))
+		buf := make([]byte, 8192)
+		h := sha256.New()
+		for len(acc) < len(payload) {
+			n, rerr := rx.Read(buf)
+			if n > 0 {
+				take := n
+				if len(acc)+take > len(payload) {
+					take = len(payload) - len(acc)
+				}
+				h.Write(buf[:take])
+				acc = append(acc, buf[:take]...)
+			}
+			if rerr != nil {
+				got <- [32]byte{}
+				return
+			}
+		}
+		var sum [32]byte
+		copy(sum[:], h.Sum(nil))
+		got <- sum
+	}()
+
+	writes := 0
+	tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	for off := 0; off < len(payload); off += writeSize {
+		end := off + writeSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		if _, err := tx.Write(payload[off:end]); err != nil {
+			t.Fatalf("Write at %d: %v", off, err)
+		}
+		writes++
+		if writes%8 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	flush := make([]byte, 300) // small standalone packets; just successors for the tail
+	for i := 0; i < 32; i++ {
+		tx.Write(flush)
+		time.Sleep(time.Millisecond)
+	}
+
+	select {
+	case sum := <-got:
+		return sum, writes
+	case <-time.After(25 * time.Second):
+		t.Fatalf("timed out (Received=%d Delivered=%d)", rx.Stats().Received, rx.Stats().Delivered)
+		return [32]byte{}, writes
+	}
+}
+
+// TestE2EBondedAdvFragmentation proves fragmentation composes with link bonding
+// (SMPTE 2022-7) on the Advanced profile: a payload split into fragments is
+// duplicated across paths, merged by the (Seq, SourceTime) dedup, and
+// reassembled — and a fragment lost on one path is covered seamlessly by the
+// other's copy.
+func TestE2EBondedAdvFragmentation(t *testing.T) {
+	const fragSize = 1000
+	const writeSize = 6000 // 6 fragments per Write
+	const totalBytes = 96 * 1024
+
+	t.Run("clean_merge", func(t *testing.T) {
+		pA := freeMainPort(t)
+		pB := freeMainPort(t)
+		for pB == pA {
+			pB = freeMainPort(t)
+		}
+		addrs := []string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}
+
+		rx, err := ristgo.NewBondedReceiver(addrs, bondFragConfig(fragSize))
+		if err != nil {
+			t.Fatalf("NewBondedReceiver: %v", err)
+		}
+		defer rx.Close()
+		tx, err := ristgo.NewBondedSender(addrs, bondFragConfig(fragSize))
+		if err != nil {
+			t.Fatalf("NewBondedSender: %v", err)
+		}
+		defer tx.Close()
+
+		payload := make([]byte, totalBytes)
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+		want := sha256.Sum256(payload)
+
+		sum, writes := streamBondedFrag(t, tx, rx, payload, writeSize)
+		if sum != want {
+			st := rx.Stats()
+			t.Fatalf("bonded fragmented stream mismatch (Received=%d Delivered=%d Duplicates=%d Lost=%d)",
+				st.Received, st.Delivered, st.Duplicates, st.Lost)
+		}
+		// Fragmentation happened: far more media packets were sent than Writes.
+		if sent := tx.Stats().Sent; sent <= uint64(writes) {
+			t.Fatalf("sender emitted %d media packets for %d writes; fragmentation did not occur", sent, writes)
+		}
+		// Both paths carried the fragments, so the receiver deduplicated copies.
+		if st := rx.Stats(); st.Duplicates == 0 {
+			t.Fatalf("Duplicates=0: the second path's fragment copies were not merged (Received=%d Delivered=%d)", st.Received, st.Delivered)
+		}
+	})
+
+	t.Run("one_path_loss_seamless", func(t *testing.T) {
+		pA := freeMainPort(t)
+		pB := freeMainPort(t)
+		relayPort := freeMainPort(t)
+		for pB == pA || relayPort == pA || relayPort == pB {
+			pB = freeMainPort(t)
+			relayPort = freeMainPort(t)
+		}
+
+		rx, err := ristgo.NewBondedReceiver(
+			[]string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}, bondFragConfig(fragSize))
+		if err != nil {
+			t.Fatalf("NewBondedReceiver: %v", err)
+		}
+		defer rx.Close()
+
+		// Path 0 loses 40% of its fragments through the relay; path 1 is clean.
+		relay := startMediaRelay(t, relayPort, pA, 0.40, 13)
+		defer relay.Close()
+
+		tx, err := ristgo.NewBondedSender(
+			[]string{fmt.Sprintf("127.0.0.1:%d", relayPort), fmt.Sprintf("127.0.0.1:%d", pB)}, bondFragConfig(fragSize))
+		if err != nil {
+			t.Fatalf("NewBondedSender: %v", err)
+		}
+		defer tx.Close()
+
+		payload := make([]byte, totalBytes)
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+		want := sha256.Sum256(payload)
+
+		sum, _ := streamBondedFrag(t, tx, rx, payload, writeSize)
+		if sum != want {
+			st := rx.Stats()
+			t.Fatalf("lossy bonded fragmented stream mismatch (relay dropped=%d Received=%d Delivered=%d Lost=%d)",
+				relay.Dropped(), st.Received, st.Delivered, st.Lost)
+		}
+		if relay.Dropped() == 0 {
+			t.Fatal("relay dropped nothing; the per-path loss was not exercised")
+		}
+		// Every dropped fragment was covered by the clean path's copy — so no
+		// fragment was ever missing and no reassembly run was broken.
+		if st := rx.Stats(); st.Lost != 0 {
+			t.Fatalf("Lost=%d under one-path fragment loss; 2022-7 redundancy should cover every dropped fragment", st.Lost)
+		}
+	})
+}
+
 // TestNewBondedReceiverPeersPriority builds a per-peer bonded receiver with
 // distinct recovery priorities and streams over it, proving the per-path
 // priority API constructs a working session (the priority→NACK-path selection

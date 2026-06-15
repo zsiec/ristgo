@@ -93,6 +93,25 @@ type Config struct {
 	AdaptLQM       bool
 	RateController *adapt.Controller
 	OnRateAdapt    func(kbps int)
+
+	// FragmentSize, when > 0, makes the sender split an application payload
+	// larger than this many bytes across consecutive sequences, each an
+	// independently recoverable fragment (Advanced profile only; the codec maps
+	// the pieces to the header F/L bits). The receiver reassembles them after
+	// in-order delivery. 0 (the default) sends each payload as a single packet.
+	// This is a ristgo<->ristgo capability: libRIST implements neither
+	// fragmentation nor reassembly.
+	FragmentSize int
+
+	// OneWay runs the session as one-way / no-return-channel transport: the
+	// host emits no RTCP at all (no Sender/Receiver Reports, SDES, NACKs, RTT
+	// echoes, keepalives, GRE keepalives, LQM, or buffer negotiation), only
+	// media. Pair it with Flow.NoRecovery, which disables the core's ARQ so
+	// the sender keeps no history and the receiver requests no retransmits. A
+	// one-way sender does not time out on peer silence (the peer is silent by
+	// design — an unseen peer never expires). The zero value is the normal
+	// bidirectional session.
+	OneWay bool
 }
 
 // MainParams carries the Main-profile codec parameters. The public layer builds
@@ -320,6 +339,13 @@ type Session struct {
 	mediaBuf []byte
 	rtcpBuf  []byte
 
+	// Fragmentation (Advanced profile, loop-owned). fragSize > 0 makes the
+	// sender split a Write larger than fragSize across consecutive sequences;
+	// reasm reassembles the delivered fragments on the receive side. Both are
+	// zero/unused when fragmentation is off and for non-Advanced profiles.
+	fragSize int
+	reasm    fragReassembler
+
 	// statsVal is the published flow-stats snapshot, refreshed after every loop
 	// input by the loop goroutine and read by the public Stats(). It is guarded
 	// by statsMu rather than an atomic.Pointer so the per-input refresh reuses
@@ -492,6 +518,7 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		conn:      conn,
 		peer:      peer.New(cfg.SessionTimeout),
 		sender:    sender,
+		fragSize:  cfg.FragmentSize,
 		timers:    make(map[flow.TimerID]clock.Timestamp),
 		mediaBuf:  make([]byte, 0, maxDatagram),
 		rtcpBuf:   make([]byte, 0, maxDatagram),
@@ -739,7 +766,7 @@ func (s *Session) loop() {
 			s.afterInput(now, timer)
 		case p := <-appIn:
 			now := s.clk.Now()
-			s.flow.PushApp(now, p)
+			s.pushApp(now, p)
 			s.afterInput(now, timer)
 		case p := <-s.oobIn:
 			now := s.clk.Now()
@@ -852,7 +879,7 @@ func (s *Session) drain(now clock.Timestamp) {
 			break
 		}
 		if d, ok := ev.(flow.Deliver); ok {
-			s.queueDelivery(d.Payload)
+			s.deliverFragment(d)
 		}
 	}
 }
@@ -913,6 +940,9 @@ func (s *Session) inferSenderMediaFromRTCP() {
 // sendFeedback builds one compound RTCP datagram from the drained feedback and
 // transmits it to the peer's RTCP address.
 func (s *Session) sendFeedback(fbs []wire.Feedback, now clock.Timestamp) {
+	if s.cfg.OneWay {
+		return // one-way transport emits no RTCP feedback, only media
+	}
 	if s.bond != nil {
 		s.sendBondFeedback(fbs, now)
 		return
@@ -1215,6 +1245,9 @@ func localHardwareMAC() [6]byte {
 // _librist_proto_gre_send_keepalive). It is the Main-profile capability/liveness
 // beacon, distinct from the periodic RTCP. A no-op until the peer is learned.
 func (s *Session) sendGREKeepalive(version uint8) {
+	if s.cfg.OneWay {
+		return // one-way transport emits no GRE keepalive, only media
+	}
 	if s.main == nil || !s.peer.RTCP.IsValid() {
 		return
 	}
@@ -1252,6 +1285,9 @@ func (s *Session) sendGREKeepaliveBurst() {
 // + 2*rtt_min, libRIST sender_recover_min_time), three times for datagram
 // redundancy. Version 2 only.
 func (s *Session) sendBufferNegotiation() {
+	if s.cfg.OneWay {
+		return // one-way transport emits no buffer negotiation, only media
+	}
 	if s.main == nil || !s.peer.RTCP.IsValid() || !s.sender {
 		return
 	}
@@ -1446,6 +1482,49 @@ func (s *Session) sendEAP(f eap.Frame, now clock.Timestamp) {
 		s.logf("write eap: %v", err)
 	}
 	s.lastTx = now
+}
+
+// pushApp feeds one application payload to the flow core, splitting it across
+// consecutive sequences when fragmentation is enabled (Advanced profile) and
+// the payload exceeds the configured fragment size. Each fragment is an
+// independently recoverable sequence tagged with its F/L role; the receiver
+// reassembles them. Without fragmentation, or for a payload that already fits,
+// it is a single unfragmented PushApp. p is a session-owned buffer (Write
+// copied it), so the fragment subslices the flow retains stay valid.
+func (s *Session) pushApp(now clock.Timestamp, p []byte) {
+	if s.fragSize <= 0 || len(p) <= s.fragSize {
+		s.flow.PushApp(now, p)
+		return
+	}
+	for off := 0; off < len(p); off += s.fragSize {
+		end := off + s.fragSize
+		if end > len(p) {
+			end = len(p)
+		}
+		var role wire.FragRole
+		switch {
+		case off == 0:
+			role = wire.FragFirst
+		case end == len(p):
+			role = wire.FragLast
+		default:
+			role = wire.FragMiddle
+		}
+		s.flow.PushAppFrag(now, p[off:end], role)
+	}
+}
+
+// deliverFragment reassembles a fragmented Advanced payload before queueing it
+// for Read. The flow core delivers fragments in sequence order carrying their
+// F/L role; the reassembler concatenates a FragFirst..FragLast run, and a
+// Discontinuity (a lost fragment) or a fragment with no open run drops the
+// partial run — the application sees the same gap any unrecovered loss
+// produces. An unfragmented payload (FragStandalone) passes straight through,
+// so non-Advanced sessions and unfragmented Advanced streams are unaffected.
+func (s *Session) deliverFragment(d flow.Deliver) {
+	if out, ready := s.reasm.push(d.Frag, d.Payload, d.Discontinuity); ready {
+		s.queueDelivery(out) // copies internally before reasm's buffer is reused
+	}
 }
 
 // queueDelivery copies the delivered payload onto the read queue. The flow

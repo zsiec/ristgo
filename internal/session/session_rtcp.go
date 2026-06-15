@@ -129,6 +129,9 @@ func (s *Session) receiverReport() rtcp.ReceiverReport {
 // transmitted for a full interval, so it does not double the flow's own echo
 // cadence.
 func (s *Session) sendKeepalive(now clock.Timestamp) {
+	if s.cfg.OneWay {
+		return // one-way transport emits no RTCP, only media
+	}
 	if s.bond != nil {
 		s.sendBondKeepalive(now)
 		return

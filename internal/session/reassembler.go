@@ -1,0 +1,64 @@
+package session
+
+import "github.com/zsiec/ristgo/internal/wire"
+
+// fragReassembler reassembles an Advanced-profile payload that the sender split
+// across consecutive sequences. The flow core delivers the fragments in order,
+// each carrying its F/L role (wire.FragRole); push folds one fragment into the
+// open run and returns the whole payload on the closing FragLast. A
+// FragStandalone is a complete payload delivered as-is.
+//
+// A run is dropped — yielding no payload — whenever it cannot be completed
+// correctly: a FragMiddle/FragLast arriving with no open run (its FragFirst was
+// lost), or any fragment carrying a Discontinuity (the flow core skipped a
+// sequence, so a fragment of this payload was lost and never recovered). The
+// application then sees the same gap any unrecovered loss produces. Encountering
+// a FragFirst or FragStandalone also abandons any incomplete previous run.
+//
+// It is loop-owned (single goroutine), reuses its buffer across payloads, and
+// allocates nothing in steady state.
+type fragReassembler struct {
+	buf    []byte
+	active bool
+}
+
+// push folds one delivered fragment into the run. It returns (payload, true)
+// when a payload completes — a FragLast closing an open run, or a FragStandalone
+// — and (nil, false) otherwise. The returned slice for a FragLast aliases the
+// internal buffer, so the caller must copy it before the next push (queueDelivery
+// copies synchronously).
+func (r *fragReassembler) push(frag wire.FragRole, payload []byte, discontinuity bool) ([]byte, bool) {
+	switch frag {
+	case wire.FragFirst:
+		// Start a fresh run, abandoning any incomplete previous one. A
+		// Discontinuity here refers to a prior (already lost) payload, not this
+		// run, so it does not invalidate the new run.
+		r.buf = append(r.buf[:0], payload...)
+		r.active = true
+		return nil, false
+	case wire.FragMiddle:
+		if !r.active || discontinuity {
+			r.reset() // a lost fragment broke the run
+			return nil, false
+		}
+		r.buf = append(r.buf, payload...)
+		return nil, false
+	case wire.FragLast:
+		if !r.active || discontinuity {
+			r.reset()
+			return nil, false
+		}
+		r.buf = append(r.buf, payload...)
+		r.active = false // buffer kept until the next push overwrites/resets it
+		return r.buf, true
+	default: // FragStandalone
+		r.reset()
+		return payload, true
+	}
+}
+
+// reset discards any in-progress run.
+func (r *fragReassembler) reset() {
+	r.buf = r.buf[:0]
+	r.active = false
+}

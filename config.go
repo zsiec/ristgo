@@ -2,6 +2,7 @@ package ristgo
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"time"
@@ -215,6 +216,16 @@ type Config struct {
 	// libRIST compression). Receivers auto-detect. Default: false.
 	Compression bool
 
+	// FragmentSize, when > 0, makes the sender split a Write larger than this
+	// many bytes into fragments of at most FragmentSize bytes, each an
+	// independently recoverable sequence; the receiver reassembles them. It
+	// lets a caller submit payloads larger than MaxMediaPayload (up to
+	// FragmentSize × the internal fragment cap). Advanced profile only — and a
+	// ristgo<->ristgo capability, as libRIST implements neither fragmentation
+	// nor reassembly. Must be in [0, MaxMediaPayload]; 0 (the default) disables
+	// it and keeps the one-packet-per-Write limit.
+	FragmentSize int
+
 	// Weight is the load-balancing weight of this peer when a sender
 	// feeds multiple peers (libRIST weight). 0 (the default, libRIST
 	// RIST_PEER_WEIGHT_DUPLICATE) duplicates every packet to this peer —
@@ -364,6 +375,14 @@ func (cfg *Config) validate() error {
 	}
 	if cfg.Compression && cfg.Profile != ProfileAdvanced {
 		return errors.New("rist: Compression requires ProfileAdvanced")
+	}
+	if cfg.FragmentSize != 0 {
+		if cfg.Profile != ProfileAdvanced {
+			return errors.New("rist: FragmentSize (payload fragmentation) requires ProfileAdvanced")
+		}
+		if cfg.FragmentSize < 0 || cfg.FragmentSize > MaxMediaPayload {
+			return fmt.Errorf("rist: FragmentSize must be between 0 and MaxMediaPayload (%d)", MaxMediaPayload)
+		}
 	}
 
 	if cfg.DTLS != nil {

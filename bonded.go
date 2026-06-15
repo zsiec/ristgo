@@ -31,6 +31,12 @@ type BondedSender struct {
 	sess    *session.Session
 	remote  netip.AddrPort // the first path, for RemoteAddr
 	ctxStop func()         // ends the context watcher (set by DialBonded)
+
+	// maxWrite is the largest payload a single Write accepts — MaxMediaPayload
+	// unless FragmentSize is configured (Advanced), in which case a larger Write
+	// is split into fragments duplicated across the paths. Zero means the
+	// MaxMediaPayload default.
+	maxWrite int
 }
 
 // newBondingGroup builds the per-flow bonding group from cfg's liveness and RTT
@@ -216,12 +222,17 @@ func newBondedSender(addrs []string, priorities []uint32, cfg Config) (*BondedSe
 	fc.SSRC = ssrc
 	fc.StartSeq = randomStartSeq()
 	sc := toSessionConfig(cfg, fc, ssrc)
+	sc.FragmentSize = cfg.FragmentSize // Advanced-only (validate gates it); 0 otherwise
 	if err := applyBondProfile(&sc, cfg); err != nil {
 		conn.Close()
 		return nil, err
 	}
 	sess := session.NewBondedSender(conn, remotes, bondingGroupWith(cfg, priorities), sc)
-	return &BondedSender{sess: sess, remote: remotes[0][0]}, nil
+	maxWrite := 0
+	if cfg.FragmentSize > 0 {
+		maxWrite = cfg.FragmentSize * maxFragmentsPerWrite
+	}
+	return &BondedSender{sess: sess, remote: remotes[0][0], maxWrite: maxWrite}, nil
 }
 
 // bondedSupported fails closed on the bonded features not implemented: DTLS over
@@ -356,10 +367,17 @@ func (r *BondedReceiver) Close() error {
 }
 
 // Write submits one media payload, duplicated to every path. It returns len(p).
-// The payload must be at most MaxMediaPayload bytes.
+// The payload must be at most MaxMediaPayload bytes, unless FragmentSize is
+// configured (Advanced profile), in which case a larger payload — up to
+// FragmentSize × the internal fragment cap — is split into fragments, each
+// duplicated across the paths and reassembled by the bonded receiver.
 func (s *BondedSender) Write(p []byte) (int, error) {
-	if len(p) > MaxMediaPayload {
-		return 0, fmt.Errorf("rist: payload %d bytes exceeds MaxMediaPayload %d; chunk media before Write", len(p), MaxMediaPayload)
+	max := s.maxWrite
+	if max == 0 {
+		max = MaxMediaPayload
+	}
+	if len(p) > max {
+		return 0, fmt.Errorf("rist: payload %d bytes exceeds the maximum %d; chunk media before Write", len(p), max)
 	}
 	if err := s.sess.Write(p); err != nil {
 		return 0, err

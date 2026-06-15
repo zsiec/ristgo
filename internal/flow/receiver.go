@@ -75,6 +75,11 @@ type slot struct {
 	// seq is the widened 32-bit sequence number occupying this slot.
 	seq uint32
 
+	// frag is the fragment role carried by the packet in this slot, emitted
+	// on Deliver so the host can reassemble. The zero value FragStandalone is
+	// an unfragmented payload.
+	frag wire.FragRole
+
 	// state is slotEmpty or slotFilled.
 	state slotState
 }
@@ -323,6 +328,7 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	s.seq = pkt.Seq
 	s.sourceTime = pkt.SourceTime
 	s.payload = pkt.Payload
+	s.frag = pkt.Frag
 	s.arrival = now
 	s.packetTime = packetTime
 	s.outputTime = packetTime.Add(f.recoveryBuffer)
@@ -375,6 +381,7 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	s.seq = pkt.Seq
 	s.sourceTime = pkt.SourceTime
 	s.payload = pkt.Payload
+	s.frag = pkt.Frag
 	s.arrival = now
 	s.packetTime = now
 	s.outputTime = now.Add(f.recoveryBuffer)
@@ -382,7 +389,11 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	f.stats.Received++
 
 	f.armPlayout(s.outputTime)
-	f.outputs.push(SetTimer{ID: TimerRttEcho, Deadline: now.Add(rttEchoInterval)})
+	// NoRecovery (one-way) transport has no return channel, so the receiver
+	// originates no RTT echo requests.
+	if !f.cfg.NoRecovery {
+		f.outputs.push(SetTimer{ID: TimerRttEcho, Deadline: now.Add(rttEchoInterval)})
+	}
 }
 
 // markMissing queues missing entries for every sequence in (lastFound,
@@ -390,6 +401,13 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 // interpolated linearly between the two known packet times.
 func (f *Flow) markMissing(now clock.Timestamp, path uint8, current uint32, packetTimeNow clock.Timestamp) {
 	r := &f.receiver
+	// NoRecovery (one-way) transport has no return channel: never queue
+	// missing entries, so no NACKs are ever requested. The lastFound cursor
+	// still advances at the call site, and the playout timer still reclaims
+	// the hole at its deadline (recovery by playout-skip, not ARQ).
+	if f.cfg.NoRecovery {
+		return
+	}
 	gap := uint64(current - r.lastFound)
 	// Wraparound guard pinned to seq.MaxGap16 (32768) for flows widened
 	// from 16-bit sequences, matching libRIST's
@@ -675,6 +693,7 @@ func (f *Flow) emitDeliver(s *slot) {
 		Seq:           s.seq,
 		Payload:       s.payload,
 		Discontinuity: r.pendingDiscontinuity,
+		Frag:          s.frag,
 	})
 	r.pendingDiscontinuity = false
 	f.stats.Delivered++

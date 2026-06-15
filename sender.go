@@ -38,7 +38,18 @@ type Sender struct {
 	sess    *session.Session
 	remote  netip.AddrPort
 	ctxStop func() // ends the context watcher (set by Dial); nil for New* constructors
+
+	// maxWrite is the largest payload a single Write accepts. It is
+	// MaxMediaPayload (one packet) unless FragmentSize is configured, in which
+	// case a Write up to FragmentSize × maxFragmentsPerWrite is split into
+	// fragments. Zero means the MaxMediaPayload default (the unfragmented case).
+	maxWrite int
 }
+
+// maxFragmentsPerWrite bounds how many fragments one Write may split into when
+// FragmentSize is configured, capping the per-Write payload and the burst of
+// sequences it enqueues at once.
+const maxFragmentsPerWrite = 64
 
 // NewSender dials a RIST receiver at addr ("host:port" or a rist:// URL whose
 // query parameters override cfg) and returns a ready Sender. For the Simple
@@ -48,6 +59,29 @@ type Sender struct {
 //
 // See [Dial] for the context-aware constructor with functional options.
 func NewSender(addr string, cfg Config) (*Sender, error) {
+	return newSenderMode(addr, cfg, false)
+}
+
+// NewOneWaySender dials a RIST receiver at addr ("host:port" or a rist:// URL)
+// and returns a Sender for one-way / no-return-channel transport: it streams
+// media but never expects feedback. There is no ARQ recovery — the sender
+// retains no retransmit history and emits no RTCP at all (no Sender Reports,
+// SDES, RTT echoes, or keepalives), only media — so a lost packet is not
+// recovered. Use it for satellite, broadcast, or strictly asymmetric paths with
+// no return channel, paired with a [NewOneWayReceiver], which likewise sends
+// nothing back.
+//
+// Supported on the Simple, Main, and Advanced profiles with optional PSK
+// (Secret) encryption; DTLS and EAP-SRP are rejected, as their handshakes need
+// a return channel. Because the receiver is silent by design, the sender never
+// times out on peer silence.
+func NewOneWaySender(addr string, cfg Config) (*Sender, error) {
+	return newSenderMode(addr, cfg, true)
+}
+
+// newSenderMode is the shared body of NewSender and NewOneWaySender. oneWay
+// disables ARQ (Flow.NoRecovery) and all RTCP egress (session OneWay).
+func newSenderMode(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
 		return nil, err
@@ -55,13 +89,16 @@ func NewSender(addr string, cfg Config) (*Sender, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
+	if oneWay && (cfg.DTLS != nil || cfg.Username != "") {
+		return nil, fmt.Errorf("%w: DTLS and EAP-SRP are not supported in one-way mode", ErrInvalidConfig)
+	}
 	switch cfg.Profile {
 	case ProfileSimple:
-		return newSimpleSender(addr, cfg)
+		return newSimpleSender(addr, cfg, oneWay)
 	case ProfileMain:
-		return newMainSender(addr, cfg)
+		return newMainSender(addr, cfg, oneWay)
 	case ProfileAdvanced:
-		return newAdvSender(addr, cfg)
+		return newAdvSender(addr, cfg, oneWay)
 	default:
 		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
 	}
@@ -69,7 +106,7 @@ func NewSender(addr string, cfg Config) (*Sender, error) {
 
 // newSimpleSender constructs a Simple-profile sender: RTP on the receiver's
 // even media port, RTCP on port+1.
-func newSimpleSender(addr string, cfg Config) (*Sender, error) {
+func newSimpleSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	host, port, err := resolveMediaPort(addr)
 	if err != nil {
 		return nil, err
@@ -94,7 +131,9 @@ func newSimpleSender(addr string, cfg Config) (*Sender, error) {
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
 	fc.StartSeq = randomStartSeq()
+	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, ssrc)
+	sc.OneWay = oneWay
 	applyRateAdapt(&sc, cfg)
 	sess := session.NewSender(conn, mediaAddr, rtcpAddr, sc)
 	return &Sender{sess: sess, remote: mediaAddr}, nil
@@ -102,7 +141,7 @@ func newSimpleSender(addr string, cfg Config) (*Sender, error) {
 
 // newMainSender constructs a Main-profile sender: the GRE-tunnelled flow (with
 // optional PSK encryption) over the single port at addr.
-func newMainSender(addr string, cfg Config) (*Sender, error) {
+func newMainSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
@@ -138,8 +177,10 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
 	fc.StartSeq = randomStartSeq()
+	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Main = mp
+	sc.OneWay = oneWay
 	applyRateAdapt(&sc, cfg)
 	sess := session.NewMainSender(conn, remote, sc)
 	return &Sender{sess: sess, remote: remote}, nil
@@ -148,7 +189,7 @@ func newMainSender(addr string, cfg Config) (*Sender, error) {
 // newAdvSender constructs an Advanced-profile sender: RTP-based media (with
 // optional AES-CTR payload encryption and LZ4 compression) over the single port
 // at addr, with native control messages on the same port.
-func newAdvSender(addr string, cfg Config) (*Sender, error) {
+func newAdvSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
@@ -173,11 +214,18 @@ func newAdvSender(addr string, cfg Config) (*Sender, error) {
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
 	fc.StartSeq = randomStartSeq()
+	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Adv = ap
+	sc.OneWay = oneWay
+	sc.FragmentSize = cfg.FragmentSize
 	applyRateAdapt(&sc, cfg)
 	sess := session.NewAdvSender(conn, remote, sc)
-	return &Sender{sess: sess, remote: remote}, nil
+	maxWrite := 0
+	if cfg.FragmentSize > 0 {
+		maxWrite = cfg.FragmentSize * maxFragmentsPerWrite
+	}
+	return &Sender{sess: sess, remote: remote, maxWrite: maxWrite}, nil
 }
 
 // NewListenerSender binds addr ("host:port" or a rist:// URL) and returns a
@@ -299,8 +347,12 @@ func (s *Sender) Write(p []byte) (int, error) {
 		// rather than emitting an empty media packet on the wire.
 		return 0, nil
 	}
-	if len(p) > MaxMediaPayload {
-		return 0, fmt.Errorf("rist: payload %d bytes exceeds MaxMediaPayload %d; chunk media before Write", len(p), MaxMediaPayload)
+	max := s.maxWrite
+	if max == 0 {
+		max = MaxMediaPayload
+	}
+	if len(p) > max {
+		return 0, fmt.Errorf("rist: payload %d bytes exceeds the maximum %d; chunk media before Write", len(p), max)
 	}
 	if err := s.sess.Write(p); err != nil {
 		return 0, err

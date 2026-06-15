@@ -196,6 +196,15 @@ type Config struct {
 	// timing_mode). The zero value is TimingSource, the libRIST default.
 	// Receiver-only.
 	TimingMode TimingMode
+
+	// NoRecovery disables ARQ recovery for one-way / no-return-channel
+	// transport. The sender retains no retransmit history and arms no RTT-echo
+	// cadence; the receiver queues no missing entries (emits no NACKs) and arms
+	// no RTT-echo cadence. The receiver still reorders within the buffer and
+	// delivers in order — unrecoverable gaps are reclaimed by playout-skip, not
+	// ARQ — so a stream with no return channel still plays out continuously,
+	// just without recovery. The zero value keeps full recovery.
+	NoRecovery bool
 }
 
 // TimingMode selects the receiver playout-scheduling clock.
@@ -413,10 +422,20 @@ func (f *Flow) feedbackPath() uint8 {
 // PushApp retains payload by reference (see the package ownership note) so it
 // can be re-sent on NACK; the producer must not mutate it afterward.
 func (f *Flow) PushApp(now clock.Timestamp, payload []byte) {
+	f.PushAppFrag(now, payload, wire.FragStandalone)
+}
+
+// PushAppFrag is PushApp for one fragment of a payload the host has split
+// across consecutive sequences (Advanced profile): frag tags this piece's role
+// (FragFirst/FragMiddle/FragLast), which the core carries through onto the
+// outgoing MediaPacket and re-sends unchanged on retransmission, but never
+// interprets. wire.FragStandalone is a whole, unfragmented payload — the case
+// PushApp delegates here.
+func (f *Flow) PushAppFrag(now clock.Timestamp, payload []byte, frag wire.FragRole) {
 	if f.role != RoleSender {
 		return
 	}
-	f.pushApp(now, payload)
+	f.pushApp(now, payload, frag)
 }
 
 // HandleTimer must be called by the host when a deadline previously

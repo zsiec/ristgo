@@ -39,6 +39,11 @@ type senderSlot struct {
 	// `last_retry_request != 0` guard: the first retransmit is never gated.
 	retried bool
 
+	// frag is the fragment role stamped on this packet, re-sent unchanged on
+	// retransmission so a recovered fragment still carries its F/L bits. The
+	// zero value FragStandalone is an unfragmented payload.
+	frag wire.FragRole
+
 	// state is slotEmpty or slotFilled.
 	state slotState
 }
@@ -77,7 +82,7 @@ type senderState struct {
 // pushApp is the sender-role body of PushApp: assign the next sequence, store
 // the packet in the history ring, and emit its first transmission. It mirrors
 // rist_sender_enqueue followed by the data send.
-func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
+func (f *Flow) pushApp(now clock.Timestamp, payload []byte, frag wire.FragRole) {
 	s := &f.sender
 	if !s.started {
 		s.started = true
@@ -88,25 +93,35 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 		// intentionally ungated. This matches libRIST end-to-end because its
 		// receiver originates echo requests unconditionally, flipping the
 		// peer sender's echo_enabled within one cadence.
-		f.outputs.push(SetTimer{ID: TimerRttEcho, Deadline: now.Add(rttEchoInterval)})
+		//
+		// NoRecovery (one-way) transport has no return channel, so there is no
+		// RTT to measure and no retransmits to gate: skip the echo cadence.
+		if !f.cfg.NoRecovery {
+			f.outputs.push(SetTimer{ID: TimerRttEcho, Deadline: now.Add(rttEchoInterval)})
+		}
 	}
 
 	seqn := s.nextSeq
 	s.nextSeq++
 	sourceTime := uint64(clock.NTPTimeFromTimestamp(now))
 
-	sl := &s.ring[seqn&s.mask]
-	// Lazy eviction: a new sequence reusing this slot simply overwrites the
-	// stale entry, exactly as libRIST's ring overwrites aged packets. A
-	// later NACK for the overwritten sequence finds a mismatched slot and is
-	// reported unserviceable.
-	sl.state = slotFilled
-	sl.seq = seqn
-	sl.sourceTime = sourceTime
-	sl.payload = payload
-	sl.transmitCount = 0
-	sl.retried = false
-	sl.lastRetry = 0
+	// NoRecovery (one-way) transport never retransmits, so retaining the
+	// packet in the history ring would only waste memory: emit and forget.
+	if !f.cfg.NoRecovery {
+		sl := &s.ring[seqn&s.mask]
+		// Lazy eviction: a new sequence reusing this slot simply overwrites the
+		// stale entry, exactly as libRIST's ring overwrites aged packets. A
+		// later NACK for the overwritten sequence finds a mismatched slot and is
+		// reported unserviceable.
+		sl.state = slotFilled
+		sl.seq = seqn
+		sl.sourceTime = sourceTime
+		sl.payload = payload
+		sl.transmitCount = 0
+		sl.retried = false
+		sl.lastRetry = 0
+		sl.frag = frag
+	}
 
 	f.outputs.push(SendMedia{
 		Path: s.txPath,
@@ -117,6 +132,7 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte) {
 			Payload:    payload,
 			Retransmit: false,
 			PathID:     s.txPath,
+			Frag:       frag,
 		},
 	})
 	s.dataBW.feed(now, wireBytes(len(payload))) // recovery_maxbitrate data-rate EWMA
@@ -210,6 +226,7 @@ func (f *Flow) serviceNack(now clock.Timestamp, req wire.NackRequest) {
 					Payload:    sl.payload,
 					Retransmit: true,
 					PathID:     s.txPath,
+					Frag:       sl.frag,
 				},
 			})
 			s.retryBW.feed(now, wireBytes(len(sl.payload)))

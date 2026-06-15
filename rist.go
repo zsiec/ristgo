@@ -1,13 +1,12 @@
 // Package ristgo implements the RIST (Reliable Internet Stream Transport)
-// protocol — the VSF TR-06 family — in pure Go.
+// protocol (the VSF TR-06 family) in pure Go.
 //
-// RIST is the broadcast industry's open standard for reliable, low-latency
-// transport of live media over lossy IP networks. It composes standard wire
-// formats (RTP/RTCP, and GRE-over-UDP for the Main profile) with NACK-based
-// retransmission (ARQ) and optional SMPTE 2022-7 packet-level multipath
-// reconstruction. This implementation targets wire-level interoperability
-// with libRIST, the C reference implementation embedded in FFmpeg, VLC,
-// GStreamer, and TSDuck.
+// RIST is an open standard for reliable, low-latency transport of live media
+// over lossy IP networks. It composes standard wire formats (RTP/RTCP, and
+// GRE-over-UDP for the Main profile) with NACK-based retransmission (ARQ) and
+// optional SMPTE 2022-7 packet-level multipath reconstruction. This
+// implementation targets wire-level interoperability with libRIST, the C
+// reference implementation embedded in FFmpeg, VLC, GStreamer, and TSDuck.
 //
 // # Architecture
 //
@@ -46,11 +45,11 @@
 //	n, err := rx.Read(buf) // in-order, ARQ-recovered media
 //
 // Cancelling ctx closes the session (aborting a pending handshake and unblocking
-// Read/Write). Options configure the common knobs — for example
-// ristgo.WithProfile(ristgo.ProfileMain), ristgo.WithSecret("…"),
-// ristgo.WithDTLS(…) — and WithConfig passes a full [Config] for anything else.
+// Read/Write). Options configure the common knobs, for example
+// ristgo.WithProfile(ristgo.ProfileMain), ristgo.WithSecret("..."), and
+// ristgo.WithDTLS(...); WithConfig passes a full [Config] for anything else.
 // The Config-based [NewSender]/[NewReceiver] constructors remain for callers who
-// prefer the struct; either form also accepts a rist:// URL as the address,
+// prefer the struct, and either form also accepts a rist:// URL as the address,
 // configuring from its query string.
 //
 // # Profiles and features
@@ -62,25 +61,36 @@
 //   - Main (VSF TR-06-2): GRE-over-UDP on a single port, PSK AES-CTR encryption,
 //     EAP-SRP authentication, null-packet deletion, and optional pure-Go DTLS 1.2
 //     transport security ([Config.DTLS]).
-//   - Advanced (VSF TR-06-3): compact RTP-based framing with AEAD ciphers and LZ4
-//     payload compression.
+//   - Advanced (VSF TR-06-3): compact RTP-based framing with AEAD ciphers, LZ4
+//     payload compression, and payload fragmentation ([Config.FragmentSize]).
 //
 // Across every profile: NACK-based ARQ retransmission (range or bitmask), SMPTE
 // 2022-7 link bonding ([BondedSender]/[BondedReceiver]) for seamless multipath
-// reconstruction, and source adaptation (VSF TR-06-4 Part 1) that feeds link
-// quality back to an encoder-rate callback.
+// reconstruction, source adaptation (VSF TR-06-4 Part 1) that feeds link quality
+// back to an encoder-rate callback, and IP multicast (group membership,
+// multicast TTL, egress interface, and source-specific filtering via
+// [Config.Interface], [Config.MulticastTTL], [Config.MulticastSource], and
+// [Config.MulticastLoopback]).
+//
+// # Connection roles
+//
+// The protocol role can be decoupled from the connection direction: a Receiver
+// can dial a listening Sender ([NewReceiverCaller], [DialReceiver]) and a Sender
+// can bind and wait for a receiver to connect ([NewListenerSender],
+// [ListenSender]). One-way transport with no return channel is available via
+// [NewOneWaySender] and [NewOneWayReceiver]: the sender keeps no retransmit
+// history and emits no RTCP, and the receiver emits no RTCP and requests no
+// retransmissions.
 //
 // # Limitations
 //
-// Transport is unicast UDP only. IP multicast (IGMP/MLD group join, multicast
-// TTL, and source-specific multicast) is not supported: a receiver pointed at a
-// multicast group address binds the socket but does not join the group, so on
-// most platforms and IGMP-snooping networks it receives nothing, and a sender
-// does not set the multicast TTL. libRIST supports multicast; ristgo does not,
-// because a correct implementation needs golang.org/x/net/ipv4 and ipv6 for
-// group membership and TTL control, which falls outside ristgo's standard-
-// library-plus-x/crypto dependency policy. Use unicast addresses, or terminate
-// multicast with an external relay (e.g. a udpxy/socat bridge).
+// A few capabilities are ristgo to ristgo only, because libRIST does not
+// implement them: payload fragmentation and reassembly ([Config.FragmentSize]),
+// one-way (no-return-channel) transport ([NewOneWaySender],
+// [NewOneWayReceiver]), and the Advanced-profile AEAD ciphers (AES-GCM and
+// ChaCha20-Poly1305 are built to the TR-06-3 spec, but libRIST Advanced
+// implements AES-CTR only). DTLS and EAP-SRP are not available in the
+// reversed-role, one-way, or bonded modes.
 package ristgo
 
 // Version is the ristgo library version.

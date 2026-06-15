@@ -230,5 +230,6 @@ func (s *Session) handleLQM(raw [44]byte) {
 }
 
 // adaptEmitsLQM reports whether this session should emit periodic LQMs (an
-// opted-in receiver, any profile).
-func (s *Session) adaptEmitsLQM() bool { return s.cfg.AdaptLQM && !s.sender }
+// opted-in receiver, any profile). One-way transport has no return channel, so
+// it never emits LQM.
+func (s *Session) adaptEmitsLQM() bool { return s.cfg.AdaptLQM && !s.sender && !s.cfg.OneWay }

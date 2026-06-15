@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/zsiec/ristgo/internal/adv"
@@ -92,6 +93,66 @@ func TestAdvMediaRoundTrip(t *testing.T) {
 				t.Fatalf("payload mismatch:\n got  %x\n want %x", pkt.Payload, tc.payload)
 			}
 		})
+	}
+}
+
+// TestAdvFragRoundTrip checks every fragment role survives the encode↔decode of
+// the Advanced media path: the wire fragment role maps onto the header F/L bits
+// and back, across the encrypted+compressed combinations.
+func TestAdvFragRoundTrip(t *testing.T) {
+	roles := []wire.FragRole{wire.FragStandalone, wire.FragFirst, wire.FragMiddle, wire.FragLast}
+	combos := []struct {
+		name              string
+		encrypt, compress bool
+	}{
+		{"clear", false, false},
+		{"aesctr", true, false},
+		{"aesctr+lz4", true, true},
+	}
+	for _, combo := range combos {
+		for _, role := range roles {
+			t.Run(fmt.Sprintf("%s/role%d", combo.name, role), func(t *testing.T) {
+				tx, rx := advCodecPair(t, combo.encrypt, combo.compress)
+				pkt := mediaPkt(1234, 5_000_000, bytes.Repeat([]byte("frag-payload"), 8), false)
+				pkt.Frag = role
+
+				b, err := tx.encodeAdvMedia(nil, pkt)
+				if err != nil {
+					t.Fatalf("encodeAdvMedia: %v", err)
+				}
+				isMedia, got, _, err := rx.decodeAdv(b)
+				if err != nil || !isMedia {
+					t.Fatalf("decodeAdv: media=%v err=%v", isMedia, err)
+				}
+				if got.Frag != role {
+					t.Fatalf("Frag = %d, want %d", got.Frag, role)
+				}
+				if !bytes.Equal(got.Payload, pkt.Payload) {
+					t.Fatal("payload mismatch")
+				}
+			})
+		}
+	}
+}
+
+// TestFragBitsMapping pins the role↔(F,L) mapping in both directions.
+func TestFragBitsMapping(t *testing.T) {
+	cases := []struct {
+		role        wire.FragRole
+		first, last bool
+	}{
+		{wire.FragStandalone, true, true},
+		{wire.FragFirst, true, false},
+		{wire.FragMiddle, false, false},
+		{wire.FragLast, false, true},
+	}
+	for _, c := range cases {
+		if f, l := fragBits(c.role); f != c.first || l != c.last {
+			t.Errorf("fragBits(%d) = (%v,%v), want (%v,%v)", c.role, f, l, c.first, c.last)
+		}
+		if got := fragRole(c.first, c.last); got != c.role {
+			t.Errorf("fragRole(%v,%v) = %d, want %d", c.first, c.last, got, c.role)
+		}
 	}
 }
 
@@ -258,7 +319,8 @@ func TestAdvDecodeErrors(t *testing.T) {
 		t.Fatal("cleartext media decoded by an encrypting receiver without error")
 	}
 
-	// A fragmented DIRECT packet (only F set) must be rejected.
+	// A fragmented DIRECT packet (only F set) now decodes, carrying its
+	// fragment role for the host to reassemble (rather than being rejected).
 	frag, err := adv.Build(nil, adv.Params{
 		Seq: 1, SSRC: adv.SSRCProtected(advTestSSRC), EncType: adv.TypeDirect,
 		FirstFrag: true, LastFrag: false,
@@ -267,8 +329,12 @@ func TestAdvDecodeErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	rxClear := newAdvCodec(nil, nil, false, advTestSSRC, 0, 0)
-	if _, _, _, err := rxClear.decodeAdv(frag); err == nil {
-		t.Fatal("fragmented media decoded without error")
+	isMedia, pkt, _, err := rxClear.decodeAdv(frag)
+	if err != nil || !isMedia {
+		t.Fatalf("fragmented media: media=%v err=%v, want a clean media decode", isMedia, err)
+	}
+	if pkt.Frag != wire.FragFirst {
+		t.Fatalf("fragmented media Frag = %d, want FragFirst", pkt.Frag)
 	}
 }
 

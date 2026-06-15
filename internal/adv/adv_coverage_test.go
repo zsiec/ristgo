@@ -33,6 +33,51 @@ func TestSeqSplitJoin(t *testing.T) {
 	}
 }
 
+// TestSeq32MultiWraparound densely covers the 32-bit sequence space across
+// more than ten 16-bit roll-overs. ristgo's design keeps the extended sequence
+// stable here: the send-side core counts in a single uint32 (flow sender's
+// nextSeq++) and the codec derives seq_ext purely via SplitSeq(pkt.Seq), so
+// there is no stateful high-half accumulator to drift across many wraps.
+// TestSeq32Wraparound covers only a single wrap plus the top of the space;
+// this walks contiguous packets straddling each boundary, so a mis-carried
+// increment — not only an isolated value — would be caught.
+//
+// (A receiver faithfully decodes whatever seq_ext arrives on the wire, so this
+// is a deterministic codec proof rather than an interop test: there is nothing
+// for the RX to "correct" if a peer mis-extends the sequence.)
+func TestSeq32MultiWraparound(t *testing.T) {
+	boundaries := make([]uint32, 0, 16)
+	for k := uint32(0); k <= 12; k++ {
+		boundaries = append(boundaries, k<<16) // k * 65536
+	}
+	boundaries = append(boundaries, 0xFFFF0000) // last 16-bit epoch before the 2^32 wrap
+
+	for _, b := range boundaries {
+		// Walk b-2, b-1, b, b+1, b+2; uint32 arithmetic wraps mod 2^32
+		// exactly as the send-side counter does (b=0 thus also covers the
+		// 2^32 -> 0 roll-over).
+		for d := -2; d <= 2; d++ {
+			seq := b + uint32(d)
+			params := Params{Seq: seq, SSRC: 0x40, EncType: TypeDirect, FirstFrag: true, LastFrag: true}
+			wire, err := Build(nil, params, []byte{0})
+			if err != nil {
+				t.Fatalf("seq=%#x Build: %v", seq, err)
+			}
+			p, err := Parse(wire)
+			if err != nil {
+				t.Fatalf("seq=%#x Parse: %v", seq, err)
+			}
+			if p.Seq != seq {
+				t.Errorf("seq=%#x round-trip Seq = %#x", seq, p.Seq)
+			}
+			lo, hi := SplitSeq(seq)
+			if JoinSeq(hi, lo) != seq {
+				t.Errorf("seq=%#x split/join mismatch (lo=%#x hi=%#x)", seq, lo, hi)
+			}
+		}
+	}
+}
+
 // TestFlowIDWire verifies the exact 4-byte Flow ID wire packing mirrors
 // libRIST (test_flow_id_roundtrip: inner_hi=0xAB,
 // inner_lo_sub=0xC5 -> inner=0xABC, sub=0x5).

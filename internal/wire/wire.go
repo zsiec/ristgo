@@ -80,7 +80,33 @@ type MediaPacket struct {
 	// session assigns a stable index per registered peer, and flow records
 	// per-path arrival without ever knowing what a path is.
 	PathID uint8
+
+	// Frag is the Advanced-profile fragment role: whether this packet is a
+	// whole payload or one piece of a payload split across consecutive
+	// sequences. The zero value FragStandalone is a complete, unfragmented
+	// payload — what every Simple/Main packet and every unfragmented Advanced
+	// packet carries — so leaving it unset preserves the original behavior.
+	// The Advanced codec maps it to/from the header F/L bits. flow carries it
+	// through opaquely (it never inspects it); the session splits payloads on
+	// send and reassembles fragments after in-order delivery.
+	Frag FragRole
 }
+
+// FragRole is the Advanced-profile fragment role of a MediaPacket, mapping to
+// the header's F (first) and L (last) bits (TR-06-3 §5.2.2): F=L=1 is a whole
+// payload, F=1/L=0 opens a fragment run, F=0/L=0 continues it, and F=0/L=1
+// closes it. The zero value is FragStandalone so an unset field is a complete
+// payload.
+type FragRole uint8
+
+// Fragment roles. FragStandalone (the zero value) is an unfragmented payload;
+// the others tag the pieces of a split payload, in delivery order.
+const (
+	FragStandalone FragRole = iota // F=1, L=1: a complete, unfragmented payload
+	FragFirst                      // F=1, L=0: first piece of a split payload
+	FragMiddle                     // F=0, L=0: an interior piece
+	FragLast                       // F=0, L=1: last piece of a split payload
+)
 
 // Feedback is the normalized form of everything that is not media: RTCP
 // control traffic in the Simple and Main profiles, and Advanced profile

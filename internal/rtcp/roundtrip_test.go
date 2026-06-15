@@ -225,6 +225,32 @@ func TestEncodeNormalization(t *testing.T) {
 	})
 }
 
+// TestSDESZeroLengthCNAME pins the zero-length-CNAME wire form in both
+// directions: ristgo emits the canonical 12-byte SDES and decodes a peer's
+// empty-CNAME SDES without rejecting it. The round-trip table proves
+// encode∘decode self-consistency; this test additionally pins the exact
+// bytes, the interop-relevant guarantee (some implementations mishandle a
+// CNAME item of length zero).
+func TestSDESZeroLengthCNAME(t *testing.T) {
+	// 81 CA 00 02 | SSRC=7 | item=CNAME(1) len=0 | 2 zero terminator/pad bytes.
+	want := []byte{0x81, 0xCA, 0x00, 0x02, 0x00, 0x00, 0x00, 0x07, 0x01, 0x00, 0x00, 0x00}
+
+	if got := (SDES{SSRC: 7}).AppendTo(nil); !bytes.Equal(got, want) {
+		t.Fatalf("encode empty CNAME:\n got %x\nwant %x", got, want)
+	}
+
+	dec, n, err := Parse(want)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if n != len(want) {
+		t.Errorf("Parse consumed %d, want %d", n, len(want))
+	}
+	if !reflect.DeepEqual(dec, SDES{SSRC: 7, CNAME: ""}) {
+		t.Errorf("decode = %#v, want SDES{SSRC:7, CNAME:\"\"}", dec)
+	}
+}
+
 // TestDecodeDoesNotAliasInput asserts decoded packets survive the caller
 // recycling its receive buffer.
 func TestDecodeDoesNotAliasInput(t *testing.T) {

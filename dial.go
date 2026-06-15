@@ -106,6 +106,14 @@ func WithCNAME(name string) Option { return func(c *Config) { c.CNAME = name } }
 // WithCompression enables Advanced-profile payload compression (LZ4).
 func WithCompression() Option { return func(c *Config) { c.Compression = true } }
 
+// WithFragmentSize enables Advanced-profile payload fragmentation: a Write
+// larger than n bytes is split into fragments of at most n bytes, each an
+// independently recoverable sequence, and reassembled by the receiver. It lets a
+// caller submit payloads larger than MaxMediaPayload. n must be in the range
+// [0, MaxMediaPayload]; 0 disables fragmentation. This is a ristgo to ristgo
+// capability, as libRIST implements neither fragmentation nor reassembly.
+func WithFragmentSize(n int) Option { return func(c *Config) { c.FragmentSize = n } }
+
 // WithWeight sets this peer's load-balancing weight (0 = SMPTE 2022-7 duplicate).
 func WithWeight(w int) Option { return func(c *Config) { c.Weight = w } }
 

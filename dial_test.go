@@ -23,6 +23,7 @@ func TestApplyOptions(t *testing.T) {
 		WithMaxBitrate(50000),
 		WithCNAME("cam-1"),
 		WithCompression(),
+		WithFragmentSize(1200),
 		WithWeight(3),
 		WithSourceAdaptation(),
 	})
@@ -50,6 +51,7 @@ func TestApplyOptions(t *testing.T) {
 		{"MaxBitrate", cfg.MaxBitrate, 50000},
 		{"CNAME", cfg.CNAME, "cam-1"},
 		{"Compression", cfg.Compression, true},
+		{"FragmentSize", cfg.FragmentSize, 1200},
 		{"Weight", cfg.Weight, 3},
 		{"SourceAdaptation", cfg.SourceAdaptation, true},
 	}

@@ -114,6 +114,12 @@ type Deliver struct {
 	// playout deadline), so the output stream has a gap here. The same
 	// information is aggregated in Stats.Discontinuities.
 	Discontinuity bool
+	// Frag is the fragment role the sending codec stamped on this packet
+	// (Advanced profile). The core delivers each fragment in order without
+	// interpreting it; the host reassembles a FragFirst..FragLast run into one
+	// payload, dropping the run when a Discontinuity marks a lost fragment. The
+	// zero value FragStandalone is a whole, unfragmented payload.
+	Frag wire.FragRole
 }
 
 // isEvent seals Deliver into the Event variant set.

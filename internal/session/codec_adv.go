@@ -176,6 +176,7 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 		}
 	}
 
+	first, last := fragBits(pkt.Frag)
 	params := adv.Params{
 		Seq:        pkt.Seq,
 		Timestamp:  advTSFromSource(pkt.SourceTime),
@@ -183,8 +184,8 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 		EncType:    adv.TypeDirect,
 		PSKMode:    adv.PSKNone,
 		LPCMode:    lpcMode,
-		FirstFrag:  true,
-		LastFrag:   true,
+		FirstFrag:  first,
+		LastFrag:   last,
 		Retransmit: pkt.Retransmit,
 	}
 	if c.srcPort != 0 || c.dstPort != 0 {
@@ -210,6 +211,35 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 	}
 
 	return adv.Build(dst, params, payload)
+}
+
+// fragBits maps a wire fragment role to the Advanced header F (first) and L
+// (last) bits (TR-06-3 §5.2.2). FragStandalone is the unfragmented F=L=1 packet.
+func fragBits(r wire.FragRole) (first, last bool) {
+	switch r {
+	case wire.FragFirst:
+		return true, false
+	case wire.FragMiddle:
+		return false, false
+	case wire.FragLast:
+		return false, true
+	default: // FragStandalone
+		return true, true
+	}
+}
+
+// fragRole maps the Advanced header F/L bits back to a wire fragment role.
+func fragRole(first, last bool) wire.FragRole {
+	switch {
+	case first && last:
+		return wire.FragStandalone
+	case first: // first && !last
+		return wire.FragFirst
+	case last: // !first && last
+		return wire.FragLast
+	default: // !first && !last
+		return wire.FragMiddle
+	}
 }
 
 // flowIDFromPorts builds the Advanced Flow ID from the reduced-overhead virtual
@@ -260,15 +290,11 @@ func (c *advCodec) decodeParsed(p adv.Parsed) (isMedia bool, pkt wire.MediaPacke
 // decodeMediaAdv reconstructs a MediaPacket from a parsed DIRECT packet:
 // decrypt (AES-CTR mode 1) then decompress (LZ4), then map the native 32-bit
 // sequence and the 1 MHz timestamp (widened by rollover counting) to the
-// normalized fields. A fragmented packet (not both F and L set) is rejected —
-// libRIST never fragments (F=L=1 always), so reassembly is a
-// documented non-goal at this stage. A retransmit reconstructs to the same
-// (Seq, SourceTime) as its original.
+// normalized fields. The header F/L bits become MediaPacket.Frag, which the
+// flow core carries through and the session reassembles after in-order
+// delivery; an unfragmented packet (F=L=1) maps to FragStandalone. A
+// retransmit reconstructs to the same (Seq, SourceTime, Frag) as its original.
 func (c *advCodec) decodeMediaAdv(p adv.Parsed) (wire.MediaPacket, error) {
-	if !(p.FirstFrag && p.LastFrag) {
-		return wire.MediaPacket{}, fmt.Errorf("rist: adv: fragmented media not supported (F=%v L=%v)", p.FirstFrag, p.LastFrag)
-	}
-
 	data := p.Payload
 
 	// Decrypt. Only AES-CTR (mode 1) is supported, the
@@ -324,6 +350,7 @@ func (c *advCodec) decodeMediaAdv(p adv.Parsed) (wire.MediaPacket, error) {
 		SSRC:       adv.SSRCProtected(p.SSRC),
 		Payload:    data,
 		Retransmit: p.Retransmit,
+		Frag:       fragRole(p.FirstFrag, p.LastFrag),
 	}, nil
 }
 

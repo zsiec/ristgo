@@ -44,6 +44,28 @@ type Receiver struct {
 //
 // See [Listen] for the context-aware constructor with functional options.
 func NewReceiver(addr string, cfg Config) (*Receiver, error) {
+	return newReceiverMode(addr, cfg, false)
+}
+
+// NewOneWayReceiver binds a RIST receiver at addr ("host:port" or a rist:// URL)
+// for one-way / no-return-channel transport: it delivers media but sends nothing
+// back. It emits no RTCP at all (no Receiver Reports, SDES, NACKs, RTT echoes,
+// keepalives, or Link Quality Messages) and requests no retransmissions, so a
+// lost packet is not recovered — an unrecoverable gap is skipped at playout and
+// surfaced as a delivery discontinuity. Use it for satellite, broadcast, or
+// strictly asymmetric paths with no return channel, paired with a
+// [NewOneWaySender].
+//
+// Supported on the Simple, Main, and Advanced profiles with optional PSK
+// (Secret) encryption; DTLS and EAP-SRP are rejected, as their handshakes need
+// a return channel.
+func NewOneWayReceiver(addr string, cfg Config) (*Receiver, error) {
+	return newReceiverMode(addr, cfg, true)
+}
+
+// newReceiverMode is the shared body of NewReceiver and NewOneWayReceiver.
+// oneWay disables ARQ (Flow.NoRecovery) and all RTCP egress (session OneWay).
+func newReceiverMode(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
 		return nil, err
@@ -51,13 +73,16 @@ func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
+	if oneWay && (cfg.DTLS != nil || cfg.Username != "") {
+		return nil, fmt.Errorf("%w: DTLS and EAP-SRP are not supported in one-way mode", ErrInvalidConfig)
+	}
 	switch cfg.Profile {
 	case ProfileSimple:
-		return newSimpleReceiver(addr, cfg)
+		return newSimpleReceiver(addr, cfg, oneWay)
 	case ProfileMain:
-		return newMainReceiver(addr, cfg)
+		return newMainReceiver(addr, cfg, oneWay)
 	case ProfileAdvanced:
-		return newAdvReceiver(addr, cfg)
+		return newAdvReceiver(addr, cfg, oneWay)
 	default:
 		return nil, fmt.Errorf("%w: the %s profile is not implemented", ErrInvalidConfig, cfg.Profile)
 	}
@@ -65,7 +90,7 @@ func NewReceiver(addr string, cfg Config) (*Receiver, error) {
 
 // newSimpleReceiver binds a Simple-profile receiver: RTP on the even port,
 // RTCP on port+1.
-func newSimpleReceiver(addr string, cfg Config) (*Receiver, error) {
+func newSimpleReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	host, port, err := resolveMediaPort(addr)
 	if err != nil {
 		return nil, err
@@ -79,15 +104,17 @@ func newSimpleReceiver(addr string, cfg Config) (*Receiver, error) {
 		return nil, err
 	}
 	fc := toFlowConfig(cfg)
+	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.AdaptLQM = cfg.SourceAdaptation
+	sc.OneWay = oneWay
 	sess := session.NewReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }
 
 // newMainReceiver binds a Main-profile receiver: the GRE-tunnelled flow (with
 // optional PSK decryption) on the single port at addr.
-func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
+func newMainReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
@@ -116,9 +143,11 @@ func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
 		conn.EnableDTLSServer(dcfg)
 	}
 	fc := toFlowConfig(cfg)
+	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.Main = mp
 	sc.AdaptLQM = cfg.SourceAdaptation
+	sc.OneWay = oneWay
 	sess := session.NewMainReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }
@@ -126,7 +155,7 @@ func newMainReceiver(addr string, cfg Config) (*Receiver, error) {
 // newAdvReceiver binds an Advanced-profile receiver: RTP-based media (with
 // optional AES-CTR payload decryption) on the single port at addr, with native
 // control messages on the same port.
-func newAdvReceiver(addr string, cfg Config) (*Receiver, error) {
+func newAdvReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
 		return nil, err
@@ -144,9 +173,11 @@ func newAdvReceiver(addr string, cfg Config) (*Receiver, error) {
 		return nil, err
 	}
 	fc := toFlowConfig(cfg)
+	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, randomEvenSSRC())
 	sc.Adv = ap
 	sc.AdaptLQM = cfg.SourceAdaptation
+	sc.OneWay = oneWay
 	sess := session.NewAdvReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }
