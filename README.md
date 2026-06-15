@@ -101,8 +101,17 @@ rx, _ := ristgo.Listen(ctx, ":5000",
 	ristgo.WithProfile(ristgo.ProfileMain),
 	ristgo.WithDTLS(ristgo.DTLSConfig{PSK: []byte("shared-dtls-key")})) // or CertPEM/KeyPEM + PeerFingerprint
 
-// SMPTE 2022-7 bonding: feed several paths from one source.
+// SMPTE 2022-7 bonding: feed several paths from one source (full duplication).
 bx, _ := ristgo.DialBonded(ctx, []string{"a.example:5000", "b.example:5000"})
+
+// Weighted load-share: split the stream across paths instead of duplicating it.
+// Per-path weights (0 keeps a path on full 2022-7 duplication), or a uniform
+// weight via WithWeight for an even split. Change a weight at runtime with
+// bx.SetWeight(path, weight).
+lb, _ := ristgo.NewBondedSenderPeers([]ristgo.BondedPeer{
+	{Addr: "a.example:5000", Weight: 3}, // ~75% of the packets
+	{Addr: "b.example:5000", Weight: 1}, // ~25%
+}, ristgo.DefaultConfig())
 ```
 
 Prefer a struct? The config-based constructors are still available and take the
@@ -191,6 +200,7 @@ Everything below is implemented and tested.
 | Payload fragmentation and reassembly (per-fragment ARQ) | Advanced | TR-06-3 |
 | Stream multiplexing (MultiReceiver: N flows demultiplexed per port) | all | TR-06-1..3 |
 | SMPTE 2022-7 bonding, seamless multipath reconstruction | all | TR-06-1..3 |
+| Weighted load-share bonding (per-path weights, runtime SetWeight) | all | libRIST weight |
 | Source adaptation (Link Quality Messages, encoder-rate callback) | all | TR-06-4 Part 1 |
 | IP multicast (group membership, multicast TTL, egress interface, source filter) | all | n/a |
 | Reversed-role transport (caller-receive, listener-send) | all | n/a |

@@ -29,6 +29,7 @@ type singlePortLossyProxy struct {
 	minMediaSize int
 	rng          *mrand.Rand
 	dropped      atomic.Uint64
+	forwarded    atomic.Uint64
 	mu           sync.Mutex
 	senderAddr   *net.UDPAddr
 	wg           sync.WaitGroup
@@ -36,6 +37,10 @@ type singlePortLossyProxy struct {
 
 // Dropped reports how many forward media datagrams the proxy has dropped.
 func (p *singlePortLossyProxy) Dropped() uint64 { return p.dropped.Load() }
+
+// Forwarded reports how many forward media-sized datagrams the proxy has relayed
+// (the per-path media count the weighted load-share tests assert on).
+func (p *singlePortLossyProxy) Forwarded() uint64 { return p.forwarded.Load() }
 
 // startSinglePortLossyProxy binds the proxy on proxyPort and relays to the
 // receiver on recvPort, dropping forward media-sized datagrams with probability
@@ -81,6 +86,9 @@ func (p *singlePortLossyProxy) relayForward() {
 		if n >= p.minMediaSize && p.rng.Float64() < p.loss {
 			p.dropped.Add(1)
 			continue
+		}
+		if n >= p.minMediaSize {
+			p.forwarded.Add(1)
 		}
 		p.back.WriteToUDP(buf[:n], p.recvAddr)
 	}

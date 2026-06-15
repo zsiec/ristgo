@@ -18,11 +18,17 @@
 //
 // # Modes
 //
-// ristgo implements the SMPTE 2022-7 full-redundancy mode: a sender transmits
-// the identical packet (same Seq/SourceTime) on every path, and the receiver
-// merges. This corresponds to libRIST's RIST_PEER_WEIGHT_DUPLICATE (weight 0).
-// Weighted round-robin load-balancing (weight > 0) is a documented follow-on;
-// Weight is carried per path so it can drive that later without an API change.
+// A path's Weight selects its mode. Weight 0 (WeightDuplicate) is the SMPTE
+// 2022-7 full-redundancy mode: the sender transmits the identical packet (same
+// Seq/SourceTime) on the path and the receiver merges by the shared (Seq,
+// SourceTime) dedup, matching libRIST's RIST_PEER_WEIGHT_DUPLICATE. A positive
+// Weight joins the weighted load-share rotation (SelectWeighted): the sender
+// routes each datagram to exactly one weighted path, splitting the stream in
+// proportion to the weights (libRIST's weight/w_count). The two modes compose —
+// duplicate paths carry every packet while the weighted paths share the rest —
+// and a weight can change at runtime (SetWeight, libRIST rist_peer_weight_set).
+// Either way the receiver is unchanged: it merges whatever arrives into the one
+// seq-indexed ring, so load-share is purely a sender-side routing policy.
 package bonding
 
 import (
@@ -45,13 +51,18 @@ type Path struct {
 	Index uint8
 
 	// Weight is the libRIST load-balancing weight; WeightDuplicate (0) selects
-	// full 2022-7 duplication.
+	// full 2022-7 duplication, a positive weight joins the weighted rotation
+	// (SelectWeighted) and receives a proportional share of the packets.
 	Weight int
 
 	// Priority is the NACK recovery priority (libRIST recovery_priority): the
 	// receiver routes each NACK to the live path with the highest Priority,
 	// ties broken by the lowest measured RTT (rist_nack_peer_preferred).
 	Priority uint32
+
+	// wCount is the remaining send credit for this weighted path in the current
+	// rotation round (libRIST peer->w_count); it refills to Weight each round.
+	wCount int
 
 	rtt      rtt.Estimator
 	lastSeen clock.Timestamp
@@ -91,9 +102,10 @@ func NewGroup(sessionTimeout, rttMin, rttMax clock.Microseconds) *Group {
 func (g *Group) AddPath(index uint8, weight int, priority uint32) *Path {
 	if p := g.path(index); p != nil {
 		p.Weight, p.Priority = weight, priority
+		p.wCount = weight // re-seed the rotation credit for the new weight
 		return p
 	}
-	p := &Path{Index: index, Weight: weight, Priority: priority, rtt: rtt.New(g.rttMin)}
+	p := &Path{Index: index, Weight: weight, Priority: priority, wCount: weight, rtt: rtt.New(g.rttMin)}
 	g.paths = append(g.paths, p)
 	return p
 }
@@ -231,7 +243,94 @@ func (g *Group) ShouldDuplicate(index uint8, now clock.Timestamp) bool {
 	if p == nil || p.Weight != WeightDuplicate {
 		return false
 	}
+	return g.sendable(p, now)
+}
+
+// sendable reports whether a sender should still transmit on path p as of now: a
+// never-seen path is sendable (a sender blasts every configured peer from the
+// start, before any return traffic proves it live), and only a path seen and then
+// silent past the session timeout is dropped (libRIST's hard-dead prune).
+func (g *Group) sendable(p *Path, now clock.Timestamp) bool {
 	return !(p.seen && now.Sub(p.lastSeen) > g.timeout)
+}
+
+// HasWeighted reports whether any path is configured for weighted load-sharing
+// (Weight > 0). A sender consults SelectWeighted only when this is true; with no
+// weighted path it duplicates to the WeightDuplicate paths alone.
+func (g *Group) HasWeighted() bool {
+	for _, p := range g.paths {
+		if p.Weight > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// SelectWeighted elects the single weighted path a bonded sender routes the next
+// media datagram to, sharing the stream across the weighted (Weight > 0) paths in
+// proportion to their weights. It is the load-balancing counterpart of
+// DuplicateTargets: the WeightDuplicate paths get every packet (2022-7), while the
+// weighted paths split the packets one-per-datagram via this election.
+//
+// The rotation follows libRIST's weighted send (rist_sender_send_data_balanced):
+// each round, every live weighted path is granted Weight credits; the path with
+// the most remaining credit is elected and spends one, so over a round of
+// sum(Weight) packets each path carries exactly its Weight share. A path proven
+// dead is skipped and its credit redistributes to the survivors, so a failed link
+// shifts its share onto the others rather than black-holing those packets. ok is
+// false when no weighted path is configured (the caller duplicates only) or when
+// every weighted path is currently dead.
+func (g *Group) SelectWeighted(now clock.Timestamp) (index uint8, ok bool) {
+	if !g.HasWeighted() {
+		return 0, false
+	}
+	best := g.bestWeighted(now)
+	if best == nil {
+		return 0, false // every weighted path is dead
+	}
+	if best.wCount <= 0 {
+		// The round is exhausted among the live weighted paths: refill them (dead
+		// paths are left empty, so their share passes to the survivors) and re-elect.
+		for _, p := range g.paths {
+			if p.Weight > 0 && g.sendable(p, now) {
+				p.wCount = p.Weight
+			}
+		}
+		best = g.bestWeighted(now)
+	}
+	best.wCount--
+	return best.Index, true
+}
+
+// bestWeighted returns the live weighted path with the most remaining credit, ties
+// broken by registration order (the first such path), or nil if none is live.
+func (g *Group) bestWeighted(now clock.Timestamp) *Path {
+	var best *Path
+	for _, p := range g.paths {
+		if p.Weight <= 0 || !g.sendable(p, now) {
+			continue
+		}
+		if best == nil || p.wCount > best.wCount {
+			best = p
+		}
+	}
+	return best
+}
+
+// SetWeight changes path index's load-balancing weight at runtime (libRIST
+// rist_peer_weight_set): 0 returns it to full 2022-7 duplication, a positive value
+// makes it carry that share of the weighted rotation. It restarts the rotation so
+// the new proportion takes effect cleanly from the next packet, every weighted
+// path regaining full credit. Unknown indices are ignored.
+func (g *Group) SetWeight(index uint8, weight int) {
+	p := g.path(index)
+	if p == nil {
+		return
+	}
+	p.Weight = weight
+	for _, q := range g.paths {
+		q.wCount = q.Weight // restart the round at the new weights
+	}
 }
 
 // DuplicateTargets returns the indices of the paths a bonded sender fans each

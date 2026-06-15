@@ -332,6 +332,11 @@ type Session struct {
 	bondIn  chan bondInbound // bonded multipath: per-path media/RTCP, tagged
 	appIn   chan []byte
 
+	// weightCmd carries runtime load-balancing weight changes (BondedSender.SetWeight,
+	// libRIST rist_peer_weight_set) onto the event loop, which owns the (not
+	// concurrency-safe) bonding Group. Non-nil only on a bonded sender.
+	weightCmd chan weightSet
+
 	// Out-of-band side channel (Main/Advanced only). oobIn carries application
 	// WriteOOB payloads to the loop; oobOut carries received OOB datagrams to
 	// ReadOOB. OOB bypasses the flow core entirely (no ARQ/reorder/dedup), like
@@ -775,6 +780,12 @@ func (s *Session) loop() {
 			now := s.clk.Now()
 			s.handleBondInbound(now, bi)
 			s.afterInput(now, timer)
+		case wc := <-s.weightCmd:
+			// Apply a runtime load-balancing weight change on the loop goroutine,
+			// which owns the bonding Group. It takes effect on the next media send.
+			if s.bond != nil {
+				s.bond.group.SetWeight(wc.path, wc.weight)
+			}
 		case p := <-appIn:
 			now := s.clk.Now()
 			s.pushApp(now, p)

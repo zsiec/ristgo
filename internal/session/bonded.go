@@ -47,6 +47,13 @@ type bondInbound struct {
 	src    netip.AddrPort
 }
 
+// weightSet is a runtime load-balancing weight change for one path, delivered to
+// the event loop via Session.weightCmd (the loop owns the bonding Group).
+type weightSet struct {
+	path   uint8
+	weight int
+}
+
 // bondState holds the per-path I/O and policy for a bonded session.
 type bondState struct {
 	group *bonding.Group
@@ -109,8 +116,26 @@ func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bond
 	s.peer.RTCP = remotes[0][1]
 	s.bond = bs
 	s.bondIn = make(chan bondInbound, 256)
+	s.weightCmd = make(chan weightSet, 4) // runtime BondedSender.SetWeight
 	s.start()
 	return s
+}
+
+// SetPathWeight changes path's load-balancing weight at runtime (BondedSender.
+// SetWeight, libRIST rist_peer_weight_set). It marshals the change onto the event
+// loop, which owns the bonding Group, so it is safe to call from any goroutine. It
+// returns ErrOOBUnsupported when the session has no weight channel (not a bonded
+// sender) and the close reason once the session is closed.
+func (s *Session) SetPathWeight(path uint8, weight int) error {
+	if s.weightCmd == nil {
+		return s.cfg.ErrOOBUnsupported
+	}
+	select {
+	case s.weightCmd <- weightSet{path: path, weight: weight}:
+		return nil
+	case <-s.done:
+		return s.closeReason()
+	}
 }
 
 // startBondReaders launches the per-path reader goroutines. A receiver runs a
@@ -349,6 +374,15 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		}
 		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[i][0]); err != nil {
 			s.logf("bond: write media path %d: %v", i, err)
+		}
+	}
+	// Weighted load-share paths (Weight > 0): route this datagram to one elected
+	// path, splitting the stream across them in proportion to their weights
+	// (libRIST weighted send). These paths are disjoint from the duplicate paths
+	// above, so no path is sent the same datagram twice.
+	if idx, ok := s.bond.group.SelectWeighted(now); ok && int(idx) < len(s.bond.remotes) {
+		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[idx][0]); err != nil {
+			s.logf("bond: write media weighted path %d: %v", idx, err)
 		}
 	}
 	s.lastTx = now

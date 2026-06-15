@@ -228,11 +228,13 @@ type Config struct {
 	// one-packet-per-Write limit.
 	FragmentSize int
 
-	// Weight is the load-balancing weight of this peer when a sender
-	// feeds multiple peers (libRIST weight). 0 (the default, libRIST
-	// RIST_PEER_WEIGHT_DUPLICATE) duplicates every packet to this peer —
-	// the SMPTE 2022-7 mode — instead of joining the weighted rotation.
-	// Must be >= 0.
+	// Weight is the load-balancing weight applied uniformly to every path of a
+	// bonded sender built from the []string form (NewBondedSender / DialBonded /
+	// WithWeight / the ?weight= URL parameter). 0 (the default, libRIST
+	// RIST_PEER_WEIGHT_DUPLICATE) duplicates every packet to every path — the SMPTE
+	// 2022-7 mode — while a positive value splits the stream evenly across the
+	// paths (weighted load-share). For per-path weights, use BondedPeer.Weight with
+	// NewBondedSenderPeers, which takes precedence over this field. Must be >= 0.
 	Weight int
 
 	// SourceAdaptation, set on a Receiver, makes it send periodic Link Quality

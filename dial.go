@@ -118,7 +118,10 @@ func WithCompression() Option { return func(c *Config) { c.Compression = true } 
 // corrupted delivery, not an error. Enable it only when both ends are ristgo.
 func WithFragmentSize(n int) Option { return func(c *Config) { c.FragmentSize = n } }
 
-// WithWeight sets this peer's load-balancing weight (0 = SMPTE 2022-7 duplicate).
+// WithWeight sets the uniform load-balancing weight for a bonded sender's paths
+// (Config.Weight): 0 (the default) keeps full SMPTE 2022-7 duplication, a positive
+// value splits the stream evenly across the paths. For per-path weights use
+// NewBondedSenderPeers with BondedPeer.Weight.
 func WithWeight(w int) Option { return func(c *Config) { c.Weight = w } }
 
 // WithSourceAdaptation makes a receiver emit Link Quality Messages for source

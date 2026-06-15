@@ -24,9 +24,12 @@ type BondedReceiver struct {
 	ctxStop func() // ends the context watcher (set by ListenBonded)
 }
 
-// BondedSender transmits one media flow redundantly across several receiver
-// addresses (full SMPTE 2022-7 duplication): every payload is sent on every
-// path with identical sequence and timestamp, so the receiver can merge them.
+// BondedSender transmits one media flow across several receiver addresses. By
+// default it is full SMPTE 2022-7 duplication: every payload is sent on every path
+// with identical sequence and timestamp, so the receiver merges them seamlessly.
+// Per-path weights (BondedPeer.Weight / Config.Weight) switch a path to weighted
+// load-share instead, splitting the stream across paths in proportion to their
+// weights; weights can change at runtime with SetWeight.
 type BondedSender struct {
 	sess    *session.Session
 	remote  netip.AddrPort // the first path, for RemoteAddr
@@ -37,6 +40,10 @@ type BondedSender struct {
 	// is split into fragments duplicated across the paths. Zero means the
 	// MaxMediaPayload default.
 	maxWrite int
+
+	// paths is the number of bonded paths (== len(addrs) at construction), used to
+	// bounds-check SetWeight's path index.
+	paths int
 }
 
 // newBondingGroup builds the per-flow bonding group from cfg's liveness and RTT
@@ -65,31 +72,59 @@ type BondedPeer struct {
 	// the default 0 is the lowest. Must be >= 0. It is meaningful on a receiver
 	// (which selects a NACK path); a sender duplicates to every path regardless.
 	Priority int
+
+	// Weight is the load-balancing weight (libRIST weight): 0 (the default) keeps
+	// the path in SMPTE 2022-7 full duplication, while a positive value makes it
+	// carry that share of a weighted load-share rotation. It is meaningful on a
+	// sender, which routes each datagram to one weighted path in proportion to the
+	// weights; a receiver ignores it (it merges whatever arrives). Mixing duplicate
+	// (0) and weighted (>0) paths is allowed: the duplicate paths get every packet
+	// and the weighted paths split the rest. Must be >= 0.
+	Weight int
 }
 
-// splitBondedPeers validates peers and splits them into parallel address and
-// priority slices.
-func splitBondedPeers(peers []BondedPeer) (addrs []string, priorities []uint32, err error) {
+// splitBondedPeers validates peers and splits them into parallel address,
+// priority, and weight slices.
+func splitBondedPeers(peers []BondedPeer) (addrs []string, priorities []uint32, weights []int, err error) {
 	addrs = make([]string, len(peers))
 	priorities = make([]uint32, len(peers))
+	weights = make([]int, len(peers))
 	for i, p := range peers {
 		if p.Priority < 0 {
-			return nil, nil, fmt.Errorf("%w: BondedPeer.Priority must be >= 0", ErrInvalidConfig)
+			return nil, nil, nil, fmt.Errorf("%w: BondedPeer.Priority must be >= 0", ErrInvalidConfig)
+		}
+		if p.Weight < 0 {
+			return nil, nil, nil, fmt.Errorf("%w: BondedPeer.Weight must be >= 0 (0 = duplicate)", ErrInvalidConfig)
 		}
 		addrs[i] = p.Addr
 		priorities[i] = uint32(p.Priority)
+		weights[i] = p.Weight
 	}
-	return addrs, priorities, nil
+	return addrs, priorities, weights, nil
 }
 
 // bondingGroupWith builds the bonding group and pre-registers each path with its
-// recovery priority; the session then skips re-registering those paths
-// (Group.HasPath), preserving the priorities. A nil priorities slice leaves the
-// group empty for the session to populate with the priority-0 defaults.
-func bondingGroupWith(cfg Config, priorities []uint32) *bonding.Group {
+// recovery priority and load-balancing weight; the session then skips
+// re-registering those paths (Group.HasPath), preserving both. Nil priorities and
+// weights leave the group empty for the session to populate with the duplicate /
+// priority-0 defaults. The slices may differ in length (a path absent from one
+// takes that field's default).
+func bondingGroupWith(cfg Config, priorities []uint32, weights []int) *bonding.Group {
 	g := newBondingGroup(cfg)
-	for i, pr := range priorities {
-		g.AddPath(uint8(i), bonding.WeightDuplicate, pr)
+	n := len(priorities)
+	if len(weights) > n {
+		n = len(weights)
+	}
+	for i := 0; i < n; i++ {
+		var pr uint32
+		if i < len(priorities) {
+			pr = priorities[i]
+		}
+		w := bonding.WeightDuplicate
+		if i < len(weights) {
+			w = weights[i]
+		}
+		g.AddPath(uint8(i), w, pr)
 	}
 	return g
 }
@@ -112,7 +147,7 @@ func NewBondedReceiver(addrs []string, cfg Config) (*BondedReceiver, error) {
 // priority (libRIST recovery-priority): retransmission requests prefer the live
 // path with the highest priority.
 func NewBondedReceiverPeers(peers []BondedPeer, cfg Config) (*BondedReceiver, error) {
-	addrs, priorities, err := splitBondedPeers(peers)
+	addrs, priorities, _, err := splitBondedPeers(peers)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +179,7 @@ func newBondedReceiver(addrs []string, priorities []uint32, cfg Config) (*Bonded
 		closeConns(conns)
 		return nil, err
 	}
-	sess := session.NewBondedReceiver(conns, bondingGroupWith(cfg, priorities), sc)
+	sess := session.NewBondedReceiver(conns, bondingGroupWith(cfg, priorities, nil), sc)
 	return &BondedReceiver{sess: sess}, nil
 }
 
@@ -160,22 +195,23 @@ func newBondedReceiver(addrs []string, priorities []uint32, cfg Config) (*Bonded
 //
 // See [DialBonded] for the context-aware constructor with functional options.
 func NewBondedSender(addrs []string, cfg Config) (*BondedSender, error) {
-	return newBondedSender(addrs, nil, cfg)
+	return newBondedSender(addrs, nil, nil, cfg)
 }
 
-// NewBondedSenderPeers is [NewBondedSender] with a per-path recovery priority.
-// Priority is meaningful on a receiver; on a sender it is carried for symmetry
-// (a sender duplicates to every path), so this mainly mirrors the receiver's
-// per-peer configuration.
+// NewBondedSenderPeers is [NewBondedSender] with per-path configuration. The
+// sender-meaningful field is BondedPeer.Weight: 0 keeps a path on full SMPTE
+// 2022-7 duplication, a positive value gives it that share of a weighted
+// load-share rotation (mixing the two is allowed). Priority is carried for
+// symmetry but is meaningful on a receiver, not a sender.
 func NewBondedSenderPeers(peers []BondedPeer, cfg Config) (*BondedSender, error) {
-	addrs, priorities, err := splitBondedPeers(peers)
+	addrs, priorities, weights, err := splitBondedPeers(peers)
 	if err != nil {
 		return nil, err
 	}
-	return newBondedSender(addrs, priorities, cfg)
+	return newBondedSender(addrs, priorities, weights, cfg)
 }
 
-func newBondedSender(addrs []string, priorities []uint32, cfg Config) (*BondedSender, error) {
+func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Config) (*BondedSender, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
@@ -184,6 +220,16 @@ func newBondedSender(addrs []string, priorities []uint32, cfg Config) (*BondedSe
 	}
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("%w: a bonded sender needs at least one address", ErrInvalidConfig)
+	}
+	// The []string form (no per-peer weights) honors a uniform Config.Weight
+	// (WithWeight / ?weight=): a positive value load-shares evenly across all
+	// paths, zero keeps full 2022-7 duplication. Per-peer BondedPeer.Weight, when
+	// given, takes precedence.
+	if weights == nil && cfg.Weight > 0 {
+		weights = make([]int, len(addrs))
+		for i := range weights {
+			weights[i] = cfg.Weight
+		}
 	}
 	remotes := make([][2]netip.AddrPort, 0, len(addrs))
 	for _, a := range addrs {
@@ -227,12 +273,12 @@ func newBondedSender(addrs []string, priorities []uint32, cfg Config) (*BondedSe
 		conn.Close()
 		return nil, err
 	}
-	sess := session.NewBondedSender(conn, remotes, bondingGroupWith(cfg, priorities), sc)
+	sess := session.NewBondedSender(conn, remotes, bondingGroupWith(cfg, priorities, weights), sc)
 	maxWrite := 0
 	if cfg.FragmentSize > 0 {
 		maxWrite = cfg.FragmentSize * maxFragmentsPerWrite
 	}
-	return &BondedSender{sess: sess, remote: remotes[0][0], maxWrite: maxWrite}, nil
+	return &BondedSender{sess: sess, remote: remotes[0][0], maxWrite: maxWrite, paths: len(remotes)}, nil
 }
 
 // bondedSupported fails closed on the bonded features not implemented: DTLS over
@@ -397,6 +443,23 @@ func (s *BondedSender) Stats() Stats { return toStats(s.sess.Stats()) }
 
 // RemoteAddr returns the first path's media address.
 func (s *BondedSender) RemoteAddr() net.Addr { return net.UDPAddrFromAddrPort(s.remote) }
+
+// SetWeight changes the load-balancing weight of one path at runtime (libRIST
+// rist_peer_weight_set). path is the zero-based index into the addresses or peers
+// given at construction; weight is 0 to return the path to SMPTE 2022-7 full
+// duplication, or a positive value for its share of the weighted load-share
+// rotation. The change takes effect on the next datagram. It is safe to call from
+// any goroutine. It returns an error for an out-of-range path or a negative
+// weight, or the close reason if the sender is closed.
+func (s *BondedSender) SetWeight(path int, weight int) error {
+	if path < 0 || path >= s.paths {
+		return fmt.Errorf("%w: path %d out of range [0,%d)", ErrInvalidConfig, path, s.paths)
+	}
+	if weight < 0 {
+		return fmt.Errorf("%w: weight must be >= 0 (0 = duplicate)", ErrInvalidConfig)
+	}
+	return s.sess.SetPathWeight(uint8(path), weight)
+}
 
 // Close stops the sender and releases its socket and goroutines.
 func (s *BondedSender) Close() error {
