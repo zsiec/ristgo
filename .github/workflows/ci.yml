@@ -14,8 +14,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
       - run: make build
@@ -33,15 +33,15 @@ jobs:
   interop:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25.x'
       - name: Install libRIST build dependencies
         run: sudo apt-get update && sudo apt-get install -y meson ninja-build nasm
       - name: Cache libRIST build
         id: librist-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/librist
           key: librist-${{ runner.os }}-v0.2.18
