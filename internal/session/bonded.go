@@ -291,8 +291,12 @@ func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, b
 		}
 		return
 	}
-	isMedia, pkt, fbs, err := s.main.decodeMain(bi.data, s.highestSent)
+	isMedia, pkt, fbs, bn, err := s.main.decodeMain(bi.data, s.highestSent)
 	if err != nil {
+		return
+	}
+	if bn != nil {
+		s.handleBufferNeg(*bn)
 		return
 	}
 	if isMedia {
@@ -352,8 +356,12 @@ func (s *Session) handleBondAdvGRE(now clock.Timestamp, idx uint8, data []byte) 
 		}
 		return
 	}
-	isMedia, pkt, fbs, err := s.advGRE.decodeMain(data, s.highestSent)
+	isMedia, pkt, fbs, bn, err := s.advGRE.decodeMain(data, s.highestSent)
 	if err != nil {
+		return
+	}
+	if bn != nil {
+		s.handleBufferNeg(*bn)
 		return
 	}
 	if isMedia {

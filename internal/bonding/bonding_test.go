@@ -7,12 +7,13 @@ import (
 )
 
 const (
-	testTimeout = 2000 * clock.Millisecond // libRIST session_timeout default
-	testRTTMin  = 5 * clock.Millisecond
-	testRTTMax  = 500 * clock.Millisecond
+	testTimeout  = 2000 * clock.Millisecond // libRIST session_timeout default
+	testDupGrace = 1000 * clock.Millisecond // libRIST hard_dead recovery_buffer grace
+	testRTTMin   = 5 * clock.Millisecond
+	testRTTMax   = 500 * clock.Millisecond
 )
 
-func newGroup() *Group { return NewGroup(testTimeout, testRTTMin, testRTTMax) }
+func newGroup() *Group { return NewGroup(testTimeout, testDupGrace, testRTTMin, testRTTMax) }
 
 // at converts a microsecond duration into a clock.Timestamp instant.
 func at(d clock.Microseconds) clock.Timestamp { return clock.Timestamp(d) }
@@ -246,11 +247,23 @@ func TestDuplicateTargets(t *testing.T) {
 		t.Fatalf("never-seen DuplicateTargets = %v, want [0 1]", got)
 	}
 
-	g.Observe(0, at(0)) // path 0 last seen at t=0 (will be dead at late)
-	late := at(testTimeout + 100*clock.Millisecond)
-	g.Observe(1, late) // path 1 fresh
+	g.Observe(0, at(0)) // path 0 last seen at t=0 (hard-dead at testTimeout+testDupGrace)
+	// Past session_timeout but within the duplicate grace: path 0 is reported dead
+	// for liveness/NACK routing, yet its 2022-7 redundancy persists, so it is STILL
+	// a duplicate target (libRIST's hard_dead grace).
+	inGrace := at(testTimeout + 100*clock.Millisecond)
+	g.Observe(1, inGrace) // path 1 fresh
+	if g.Alive(0, inGrace) {
+		t.Fatal("path 0 still Alive past session_timeout")
+	}
+	if got := g.DuplicateTargets(inGrace); !equalU8(got, []uint8{0, 1}) {
+		t.Fatalf("DuplicateTargets within grace = %v, want [0 1] (redundancy held)", got)
+	}
+	// Past session_timeout + grace: path 0 is hard-dead and pruned from the fan-out.
+	late := at(testTimeout + testDupGrace + 1)
+	g.Observe(1, late) // keep path 1 fresh
 	if got := g.DuplicateTargets(late); !equalU8(got, []uint8{1}) {
-		t.Fatalf("DuplicateTargets after path 0 death = %v, want [1]", got)
+		t.Fatalf("DuplicateTargets after path 0 hard-death = %v, want [1]", got)
 	}
 }
 

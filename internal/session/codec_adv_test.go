@@ -374,3 +374,82 @@ func TestDropAdvEchoRequests(t *testing.T) {
 		t.Fatalf("kept %d feedback items, want 3 (NACK, echo response, link quality)", len(got))
 	}
 }
+
+// TestDecodeControlUnsupported verifies the §5.3.10 dispatch: an unrecognized
+// control index is surfaced as a wire.UnsupportedControl (so the host originates a
+// response), while an inbound Unsupported (0x8020) is absorbed with no signal so a
+// response can never loop.
+func TestDecodeControlUnsupported(t *testing.T) {
+	_, rx := advCodecPair(t, false, false)
+
+	// An unknown CI with a body → one UnsupportedControl echoing the CI + head.
+	const unknownCI = 0x7abc
+	body := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03}
+	fbs, err := rx.decodeControl(adv.BuildControl(nil, unknownCI, body))
+	if err != nil {
+		t.Fatalf("decodeControl(unknown): %v", err)
+	}
+	if len(fbs) != 1 {
+		t.Fatalf("unknown CI produced %d feedback, want 1", len(fbs))
+	}
+	u, ok := fbs[0].(wire.UnsupportedControl)
+	if !ok {
+		t.Fatalf("unknown CI produced %T, want wire.UnsupportedControl", fbs[0])
+	}
+	if u.CI != unknownCI {
+		t.Errorf("UnsupportedControl.CI = %#x, want %#x", u.CI, unknownCI)
+	}
+	if want := ([6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02}); u.Head != want {
+		t.Errorf("UnsupportedControl.Head = % x, want % x", u.Head, want)
+	}
+
+	// An inbound Unsupported must NOT yield a signal (no response loop).
+	un := adv.BuildUnsupported(nil, adv.Unsupported{ResponderSSRC: 0x55, IncomingCI: unknownCI})
+	fbs, err = rx.decodeControl(un)
+	if err != nil {
+		t.Fatalf("decodeControl(Unsupported): %v", err)
+	}
+	if len(fbs) != 0 {
+		t.Fatalf("inbound Unsupported produced %d feedback, want 0 (no loop)", len(fbs))
+	}
+}
+
+// TestAdvSendNonceAnnounce verifies the send-side PSK Future Nonce trigger: when
+// the Advanced send key rotates to a fresh nonce on a media packet, the codec
+// queues exactly one announcement (the new nonce + key size) for the host.
+func TestAdvSendNonceAnnounce(t *testing.T) {
+	sendKey, err := crypto.NewKey([]byte("rotate-each-packet"), crypto.KeySize128, 1, false)
+	if err != nil {
+		t.Fatalf("NewKey: %v", err)
+	}
+	c := newAdvCodec(sendKey, nil, false, advTestSSRC, 1971, 1968)
+	pkt := wire.MediaPacket{Seq: 1, SSRC: advTestSSRC, Payload: []byte{1, 2, 3, 4}}
+
+	if _, _, ok := c.takeNonceAnnounce(); ok {
+		t.Fatal("announce pending before any encode")
+	}
+	if _, err := c.encodeAdvMedia(nil, pkt); err != nil {
+		t.Fatalf("encode #1: %v", err)
+	}
+	if _, _, ok := c.takeNonceAnnounce(); ok {
+		t.Fatal("announce after the first packet (no rotation expected yet)")
+	}
+
+	pkt.Seq = 2
+	if _, err := c.encodeAdvMedia(nil, pkt); err != nil {
+		t.Fatalf("encode #2: %v", err)
+	}
+	nonce, bits, ok := c.takeNonceAnnounce()
+	if !ok {
+		t.Fatal("no announcement queued after the key rotated")
+	}
+	if bits != crypto.KeySize128 {
+		t.Errorf("announced key bits = %d, want %d", bits, crypto.KeySize128)
+	}
+	if nonce == ([crypto.NonceSize]byte{}) {
+		t.Error("announced a zero nonce")
+	}
+	if _, _, ok := c.takeNonceAnnounce(); ok {
+		t.Fatal("announcement not cleared after being taken")
+	}
+}

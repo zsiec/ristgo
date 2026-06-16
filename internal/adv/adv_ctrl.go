@@ -26,10 +26,11 @@ package adv
 //     trailing entries). EncodeRangeNACK / EncodeBitmaskNACK therefore return a
 //     SLICE of single-entry messages — the host sends one datagram each — rather
 //     than packing several entries into one body.
-//   - The Unsupported message (CI 0x8020) writes 16 body bytes but stamps its
-//     Length field as 12. ParseControl tolerates a Length shorter than the bytes
-//     present, so this libRIST quirk decodes without error; ristgo does not
-//     originate Unsupported.
+//   - The Unsupported message (CI 0x8020) writes 16 body bytes but libRIST stamps
+//     its Length field as 12. ParseControl tolerates a Length shorter than the
+//     bytes present, so this libRIST quirk decodes without error; ristgo originates
+//     Unsupported (BuildUnsupported) with the honest Length of 16, which libRIST
+//     still parses (it reads only the leading fields).
 
 import (
 	"encoding/binary"
@@ -68,6 +69,9 @@ const (
 	// pskNonceBodySize is the PSK future-nonce body: Nonce(4)+KeySize(2)+
 	// Reserved(2).
 	pskNonceBodySize = 8
+	// unsupportedHeadLen is the number of leading bytes of the offending control
+	// body echoed back in an Unsupported response (the spec's "first 48 bits").
+	unsupportedHeadLen = 6
 
 	// maxNACKDecodeRange bounds the sequences a single range NACK expands to on
 	// decode, mirroring libRIST's i<10000 recovery cap so a hostile or corrupt
@@ -435,6 +439,36 @@ func BuildKeepalive(dst []byte, k Keepalive) []byte {
 // BuildPSKNonce frames a PSK future-nonce control payload.
 func BuildPSKNonce(dst []byte, p PSKNonce) []byte {
 	return BuildControl(dst, CIPSKNonce, p.appendBody(nil))
+}
+
+// Unsupported is a Control Message Unsupported Response (CIUnsupported, TR-06-3
+// §5.3.10): a receiver sends it in reply to a control message whose Control Index
+// it does not recognize, echoing the offending CI and the first 48 bits of its
+// body so the sender can correlate the report.
+type Unsupported struct {
+	// ResponderSSRC is the (unprotected/odd) SSRC of the responder.
+	ResponderSSRC uint32
+	// IncomingCI is the unrecognized control index being reported.
+	IncomingCI uint16
+	// Head holds the first up-to-6 bytes of the offending control body, zero-padded.
+	Head [unsupportedHeadLen]byte
+}
+
+// appendBody appends the 16-byte Unsupported body: Responder SSRC(4), incoming
+// CI(2), Reserved(2), first 48 bits of the offending body(6), Padding(2). (libRIST
+// writes these 16 bytes but under-stamps its Length field as 12; ristgo stamps the
+// honest 16 via BuildControl, which libRIST still parses correctly.)
+func (u Unsupported) appendBody(dst []byte) []byte {
+	dst = binary.BigEndian.AppendUint32(dst, u.ResponderSSRC)
+	dst = binary.BigEndian.AppendUint16(dst, u.IncomingCI)
+	dst = append(dst, 0, 0) // reserved
+	dst = append(dst, u.Head[:]...)
+	return append(dst, 0, 0) // padding to a 32-bit boundary
+}
+
+// BuildUnsupported frames a Control Message Unsupported Response payload.
+func BuildUnsupported(dst []byte, u Unsupported) []byte {
+	return BuildControl(dst, CIUnsupported, u.appendBody(nil))
 }
 
 // BuildFlowAttr frames a Flow Attribute control payload (CIFlowAttr, TR-06-3

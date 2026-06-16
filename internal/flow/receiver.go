@@ -176,12 +176,145 @@ type receiverState struct {
 	nackTokenBurst float64
 	nackTokens     float64
 	nackTokensTime clock.Timestamp
+
+	// Recovery-buffer auto-scaling (libRIST _librist_receiver_buffer_calc),
+	// active only when the buffer is windowed (RecoveryBufferMin !=
+	// RecoveryBufferMax) and a sender max has been learned via buffer
+	// negotiation. senderMaxBuffer is libRIST's sender_max_buffer_ticks (the
+	// largest buffer the sender retains for retransmission, so the receiver never
+	// sizes past what can be recovered); 0 means not yet learned, which keeps the
+	// buffer at the static midpoint. lossSnap/recoveredSnap hold the cumulative
+	// Lost/Recovered counters at the previous recalc, so the loss-growth modifier
+	// sees the per-period delta (libRIST's stats_instant.lost/recovered).
+	senderMaxBuffer clock.Microseconds
+	lossSnap        uint64
+	recoveredSnap   uint64
 }
 
 // pathBit returns the pathSeen bit for a path index (aliasing mod 64; see
 // slot.pathSeen).
 func pathBit(path uint8) uint64 {
 	return 1 << (path & 63)
+}
+
+// Auto-scaling tuning constants (libRIST _librist_receiver_buffer_calc's "magic
+// numbers", which its own comment notes "still need tuning"):
+const (
+	// bufferDecreaseStep caps how much the auto-scaled recovery buffer may shrink
+	// in one recalculation (libRIST's 50 ms clamp), so a transient RTT dip cannot
+	// abruptly collapse the playout deadline and shed packets still in flight.
+	bufferDecreaseStep = 50 * clock.Millisecond
+	// bufferGrowthPerLost / bufferGrowthPerRecovered weight the buffer-growth
+	// modifier by the per-period lost and recovered counts (libRIST +5% per lost,
+	// +2% per recovered; ristgo folds libRIST's recovered_3nack/recovered_morenack
+	// classes into one Recovered delta at the morenack weight).
+	bufferGrowthPerLost      = 0.05
+	bufferGrowthPerRecovered = 0.02
+	// bufferHighLossThreshold is the per-period lost count above which the receiver
+	// jumps straight to the sender's max buffer (libRIST has_high_loss).
+	bufferHighLossThreshold = 25
+)
+
+// SetSenderMaxBuffer records the maximum buffer (in local clock units) the peer
+// retains as a sender, learned from an inbound buffer-negotiation message
+// (libRIST sender_max_buffer_ticks). It enables receiver-side recovery-buffer
+// auto-scaling, which never sizes the playout buffer past what the sender can
+// retransmit. Per libRIST, a value below RecoveryBufferMin disables negotiation
+// (the receiver falls back to the static midpoint). Receiver-role only.
+func (f *Flow) SetSenderMaxBuffer(maxBuffer clock.Microseconds) {
+	if f.role != RoleReceiver {
+		return
+	}
+	if maxBuffer < f.cfg.RecoveryBufferMin {
+		f.receiver.senderMaxBuffer = 0
+		return
+	}
+	if f.receiver.senderMaxBuffer == 0 {
+		// Activation (scaling was off): baseline the loss counters so the first
+		// recalc's modifier measures loss over the period since auto-scaling turned
+		// on, not all loss accrued since the flow started (which would spuriously
+		// trip the high-loss jump after a lossy startup/handshake).
+		f.receiver.lossSnap = f.stats.Lost
+		f.receiver.recoveredSnap = f.stats.Recovered
+	}
+	f.receiver.senderMaxBuffer = maxBuffer
+}
+
+// CurrentRecoveryBuffer returns the receiver's current recovery (playout) buffer
+// duration — the static midpoint until auto-scaling activates, then the
+// dynamically sized value. The host reads it to advertise the receiver's current
+// buffer back to the sender via buffer negotiation (libRIST's (0, desired)
+// message). It is the live value the too-late and NACK-abandon thresholds use.
+func (f *Flow) CurrentRecoveryBuffer() clock.Microseconds { return f.recoveryBuffer }
+
+// autoScaleBuffer recomputes the recovery (playout) buffer from the smoothed RTT
+// and recent loss, porting libRIST's _librist_receiver_buffer_calc. It runs only
+// for a receiver with a windowed buffer (RecoveryBufferMin != RecoveryBufferMax),
+// a positive RTTMultiplier, and a sender max learned via buffer negotiation;
+// otherwise the static midpoint set in New stands. It is called on the receiver's
+// periodic RTT-echo timer (~100 ms, libRIST recomputes on a periodic timer not on
+// echo receipt), so the loss-growth modifier sees the loss accrued over that
+// period and the buffer keeps adapting even if echo responses stop arriving.
+//
+// The deadline of an already-buffered packet is fixed at its insertion (each slot
+// stores its own outputTime), so changing the buffer here only affects packets
+// inserted afterward and the live too-late / NACK-abandon thresholds — never
+// retroactively re-dating a packet, which preserves the in-order/no-late-delivery
+// invariants. Growth is unbounded within [min, max]; shrink is rate-limited.
+func (f *Flow) autoScaleBuffer() {
+	if f.role != RoleReceiver || f.cfg.RTTMultiplier <= 0 {
+		return
+	}
+	if f.cfg.RecoveryBufferMin == f.cfg.RecoveryBufferMax {
+		return
+	}
+	senderMax := f.receiver.senderMaxBuffer
+	if senderMax <= 0 {
+		// Auto-scaling activates only once the sender advertises the buffer it
+		// retains; until then the receiver holds the static midpoint.
+		return
+	}
+
+	// desired = smoothedRTT * multiplier + reorder (libRIST eight_times_rtt/8 *
+	// rtt_mult + recovery_reorder_buffer). The smoothed RTT is read unclamped, as
+	// libRIST does here (the [rtt_min, rtt_max] clamp paces NACK retries, not the
+	// buffer sizing).
+	desired := f.est.Smoothed()*clock.Microseconds(f.cfg.RTTMultiplier) + f.cfg.ReorderBuffer
+
+	// Loss-driven growth over the period since the last recalc (libRIST's magic
+	// per-packet modifiers, "still need tuning" in its own words). ristgo folds
+	// libRIST's recovered_3nack/recovered_morenack classes into one Recovered
+	// delta at the morenack weight (0.02) — it does not split recoveries by NACK
+	// count — which errs slightly toward a larger buffer, the safe direction.
+	lostDelta := f.stats.Lost - f.receiver.lossSnap
+	recoveredDelta := f.stats.Recovered - f.receiver.recoveredSnap
+	modifier := 1.0 + float64(lostDelta)*bufferGrowthPerLost + float64(recoveredDelta)*bufferGrowthPerRecovered
+	desired = clock.Microseconds(float64(desired) * modifier)
+	if lostDelta > bufferHighLossThreshold {
+		// Heavy loss: jump straight to the largest buffer the sender supports
+		// (libRIST's has_high_loss branch).
+		desired = senderMax
+	}
+
+	// Rate-limit the decrease so a brief RTT dip cannot collapse the deadline.
+	if cur := f.recoveryBuffer; desired < cur && cur-desired > bufferDecreaseStep {
+		desired = cur - bufferDecreaseStep
+	}
+
+	// Clamp to the configured window, then to what the sender retains.
+	if desired < f.cfg.RecoveryBufferMin {
+		desired = f.cfg.RecoveryBufferMin
+	} else if desired > f.cfg.RecoveryBufferMax {
+		desired = f.cfg.RecoveryBufferMax
+	}
+	if desired > senderMax {
+		desired = senderMax
+	}
+
+	f.recoveryBuffer = desired
+	f.recoveryBuffer110 = mul110(desired)
+	f.receiver.lossSnap = f.stats.Lost
+	f.receiver.recoveredSnap = f.stats.Recovered
 }
 
 // mapSourceTime converts a packet's NTP-64 source timestamp into the local
@@ -196,6 +329,17 @@ func (f *Flow) mapSourceTime(sourceTime uint64) clock.Timestamp {
 // scheduling.
 func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	r := &f.receiver
+	// Flow-id change (libRIST "Detected flow id change ... resetting state"): a
+	// started flow that receives a fresh packet bearing a different flow id (the
+	// SSRC with the retransmit LSB masked) is seeing a new source flow — a sender
+	// restart with a new SSRC, or a different sender taking over the tuple. Discard
+	// the buffered state and re-anchor on the new flow rather than merging two
+	// distinct flows into one ring (which would corrupt dedup and playout). A
+	// retransmit cannot anchor a flow, so it never triggers a reset.
+	if r.started && !pkt.Retransmit && (pkt.SSRC&^1) != (r.ssrc&^1) {
+		f.resetReceiver()
+		f.stats.FlowResets++
+	}
 	if !r.started {
 		// A flow cannot start on a retransmit.
 		if pkt.Retransmit {
@@ -356,6 +500,26 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 
 	f.armPlayout(s.outputTime)
 	f.scheduleNack(now)
+}
+
+// resetReceiver discards all buffered receiver state on a flow-id change
+// (libRIST clears receiver_queue_has_items), so the next packet re-anchors a
+// fresh flow. It clears the ring (no stale slot from the old flow can be
+// delivered or deduped against the new one), drops the missing queue and all
+// cursors, and disarms the playout/NACK timers so start re-arms them at the new
+// flow's deadlines. It preserves what is a property of the link, not the flow:
+// the ring allocation, the RTT estimator and auto-scaled recovery buffer, the
+// negotiated sender max, and the return-bandwidth limiter.
+func (f *Flow) resetReceiver() {
+	r := &f.receiver
+	for i := range r.ring {
+		r.ring[i] = slot{}
+	}
+	r.missingHead, r.missingTail, r.missingCount = nil, nil, 0
+	r.started = false
+	r.pendingDiscontinuity = false
+	r.playoutArmed = false
+	r.nackArmed = false
 }
 
 // start performs first-packet initialization, mirroring receiver_enqueue's

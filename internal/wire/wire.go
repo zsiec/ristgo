@@ -260,13 +260,26 @@ type PeerIdentity struct {
 	CNAME string
 }
 
+// UnsupportedControl signals that an inbound Advanced-profile control message
+// carried a Control Index the codec does not recognize (TR-06-3 §5.3.10). It is a
+// host concern, not flow input: the host intercepts it (feedAdvFeedback) and
+// originates a Control Message Unsupported Response echoing CI and Head, so the
+// peer learns the message was not understood.
+type UnsupportedControl struct {
+	// CI is the unrecognized control index.
+	CI uint16
+	// Head is the first up-to-6 bytes of the offending control body, zero-padded.
+	Head [6]byte
+}
+
 // Marker-method implementations sealing the Feedback variant set.
-func (NackRequest) isFeedback()     {}
-func (LinkQuality) isFeedback()     {}
-func (FlowAttribute) isFeedback()   {}
-func (PeerIdentity) isFeedback()    {}
-func (RttEchoRequest) isFeedback()  {}
-func (RttEchoResponse) isFeedback() {}
-func (SenderReport) isFeedback()    {}
-func (Keepalive) isFeedback()       {}
-func (ExtSeq) isFeedback()          {}
+func (NackRequest) isFeedback()        {}
+func (LinkQuality) isFeedback()        {}
+func (FlowAttribute) isFeedback()      {}
+func (PeerIdentity) isFeedback()       {}
+func (UnsupportedControl) isFeedback() {}
+func (RttEchoRequest) isFeedback()     {}
+func (RttEchoResponse) isFeedback()    {}
+func (SenderReport) isFeedback()       {}
+func (Keepalive) isFeedback()          {}
+func (ExtSeq) isFeedback()             {}

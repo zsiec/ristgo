@@ -123,10 +123,19 @@ func TestParseURLErrors(t *testing.T) {
 // honors but ristgo does not yet implement are accepted and ignored (not
 // rejected), so a URL authored for libRIST still parses.
 func TestParseURLAcceptsUnimplementedLibristParams(t *testing.T) {
-	// recovery-priority is the lone accept-and-ignore param (set via BondedPeer).
-	raw := "rist://h:5000?buffer=1000&recovery-priority=5"
-	if _, _, err := ParseURL(raw, DefaultConfig()); err != nil {
-		t.Fatalf("ParseURL(%q) = %v, want nil (unimplemented libRIST params should be ignored)", raw, err)
+	// Each is a libRIST URL parameter ristgo does not implement but accepts and
+	// ignores so a libRIST-authored URL still parses: recovery-priority (set via
+	// BondedPeer), reflector (Main one-to-many fan-out), local-port (caller fixed
+	// source port).
+	for _, raw := range []string{
+		"rist://h:5000?buffer=1000&recovery-priority=5",
+		"rist://h:5000?reflector=1",
+		"rist://h:5000?local-port=5004",
+		"rist://h:5000?reflector=1&local-port=5004&recovery-priority=2",
+	} {
+		if _, _, err := ParseURL(raw, DefaultConfig()); err != nil {
+			t.Fatalf("ParseURL(%q) = %v, want nil (unimplemented libRIST params should be ignored)", raw, err)
+		}
 	}
 }
 

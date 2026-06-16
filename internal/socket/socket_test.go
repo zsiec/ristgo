@@ -74,8 +74,8 @@ func TestMediaAndRTCPRoundTrip(t *testing.T) {
 		t.Fatalf("WriteRTCP: %v", err)
 	}
 
-	rx.media.SetReadDeadline(time.Now().Add(time.Second))
-	rx.rtcp.SetReadDeadline(time.Now().Add(time.Second))
+	rx.media.Load().SetReadDeadline(time.Now().Add(time.Second))
+	rx.rtcp.Load().SetReadDeadline(time.Now().Add(time.Second))
 
 	buf := make([]byte, 64)
 	n, src, err := rx.ReadMedia(buf)
@@ -120,8 +120,8 @@ func TestListenEphemeralEvenOdd(t *testing.T) {
 	}
 	defer c.Close()
 
-	mp := c.media.LocalAddr().(*net.UDPAddr).Port
-	rp := c.rtcp.LocalAddr().(*net.UDPAddr).Port
+	mp := c.media.Load().LocalAddr().(*net.UDPAddr).Port
+	rp := c.rtcp.Load().LocalAddr().(*net.UDPAddr).Port
 	if mp%2 != 0 {
 		t.Errorf("media port %d is not even", mp)
 	}

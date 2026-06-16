@@ -146,6 +146,15 @@ type Config struct {
 	RTTMin clock.Microseconds
 	RTTMax clock.Microseconds
 
+	// RTTMultiplier is libRIST's recovery_rtt_multiplier (default 7): the factor
+	// by which the receiver scales its smoothed RTT when dynamically auto-sizing
+	// the recovery (playout) buffer. It is consumed only when the buffer is
+	// windowed (RecoveryBufferMin != RecoveryBufferMax) and the peer has
+	// advertised a sender max via buffer negotiation; otherwise the buffer is the
+	// static midpoint and this value is unused. See Flow.autoScaleBuffer
+	// (libRIST _librist_receiver_buffer_calc). 0 disables auto-scaling.
+	RTTMultiplier int
+
 	// MinRetries is libRIST's min_retries. It gates congestion-control
 	// behavior on the sender side and is unused by the receiver half.
 	MinRetries int
@@ -236,6 +245,7 @@ func DefaultConfig() Config {
 		ReorderBuffer:      15 * clock.Millisecond,
 		RTTMin:             5 * clock.Millisecond,
 		RTTMax:             500 * clock.Millisecond,
+		RTTMultiplier:      7,
 		MinRetries:         6,
 		MaxRetries:         20,
 		RecoveryMaxBitrate: 100000,
@@ -250,6 +260,14 @@ func DefaultConfig() Config {
 // default 1000/1000 ms window this is 1000 ms.
 func (c Config) RecoveryBuffer() clock.Microseconds {
 	return (c.RecoveryBufferMax-c.RecoveryBufferMin)/2 + c.RecoveryBufferMin
+}
+
+// mul110 multiplies a microsecond duration by 1.1 with the same float64
+// multiply-then-truncate libRIST uses for its too-late / NACK-abandon threshold
+// (recovery_buffer_ticks * 1.1). Shared by New and autoScaleBuffer so the static
+// and dynamically-resized recovery buffers compute the threshold identically.
+func mul110(d clock.Microseconds) clock.Microseconds {
+	return clock.Microseconds(float64(d) * 1.1)
 }
 
 // Flow is the deterministic state machine for one RIST flow (one role).
@@ -301,9 +319,7 @@ func New(role Role, cfg Config) *Flow {
 		recoveryBuffer: cfg.RecoveryBuffer(),
 		est:            rtt.New(cfg.RTTMin),
 	}
-	// Same arithmetic as libRIST's (recovery_buffer_ticks * 1.1) double
-	// multiply with truncation.
-	f.recoveryBuffer110 = clock.Microseconds(float64(f.recoveryBuffer) * 1.1)
+	f.recoveryBuffer110 = mul110(f.recoveryBuffer)
 	f.missingCounterMax = deriveMissingCounterMax(cfg)
 	f.maxNacksPerLoop = deriveMaxNacksPerLoop(cfg)
 	size := cfg.RingSize
@@ -461,6 +477,11 @@ func (f *Flow) HandleTimer(now clock.Timestamp, id TimerID) {
 				FB:   wire.RttEchoRequest{Timestamp: uint64(clock.NTPTimeFromTimestamp(now))},
 			})
 			f.outputs.push(SetTimer{ID: TimerRttEcho, Deadline: now.Add(rttEchoInterval)})
+			// Re-size the recovery buffer on this guaranteed ~100 ms receiver heartbeat
+			// (libRIST recomputes its buffer on a periodic timer, not on echo receipt),
+			// so it keeps adapting to loss even if echo responses stop arriving. A no-op
+			// unless the buffer is windowed and a sender max has been negotiated.
+			f.autoScaleBuffer()
 		}
 	default:
 		// A timer ID this stage did not arm (e.g. a stale or future

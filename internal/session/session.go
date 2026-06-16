@@ -247,6 +247,16 @@ type Session struct {
 	announce bool
 	mdec     mediaDecoder
 
+	// callerRebind marks a single-socket (Main/Advanced) caller-receiver that may
+	// recover its own NAT/dynamic-IP source-port rebind by re-binding its socket
+	// instead of timing out (libRIST's try_caller_socket_rebind). Set only for a
+	// dialed caller-receiver without SRP (an SRP session recovers via the
+	// listener-side reassociation path). rebindAttempts/lastRebind drive the
+	// linear backoff.
+	callerRebind   bool
+	rebindAttempts uint32
+	lastRebind     clock.Timestamp
+
 	// dtlsReady is closed by loop after the optional Main-profile DTLS handshake
 	// completes (or fails), gating the reader goroutine so it never touches the
 	// socket while the handshake owns it.
@@ -268,7 +278,11 @@ type Session struct {
 	remoteCaps        gre.Capabilities
 	remoteMAC         [6]byte
 	senderMaxBufferMs uint16
-	greBurstSent      bool
+	// advertisedBufMs is the receiver buffer (ms) last advertised to the sender
+	// via buffer negotiation; the periodic tick re-advertises only when the
+	// auto-scaled buffer changes, so a steady buffer emits no redundant control.
+	advertisedBufMs uint16
+	greBurstSent    bool
 
 	// adv is the Advanced-profile codec, non-nil in Advanced mode. Like main it
 	// reads/writes one UDP socket, demuxing media vs control by the
@@ -549,6 +563,7 @@ func NewMainReceiverCaller(conn *socket.Conn, remote netip.AddrPort, cfg Config)
 	s.peer.Media = remote
 	s.peer.RTCP = remote
 	s.announce = true
+	s.callerRebind = s.eapClient == nil && s.eapServer == nil // SRP recovers via the listener path
 	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
 	s.start()
 	return s
@@ -562,6 +577,7 @@ func NewAdvReceiverCaller(conn *socket.Conn, remote netip.AddrPort, cfg Config) 
 	s.peer.Media = remote
 	s.peer.RTCP = remote
 	s.announce = true
+	s.callerRebind = s.eapClient == nil && s.eapServer == nil // SRP recovers via the listener path
 	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
 	s.start()
 	return s
@@ -889,8 +905,16 @@ func (s *Session) loop() {
 					return
 				}
 			} else if s.peer.Expired(now) {
-				s.shutdown(s.cfg.ErrSessionTimeout)
-				return
+				// A rebind-eligible caller-receiver recovers its own NAT/dynamic-IP
+				// source-port change by re-binding its socket instead of tearing the
+				// session down (preserving the buffer). Only when that is not possible
+				// (or not eligible) does the session time out.
+				if s.maybeRebindCaller(now) {
+					// Rebound (or backing off): keep the session alive.
+				} else {
+					s.shutdown(s.cfg.ErrSessionTimeout)
+					return
+				}
 			}
 			// Emit a periodic keepalive. Bonding ages its paths and sends every
 			// interval (a sender must keep advertising its return address on all
@@ -916,6 +940,18 @@ func (s *Session) loop() {
 			// trigger carrying a victim source cannot turn this into a reflection.
 			if s.main != nil && s.bond == nil && s.peer.RTCP.IsValid() && !s.reauthing {
 				s.sendGREKeepalive(s.greVersion)
+				// A receiver re-advertises its (auto-scaled) recovery buffer to the
+				// sender when it changes (libRIST's (0, desired) buffer negotiation).
+				if !s.sender && s.flow != nil {
+					// Advertise only on an actual send (sendReceiverBufferNeg no-ops until
+					// the GRE version reaches v2); latching advertisedBufMs on a no-op would
+					// suppress the first real advert after the upgrade.
+					if cur := uint16(s.flow.CurrentRecoveryBuffer() / clock.Millisecond); cur != s.advertisedBufMs {
+						if s.sendReceiverBufferNeg(cur) {
+							s.advertisedBufMs = cur
+						}
+					}
+				}
 			}
 			// A receiver that opted into source adaptation emits a Link Quality
 			// Message each interval (TR-06-4 Part 1).
@@ -1031,8 +1067,30 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		s.logAt(LogWarning, CatSocket, "write media: %v", err)
 	}
 	s.lastTx = now
+	if s.adv != nil {
+		s.maybeAnnounceAdvNonce(now) // PSK Future Nonce, if this packet rotated the key
+	}
 	if s.fecEnabled() {
 		s.fecOnSend(now, pkt, b) // generate row/column FEC from this original media
+	}
+}
+
+// maybeAnnounceAdvNonce sends a PSK Future Nonce Announcement (TR-06-3 §5.3.9) when
+// the Advanced send key has just rotated to a fresh nonce, so the peer can
+// pre-derive the new AES key (skipping the PBKDF2 cost) before — or as — the first
+// data packet under it arrives. A no-op when no rotation is pending.
+func (s *Session) maybeAnnounceAdvNonce(now clock.Timestamp) {
+	nonce, bits, ok := s.adv.takeNonceAnnounce()
+	if !ok || !s.peer.RTCP.IsValid() {
+		return
+	}
+	dg, err := s.adv.pskNonceDatagram(adv.PSKNonce{Nonce: nonce, KeyBits: uint16(bits)}, advCtrlTS(now))
+	if err != nil {
+		s.logf("adv: encode psk future-nonce: %v", err)
+		return
+	}
+	if werr := s.conn.WriteMedia(dg, s.peer.RTCP); werr != nil {
+		s.logf("adv: write psk future-nonce: %v", werr)
 	}
 }
 
@@ -1283,9 +1341,13 @@ func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
 		}
 		return
 	}
-	isMedia, pkt, fbs, err := s.advGRE.decodeMain(data, s.highestSent)
+	isMedia, pkt, fbs, bn, err := s.advGRE.decodeMain(data, s.highestSent)
 	if err != nil {
 		return // keepalive or otherwise not a GRE media/RTCP datagram; ignore
+	}
+	if bn != nil {
+		s.handleBufferNeg(*bn)
+		return
 	}
 	if isMedia {
 		// libRIST does not send GRE-framed media in Advanced mode; accept it
@@ -1299,7 +1361,42 @@ func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
 // feedAdvFeedback feeds decoded feedback to the flow on the Advanced path,
 // dropping any inbound RTT-echo *request* first (see dropAdvEchoRequests).
 func (s *Session) feedAdvFeedback(now clock.Timestamp, fbs []wire.Feedback) {
-	s.feedFeedback(now, dropAdvEchoRequests(fbs))
+	// Intercept any UnsupportedControl signal: the codec emits it for an inbound
+	// control message whose CI we do not recognize, and the host replies with a
+	// Control Message Unsupported Response (TR-06-3 §5.3.10). It is filtered out
+	// before the rest reaches the flow.
+	out := fbs[:0]
+	for _, fb := range fbs {
+		if u, ok := fb.(wire.UnsupportedControl); ok {
+			s.sendAdvUnsupported(now, u)
+			continue
+		}
+		out = append(out, fb)
+	}
+	s.feedFeedback(now, dropAdvEchoRequests(out))
+}
+
+// sendAdvUnsupported originates a Control Message Unsupported Response to the peer,
+// echoing the unrecognized control index and the head of its body. Gated on an
+// authenticated, address-known peer so it cannot be turned into a reflection.
+func (s *Session) sendAdvUnsupported(now clock.Timestamp, u wire.UnsupportedControl) {
+	if s.adv == nil || !s.peer.RTCP.IsValid() || !s.authed.Load() {
+		return
+	}
+	dg, err := s.adv.unsupportedDatagram(adv.Unsupported{
+		ResponderSSRC: s.adv.ctrlSSRC(),
+		IncomingCI:    u.CI,
+		Head:          u.Head,
+	}, advCtrlTS(now))
+	if err != nil {
+		s.logf("adv: encode unsupported response: %v", err)
+		return
+	}
+	if werr := s.conn.WriteMedia(dg, s.peer.RTCP); werr != nil {
+		s.logf("adv: write unsupported response: %v", werr)
+		return
+	}
+	s.lastTx = now
 }
 
 // dropAdvEchoRequests removes inbound RTT-echo requests from an Advanced-path
@@ -1497,6 +1594,40 @@ func (s *Session) sendBufferNegotiation() {
 			_ = s.conn.WriteMedia(b, s.peer.RTCP)
 		}
 	}
+}
+
+// handleBufferNeg applies an inbound VSF buffer-negotiation message. A non-zero
+// SenderMaxMs is a sender advertising the buffer it retains for retransmission;
+// the receiver flow uses it to bound its dynamic recovery-buffer sizing (libRIST
+// sender_max_buffer_ticks). A (0, ReceiverCurMs) message is a receiver reporting
+// its current buffer — informational on a non-reflector sender (libRIST only acts
+// on it when relaying), so ristgo records nothing further from it.
+func (s *Session) handleBufferNeg(bn gre.BufferNegotiation) {
+	if bn.SenderMaxMs == 0 {
+		return
+	}
+	s.senderMaxBufferMs = bn.SenderMaxMs
+	if s.flow != nil {
+		s.flow.SetSenderMaxBuffer(clock.Microseconds(bn.SenderMaxMs) * clock.Millisecond)
+	}
+}
+
+// sendReceiverBufferNeg advertises the receiver's current recovery buffer back to
+// the sender (libRIST's (0, desired) buffer-negotiation, emitted when the
+// auto-scaled buffer changes). It is informational for a plain sender and drives a
+// reflector relay's downstream sizing; emitting it keeps ristgo's receiver
+// wire-faithful to libRIST. Version 2 only; receiver-role Main sessions only.
+func (s *Session) sendReceiverBufferNeg(curMs uint16) bool {
+	if s.cfg.OneWay || s.main == nil || s.sender || !s.peer.RTCP.IsValid() || s.greVersion < gre.VersionCur {
+		return false
+	}
+	bn := gre.BufferNegotiation{ReceiverCurMs: curMs}
+	b, err := s.main.encodeBufferNeg(nil, bn)
+	if err != nil {
+		return false
+	}
+	_ = s.conn.WriteMedia(b, s.peer.RTCP)
+	return true
 }
 
 // handleGREControl records the peer's capabilities and MAC from an inbound GRE
@@ -1762,8 +1893,12 @@ func (s *Session) handleMainDatagram(now clock.Timestamp, d inbound) {
 		} else {
 			s.deliverOOB(proto, oob)
 		}
-	} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
-		if isMedia {
+	} else if isMedia, pkt, fbs, bn, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
+		if bn != nil {
+			// VSF buffer-negotiation: a sender advertises the buffer it retains, which
+			// the receiver flow uses to bound its dynamic recovery-buffer sizing.
+			s.handleBufferNeg(*bn)
+		} else if isMedia {
 			s.feedMedia(now, 0, pkt)
 			if s.fecEnabled() {
 				// FEC over the decoded inner RTP payload (TR-06-2 §8.6);
@@ -2014,9 +2149,10 @@ func (s *Session) readMain() {
 		return
 	default:
 	}
+	gen := s.conn.RebindGen()
 	for {
 		buf := make([]byte, maxDatagram)
-		n, src, err := s.conn.ReadMedia(buf) // single GRE socket
+		n, src, err := s.readRebindable(buf, &gen) // single GRE socket
 		if err != nil {
 			return
 		}
@@ -2028,14 +2164,105 @@ func (s *Session) readMain() {
 	}
 }
 
+// rebindBackoffCap bounds the linear backoff multiplier between caller socket
+// rebinds (libRIST REBIND_BACKOFF_CAP), so the gap between attempts stops growing
+// at rebindBackoffCap × SessionTimeout.
+const rebindBackoffCap = 10
+
+// rebindMaxAttempts bounds the number of consecutive caller socket rebinds that
+// never recover the stream before the session gives up and times out. Without it,
+// a permanently-gone sender would rebind forever (each rebind resets liveness) and
+// the consumer would never see ErrSessionTimeout. The counter resets whenever a
+// rebind recovers the stream (real traffic arrives afterward), so this bounds only
+// an unrecoverable outage, not a flapping-but-recovering link.
+const rebindMaxAttempts = 10
+
+// maybeRebindCaller attempts a caller-receiver socket rebind to recover this side's
+// own NAT/dynamic-IP source-port change (mirrors libRIST try_caller_socket_rebind).
+// It returns true when the session should be KEPT ALIVE — rebound, or deliberately
+// waiting out the backoff — and false when the session is not eligible or the
+// rebind failed and should time out. It applies only to a single-socket
+// (Main/Advanced), non-bonded, non-SRP caller-receiver, requires silence beyond
+// max(SessionTimeout, 4×keepalive), and spaces attempts by a linear backoff
+// (attempts × SessionTimeout, capped). On success it re-binds to a fresh ephemeral
+// source port, gives the new socket a full SessionTimeout to recover, and forces an
+// immediate keepalive so the sender re-learns this side's address.
+func (s *Session) maybeRebindCaller(now clock.Timestamp) bool {
+	if !s.callerRebind || s.bond != nil || (s.main == nil && s.adv == nil) {
+		return false
+	}
+	// Require silence beyond max(session_timeout, 4×keepalive) so a short
+	// session_timeout against a slower keepalive cadence cannot flap a live stream.
+	minSilence := s.cfg.SessionTimeout
+	if four := 4 * s.cfg.KeepaliveInterval; minSilence < four {
+		minSilence = four
+	}
+	if !s.peer.SilentFor(now, minSilence) {
+		return true // not silent enough to rebind yet, but keep the session alive
+	}
+	// If real traffic arrived after the last rebind, that rebind recovered the
+	// stream and this silence is a fresh event — reset the attempt counter so the
+	// new event gets a full set of attempts (and is not penalized by old backoff).
+	if !s.lastRebind.IsZero() && s.peer.LastSeen().After(s.lastRebind) {
+		s.rebindAttempts = 0
+	}
+	// A sender that is permanently gone must eventually surface ErrSessionTimeout
+	// rather than rebind forever: give up after rebindMaxAttempts consecutive
+	// rebinds that never recovered the stream (the backoff alone only caps the gap,
+	// not the count, so without this the session would never time out).
+	if s.rebindAttempts >= rebindMaxAttempts {
+		return false
+	}
+	// Linear backoff between attempts (capped), so a sender that is genuinely gone
+	// does not trigger a tight rebind loop.
+	mult := s.rebindAttempts
+	if mult > rebindBackoffCap {
+		mult = rebindBackoffCap
+	}
+	if minGap := clock.Microseconds(mult) * s.cfg.SessionTimeout; !s.lastRebind.IsZero() && now.Sub(s.lastRebind) < minGap {
+		return true // backing off; hold the session open without rebinding yet
+	}
+	if err := s.conn.Rebind(); err != nil {
+		s.logAt(LogWarning, CatSocket, "caller socket rebind failed: %v", err)
+		return false // cannot rebind (DTLS or bind error): let the session time out
+	}
+	s.rebindAttempts++
+	s.lastRebind = now
+	s.peer.Observe(now)                              // a full SessionTimeout to recover on the fresh socket
+	s.lastTx = now.Add(-2 * s.cfg.KeepaliveInterval) // force an immediate keepalive from the new source port
+	s.greBurstSent = false                           // re-probe the GRE version on the new socket (Main)
+	s.logAt(LogNote, CatSocket, "caller socket rebound (attempt %d): fresh source port for NAT/dynamic-IP recovery", s.rebindAttempts)
+	return true
+}
+
+// readRebindable reads one datagram, transparently continuing across a
+// caller-receiver socket rebind: when the underlying read fails because Rebind
+// swapped the socket (the rebind generation advanced), it retries on the fresh
+// socket; a failure WITHOUT a rebind is a genuine teardown (closed socket) and is
+// returned so the reader exits. gen tracks the generation last observed.
+func (s *Session) readRebindable(buf []byte, gen *uint64) (int, netip.AddrPort, error) {
+	for {
+		n, src, err := s.conn.ReadMedia(buf)
+		if err == nil {
+			return n, src, nil
+		}
+		if g := s.conn.RebindGen(); g != *gen {
+			*gen = g
+			continue // a rebind closed the old socket; read the new one
+		}
+		return 0, src, err
+	}
+}
+
 // readAdv reads datagrams off the single Advanced-profile UDP socket and
 // forwards them to the loop, which demuxes media vs control by the encapsulation
 // Type field. It is the Advanced-profile counterpart of readMain.
 func (s *Session) readAdv() {
 	defer s.wg.Done()
+	gen := s.conn.RebindGen()
 	for {
 		buf := make([]byte, maxDatagram)
-		n, src, err := s.conn.ReadMedia(buf) // single UDP socket
+		n, src, err := s.readRebindable(buf, &gen) // single UDP socket
 		if err != nil {
 			return
 		}

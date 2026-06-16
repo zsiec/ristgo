@@ -89,9 +89,17 @@ type Config struct {
 	// Default: 500ms. Range: 1ms-1s.
 	RTTMax time.Duration
 
-	// RTTMultiplier scales the measured RTT when sizing the recovery
-	// buffer (libRIST recovery_rtt_multiplier, "default 7, per RIST
-	// spec"). Default: 7. Range: 1-100.
+	// RTTMultiplier is libRIST's recovery_rtt_multiplier ("default 7, per
+	// RIST spec"): the factor by which the receiver scales its smoothed RTT
+	// when dynamically auto-sizing the recovery buffer. Default: 7. Range: 1-100.
+	//
+	// It takes effect only for a windowed buffer (BufferMin != BufferMax): the
+	// receiver then sizes its playout buffer toward RTT*RTTMultiplier + reorder
+	// (growing under loss), clamped to [BufferMin, BufferMax] and to the buffer
+	// the sender advertises it retains (via v2 buffer negotiation), matching
+	// libRIST. With the default equal BufferMin/BufferMax the buffer is the fixed
+	// midpoint and a libRIST receiver likewise skips auto-scaling, so the value is
+	// unused — set a window to enable adaptive latency/recovery.
 	RTTMultiplier int
 
 	// MinRetries is the minimum number of retransmission requests sent

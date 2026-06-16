@@ -169,6 +169,62 @@ func TestFourInvariantsAcrossSeqWrap(t *testing.T) {
 	}
 }
 
+// TestFourInvariantsWindowedAutoScaling drives a receiver whose recovery buffer
+// is windowed (200ms..1000ms) so it dynamically auto-scales toward
+// RTT*RTTMultiplier as RTT echoes arrive (libRIST _librist_receiver_buffer_calc),
+// rather than holding the static midpoint. The sender's retained max is supplied
+// as if by buffer negotiation. Under recoverable loss the four invariants must
+// still hold — no duplicate, in order, nothing past its (now per-packet, moving)
+// deadline, and complete — proving the moving deadline never sheds a recoverable
+// packet. Latency is intentionally non-uniform (the buffer shrinks as RTT samples
+// land), so the latency check is bounded, not uniform.
+func TestFourInvariantsWindowedAutoScaling(t *testing.T) {
+	const (
+		n    = 300
+		seed = uint64(11)
+	)
+	scfg := flow.DefaultConfig()
+	scfg.SSRC = senderSSRC
+	scfg.StartSeq = 0
+	rcfg := flow.DefaultConfig()
+	rcfg.RecoveryBufferMin = 200 * clock.Millisecond
+	rcfg.RecoveryBufferMax = 1000 * clock.Millisecond
+	rcfg.RTTMultiplier = 7
+	sender := flow.New(flow.RoleSender, scfg)
+	receiver := flow.New(flow.RoleReceiver, rcfg)
+	// Stand in for the inbound buffer negotiation: the sender retains its 1000ms
+	// recovery window, which enables and bounds the receiver's auto-scaling.
+	receiver.SetSenderMaxBuffer(1000 * clock.Millisecond)
+
+	fwd := simtest.NewLink[simtest.Datagram](simtest.LinkConfig{Delay: 10 * clock.Millisecond}, seed)
+	fwd.SetDropFilter(protectEndpoints(seed, 0, n-1, 0.1))
+	back := simtest.NewLink[simtest.Datagram](simtest.LinkConfig{Delay: 10 * clock.Millisecond}, seed^0x1234)
+	fab := simtest.NewFabric(sender, receiver, []*simtest.Link[simtest.Datagram]{fwd}, []*simtest.Link[simtest.Datagram]{back})
+	fab.EnqueueCBR(0, clock.Millisecond, n, seqPayload)
+
+	if !fab.RunUntil(func(f *simtest.Fabric) bool { return len(f.DeliveredSeqs()) >= n }, 400_000) {
+		t.Fatalf("only %d/%d delivered (Recovered=%d, Lost=%d)", len(fab.DeliveredSeqs()), n, receiver.Stats().Recovered, receiver.Stats().Lost)
+	}
+	// The buffer varies over [BufferMin, midpoint] as it converges down from the
+	// 600ms midpoint toward RTT*7, so latency is non-uniform; bound it by the max
+	// buffer plus a NACK round trip rather than requiring uniformity.
+	maxLat := rcfg.RecoveryBufferMax + 200*clock.Millisecond
+	if v := fab.CheckInvariants(simtest.InvariantOpts{LatencyTolerance: rcfg.RecoveryBufferMax, MaxLatency: maxLat, RequireContiguous: true}); len(v) != 0 {
+		t.Fatalf("windowed auto-scaling invariant violations: %v", v)
+	}
+	if !equalSeqs(fab.DeliveredSeqs(), expectedSeqs(0, n)) {
+		t.Fatalf("incomplete under recoverable loss with auto-scaling: %v", fab.DeliveredSeqs())
+	}
+	if rst := receiver.Stats(); rst.Lost != 0 || rst.Discontinuities != 0 {
+		t.Fatalf("lost/disc = %d/%d under recoverable loss, want 0/0", rst.Lost, rst.Discontinuities)
+	}
+	// Prove the feature was actually exercised: the buffer must have moved off the
+	// static midpoint (it scales down toward RTT*7 on this low-RTT link).
+	if mid := rcfg.RecoveryBuffer(); receiver.CurrentRecoveryBuffer() >= mid {
+		t.Fatalf("buffer = %v, did not auto-scale below the %v midpoint", receiver.CurrentRecoveryBuffer(), mid)
+	}
+}
+
 // TestPerfectLinkExactDelivery confirms the no-impairment baseline: every
 // packet delivered once, in order, with no retransmissions at all.
 func TestPerfectLinkExactDelivery(t *testing.T) {

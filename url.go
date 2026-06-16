@@ -281,4 +281,11 @@ var recognizedURLParams = map[string]bool{
 	// across bonded peers, set via the BondedPeer API (NewBondedReceiverPeers),
 	// not a single per-session URL value — so it is accepted and ignored here.
 	"recovery-priority": true,
+	// reflector (Main one-to-many fan-out) and local-port (caller fixed source
+	// port) are libRIST URL parameters ristgo does not implement. They are
+	// accepted and ignored rather than rejected so a URL authored for libRIST
+	// still parses, matching the recovery-priority treatment above — the
+	// alternative (a hard parse error on a valid libRIST URL) is the worse
+	// failure for URL portability.
+	"reflector": true, "local-port": true,
 }

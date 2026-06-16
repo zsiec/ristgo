@@ -2,13 +2,21 @@ package fec
 
 import "encoding/binary"
 
-// Header5 is the SMPTE ST 2022-5:2013 §7.3 FEC header (16 octets, Figure 4). It is
-// the "high bit rate" sibling of the ST 2022-1 [Header]: the XOR matrix is identical
+// Header5 is the SMPTE ST 2022-5:2012 §7.3 FEC header (16 octets, Figure 4),
+// verified field-for-field against the published standard. It is the "high bit
+// rate" (HBRMT) sibling of the ST 2022-1 [Header]: the XOR matrix is identical
 // (column FEC at Offset=L over NA=D datagrams, row FEC at Offset=1 over NA=L), but
-// the wire layout differs. The base sequence number is 16 bits (vs 24), Offset and
-// NA are 10 bits each (vs 8, raising the matrix ceiling to 1020 per dimension), and
-// the header carries explicit recovery bits for the RTP padding, extension, CSRC
-// count, and marker fields that ST 2022-1 omits.
+// the wire layout differs — ST 2022-5 uses an RFC 5109-style header. The base
+// sequence number is 16 bits (vs 24), Offset and NA are 10 bits each (vs 8,
+// raising the matrix ceiling to 1020 per dimension), and the header carries
+// explicit recovery bits for the RTP padding, extension, CSRC count, and marker
+// fields that the RFC 2733-style ST 2022-1 header omits. The exact byte layout is
+// pinned by TestHeader5MatchesSpecLayout.
+//
+// Octet layout (Figure 4): byte 0 = E(0) R(0) P X CC[4]; byte 1 = M PT[7];
+// bytes 2-3 = SN Base[16]; bytes 4-7 = TS Recovery[32]; bytes 8-9 = Length
+// Recovery[16]; bytes 10-11 = Reserved; bytes 12-13 = Offset[10] in the high bits
+// then Reserved[6]; bytes 14-15 = NA[10] in the high bits then Reserved[6].
 //
 // TR-06-3 §5.3.5 carries this header in-band under Control Index 0x0020 (row) /
 // 0x0021 (column), or on dedicated UDP ports as standard ST 2022-5. The protected

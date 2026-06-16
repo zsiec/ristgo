@@ -419,12 +419,14 @@ func applyRateAdapt(sc *session.Config, cfg Config) {
 
 // toFlowConfig maps the public Config to the deterministic core's config.
 func toFlowConfig(cfg Config) flow.Config {
+	rttMin, rttMax := effectiveRTTBounds(cfg)
 	return flow.Config{
 		RecoveryBufferMin:  clock.FromDuration(cfg.BufferMin),
 		RecoveryBufferMax:  clock.FromDuration(cfg.BufferMax),
 		ReorderBuffer:      clock.FromDuration(cfg.ReorderBuffer),
-		RTTMin:             clock.FromDuration(cfg.RTTMin),
-		RTTMax:             clock.FromDuration(cfg.RTTMax),
+		RTTMin:             rttMin,
+		RTTMax:             rttMax,
+		RTTMultiplier:      cfg.RTTMultiplier,
 		MinRetries:         cfg.MinRetries,
 		MaxRetries:         cfg.MaxRetries,
 		RecoveryMaxBitrate: cfg.MaxBitrate,
@@ -432,6 +434,39 @@ func toFlowConfig(cfg Config) flow.Config {
 		CongestionControl:  toFlowCongestion(cfg.CongestionControl),
 		TimingMode:         toFlowTiming(cfg.TimingMode),
 	}
+}
+
+// effectiveRTTBounds derives the [rtt_min, rtt_max] clamp the flow core uses,
+// applying libRIST's "rtt_min is too small for the buffer size" floor from
+// store_peer_settings: the effective recovery_rtt_min is raised to
+// recovery_length_min / max_retries whenever the configured rtt_min is below it.
+// With the defaults (BufferMin 1000 ms, MaxRetries 20) that floor is 50 ms, not
+// the configured 5 ms. The floor keeps the NACK retry cadence (1.1x the clamped
+// RTT) and the max_retries abandon budget commensurate with the buffer: without
+// it, on a low-RTT link the receiver re-NACKs an order of magnitude too often and
+// exhausts all max_retries attempts in a small fraction of the playout buffer,
+// giving up on recoverable loss far sooner than a libRIST receiver and looking
+// like a retransmit storm to a libRIST sender. (The hard 3 ms RIST_RTT_MIN floor
+// is applied separately, inside internal/rtt.) rtt_max is raised to the floored
+// rtt_min when a degenerate config would otherwise leave it below — matching
+// libRIST, which sets recovery_rtt_max = recovery_rtt_min in that case.
+//
+// The configured cfg.RTTMin is left untouched (it remains the reported value);
+// only the value handed to the core is floored, exactly as libRIST computes the
+// effective recovery_rtt_min once in store_peer_settings rather than mutating the
+// user's setting.
+func effectiveRTTBounds(cfg Config) (rttMin, rttMax clock.Microseconds) {
+	rttMin = clock.FromDuration(cfg.RTTMin)
+	if cfg.MaxRetries > 0 {
+		if floor := clock.FromDuration(cfg.BufferMin) / clock.Microseconds(cfg.MaxRetries); floor > rttMin {
+			rttMin = floor
+		}
+	}
+	rttMax = clock.FromDuration(cfg.RTTMax)
+	if rttMax < rttMin {
+		rttMax = rttMin
+	}
+	return rttMin, rttMax
 }
 
 // toFlowTiming maps the public TimingMode to the flow core's TimingMode (the

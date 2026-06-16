@@ -85,7 +85,7 @@ func TestJoinMulticastASM(t *testing.T) {
 
 	dst := netip.AddrPortFrom(group, uint16(port))
 	payload := []byte("hello multicast")
-	rx.media.SetReadDeadline(time.Now().Add(time.Second))
+	rx.media.Load().SetReadDeadline(time.Now().Add(time.Second))
 	got := false
 	for i := 0; i < 5 && !got; i++ {
 		if err := tx.WriteMedia(payload, dst); err != nil {
@@ -95,7 +95,7 @@ func TestJoinMulticastASM(t *testing.T) {
 			// other multicast-unavailable cases above.
 			t.Skipf("multicast WriteMedia failed (environment, e.g. no multicast route): %v", err)
 		}
-		rx.media.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		rx.media.Load().SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 		buf := make([]byte, 64)
 		n, src, err := rx.ReadMedia(buf)
 		if err == nil && string(buf[:n]) == string(payload) && src.IsValid() {

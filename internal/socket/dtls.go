@@ -43,9 +43,9 @@ func (c *Conn) Handshake() error {
 		// The handshake conn keeps the *net.UDPAddr internally; only the
 		// dtlsPeer crossing the ReadMedia boundary is widened to netip.AddrPort.
 		c.dtlsPeer = c.dtlsRemote.AddrPort()
-		c.dtls = dtls.Client(&connectedUDP{pc: c.media, peer: c.dtlsRemote}, c.dtlsCfg)
+		c.dtls = dtls.Client(&connectedUDP{pc: c.media.Load(), peer: c.dtlsRemote}, c.dtlsCfg)
 	} else {
-		ad, err := acceptUDP(c.media)
+		ad, err := acceptUDP(c.media.Load())
 		if err != nil {
 			return err
 		}

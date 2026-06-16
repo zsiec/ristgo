@@ -19,9 +19,11 @@
 package socket
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 
 	"github.com/zsiec/ristgo/internal/dtls"
 )
@@ -30,9 +32,19 @@ import (
 // (even port) and an RTCP socket (odd port). For the Main profile it holds one
 // socket carrying everything: media and rtcp both alias it and single is true.
 type Conn struct {
-	media  *net.UDPConn
-	rtcp   *net.UDPConn
-	single bool // Main profile: media == rtcp, one socket carries everything
+	// media and rtcp are atomic.Pointers so the single media socket can be
+	// hot-swapped under the reader goroutine by Rebind (caller-receiver NAT
+	// recovery) without racing the per-datagram Read/Write path. For the Simple
+	// profile they are distinct sockets; for the Main/Advanced profile both point
+	// at the one GRE socket and single is true.
+	media  atomic.Pointer[net.UDPConn]
+	rtcp   atomic.Pointer[net.UDPConn]
+	single bool
+
+	// rebindGen counts caller-receiver socket rebinds (see Rebind). The session's
+	// read loop reads it to distinguish a rebind-induced socket close — after which
+	// it continues on the fresh socket — from a genuine teardown, on which it exits.
+	rebindGen atomic.Uint64
 
 	// DTLS transport security (Main profile, optional): when dtlsCfg is set,
 	// Handshake establishes a DTLS 1.2 session over the single socket and
@@ -43,6 +55,15 @@ type Conn struct {
 	dtlsRemote *net.UDPAddr   // client role: the peer to converse with
 	dtls       *dtls.Conn     // established by Handshake
 	dtlsPeer   netip.AddrPort // known (client) or learned (server) peer address
+}
+
+// newConn builds a Conn from already-bound media and rtcp sockets (which alias the
+// same socket when single is true), storing them into the atomic slots.
+func newConn(media, rtcp *net.UDPConn, single bool) *Conn {
+	c := &Conn{single: single}
+	c.media.Store(media)
+	c.rtcp.Store(rtcp)
+	return c
 }
 
 // Listen binds the media socket to host:port and the RTCP socket to
@@ -63,7 +84,7 @@ func Listen(host string, port int) (*Conn, error) {
 		media.Close()
 		return nil, fmt.Errorf("rist: socket: bind rtcp port %d: %w", port+1, err)
 	}
-	return &Conn{media: media, rtcp: rtcp}, nil
+	return newConn(media, rtcp, false), nil
 }
 
 // ListenEphemeral binds both sockets to OS-chosen ports on host (empty host
@@ -79,7 +100,7 @@ func ListenEphemeral(host string) (*Conn, error) {
 		media.Close()
 		return nil, fmt.Errorf("rist: socket: bind rtcp: %w", err)
 	}
-	return &Conn{media: media, rtcp: rtcp}, nil
+	return newConn(media, rtcp, false), nil
 }
 
 // ListenEphemeralEvenOdd binds an OS-chosen even media port and the adjacent odd
@@ -117,7 +138,7 @@ func ListenEphemeralEvenOdd(host string) (*Conn, error) {
 			lastErr = err
 			continue
 		}
-		return &Conn{media: media, rtcp: rtcp}, nil
+		return newConn(media, rtcp, false), nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no free even/odd port pair after 100 tries")
@@ -141,7 +162,7 @@ func ListenEphemeralFamily(network, host string) (*Conn, error) {
 		media.Close()
 		return nil, fmt.Errorf("rist: socket: bind rtcp: %w", err)
 	}
-	return &Conn{media: media, rtcp: rtcp}, nil
+	return newConn(media, rtcp, false), nil
 }
 
 // ListenEphemeralSingleFamily is ListenEphemeralSingle with an explicit address
@@ -152,14 +173,14 @@ func ListenEphemeralSingleFamily(network, host string) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rist: socket: bind main: %w", err)
 	}
-	return &Conn{media: c, rtcp: c, single: true}, nil
+	return newConn(c, c, true), nil
 }
 
 // FromConns wraps two already-bound UDP sockets (media even, rtcp odd). It
 // lets a caller inject sockets — for tests or to satisfy a PacketConn-style
 // API — and takes ownership: Close closes both.
 func FromConns(media, rtcp *net.UDPConn) *Conn {
-	return &Conn{media: media, rtcp: rtcp}
+	return newConn(media, rtcp, false)
 }
 
 // ListenSingle binds one UDP socket on host:port for the Main profile, where a
@@ -175,7 +196,7 @@ func ListenSingle(host string, port int) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rist: socket: bind main port %d: %w", port, err)
 	}
-	return &Conn{media: c, rtcp: c, single: true}, nil
+	return newConn(c, c, true), nil
 }
 
 // ListenEphemeralSingle binds one OS-chosen UDP socket on host (empty host
@@ -186,7 +207,7 @@ func ListenEphemeralSingle(host string) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rist: socket: bind main: %w", err)
 	}
-	return &Conn{media: c, rtcp: c, single: true}, nil
+	return newConn(c, c, true), nil
 }
 
 // bind opens an unconnected UDP socket on host:port using the dual-stack "udp"
@@ -233,7 +254,7 @@ func bindNet(network, host string, port int) (*net.UDPConn, error) {
 }
 
 // MediaPort returns the local media (even) port the transport is bound to.
-func (c *Conn) MediaPort() int { return c.media.LocalAddr().(*net.UDPAddr).Port }
+func (c *Conn) MediaPort() int { return c.media.Load().LocalAddr().(*net.UDPAddr).Port }
 
 // ReadMedia reads one media (RTP) datagram into buf, returning the byte count
 // and the source address (the sender's media address, for a receiver). When DTLS
@@ -248,13 +269,13 @@ func (c *Conn) ReadMedia(buf []byte) (int, netip.AddrPort, error) {
 		n, err := c.dtls.Read(buf)
 		return n, c.dtlsPeer, err
 	}
-	return c.media.ReadFromUDPAddrPort(buf)
+	return c.media.Load().ReadFromUDPAddrPort(buf)
 }
 
 // ReadRTCP reads one RTCP datagram into buf, returning the byte count and the
 // source address. Like ReadMedia it reads via ReadFromUDPAddrPort (alloc-free).
 func (c *Conn) ReadRTCP(buf []byte) (int, netip.AddrPort, error) {
-	return c.rtcp.ReadFromUDPAddrPort(buf)
+	return c.rtcp.Load().ReadFromUDPAddrPort(buf)
 }
 
 // WriteMedia sends a media (RTP) datagram to dst. When DTLS is enabled (Main
@@ -265,25 +286,72 @@ func (c *Conn) WriteMedia(b []byte, dst netip.AddrPort) error {
 		_, err := c.dtls.Write(b)
 		return err
 	}
-	_, err := c.media.WriteToUDPAddrPort(b, dst)
+	_, err := c.media.Load().WriteToUDPAddrPort(b, dst)
 	return err
 }
 
 // WriteRTCP sends an RTCP datagram to dst.
 func (c *Conn) WriteRTCP(b []byte, dst netip.AddrPort) error {
-	_, err := c.rtcp.WriteToUDPAddrPort(b, dst)
+	_, err := c.rtcp.Load().WriteToUDPAddrPort(b, dst)
 	return err
 }
 
 // Close closes both sockets, unblocking any in-flight reads (which return a
 // net.ErrClosed-wrapped error). It is safe to call more than once.
 func (c *Conn) Close() error {
-	err := c.media.Close()
+	err := c.media.Load().Close()
 	if c.single {
 		return err // media and rtcp are the same socket; close it once
 	}
-	if e := c.rtcp.Close(); e != nil && err == nil {
+	if e := c.rtcp.Load().Close(); e != nil && err == nil {
 		err = e
 	}
 	return err
+}
+
+// RebindGen returns the current rebind generation; the session read loop compares
+// it across a read error to tell a Rebind-induced close (continue on the fresh
+// socket) from a genuine teardown (exit).
+func (c *Conn) RebindGen() uint64 { return c.rebindGen.Load() }
+
+// Rebind recovers a caller-receiver NAT/dynamic-IP source-port change on a
+// single-socket (Main/Advanced) plaintext-or-PSK transport (libRIST's
+// try_caller_socket_rebind): it binds a FRESH ephemeral socket on the same host
+// family and atomically swaps it in, then closes the old one (unblocking the
+// reader, which continues on the new socket after seeing RebindGen advance). The
+// fresh local port makes the peer re-learn this side's source on the next outbound
+// keepalive. It is rejected for a DTLS connection (the handshake is bound to the
+// old socket) and for a non-single (Simple even/odd) transport.
+func (c *Conn) Rebind() error {
+	if c.dtls != nil {
+		return errors.New("rist: socket: cannot rebind a DTLS connection")
+	}
+	if !c.single {
+		return errors.New("rist: socket: rebind is only supported on a single-socket (Main/Advanced) transport")
+	}
+	old := c.media.Load()
+	la, ok := old.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return errors.New("rist: socket: rebind: unexpected local address type")
+	}
+	network := "udp"
+	if la.IP != nil {
+		if la.IP.To4() != nil {
+			network = "udp4"
+		} else {
+			network = "udp6"
+		}
+	}
+	fresh, err := bindNet(network, "", 0) // fresh OS-chosen ephemeral port
+	if err != nil {
+		return fmt.Errorf("rist: socket: rebind: %w", err)
+	}
+	// Publish the new socket BEFORE bumping the generation and closing the old one,
+	// so the reader (which re-loads media after its blocked read errors) always sees
+	// the fresh socket once it observes the advanced generation.
+	c.media.Store(fresh)
+	c.rtcp.Store(fresh)
+	c.rebindGen.Add(1)
+	_ = old.Close()
+	return nil
 }

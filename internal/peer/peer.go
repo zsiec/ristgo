@@ -94,6 +94,12 @@ func (p *Peer) SilentFor(now clock.Timestamp, d clock.Microseconds) bool {
 // Seen reports whether any traffic has ever arrived from the peer.
 func (p *Peer) Seen() bool { return p.seen }
 
+// LastSeen returns the instant the most recent datagram from the peer was
+// observed (Observe), or the zero Timestamp if none has been. The caller-rebind
+// recovery check compares it against the last rebind to tell whether real traffic
+// arrived afterward (the rebind recovered the stream).
+func (p *Peer) LastSeen() clock.Timestamp { return p.lastSeen }
+
 // Expired reports whether the peer was once seen but has now been silent for
 // longer than the session timeout — the condition for tearing the session
 // down (libRIST checks now - last_pkt_received > session_timeout). A peer

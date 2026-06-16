@@ -47,12 +47,18 @@ type BondedSender struct {
 }
 
 // newBondingGroup builds the per-flow bonding group from cfg's liveness and RTT
-// bounds.
+// bounds. The duplicate-path grace is the recovery buffer (libRIST's hard_dead
+// recovery_buffer_ticks), so a 2022-7 path keeps its redundancy for that long
+// after it goes dead. The RTT clamp bounds are the effective ones (the buffer-size
+// rtt_min floor applied), matching the flow core so per-path RTT stats and NACK
+// tie-breaking use the same floor as the core's retry cadence.
 func newBondingGroup(cfg Config) *bonding.Group {
+	rttMin, rttMax := effectiveRTTBounds(cfg)
 	return bonding.NewGroup(
 		clock.FromDuration(cfg.SessionTimeout),
-		clock.FromDuration(cfg.RTTMin),
-		clock.FromDuration(cfg.RTTMax),
+		clock.FromDuration(cfg.recoveryBufferTime()),
+		rttMin,
+		rttMax,
 	)
 }
 

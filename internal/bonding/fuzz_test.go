@@ -17,7 +17,7 @@ func FuzzGroupOperations(f *testing.F) {
 	f.Add([]byte{1, 5, 1, 7, 4, 255, 4, 1, 5, 100})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		g := NewGroup(2000*clock.Millisecond, 5*clock.Millisecond, 500*clock.Millisecond)
+		g := NewGroup(2000*clock.Millisecond, 1000*clock.Millisecond, 5*clock.Millisecond, 500*clock.Millisecond)
 		registered := make(map[uint8]bool)
 		var now clock.Timestamp
 

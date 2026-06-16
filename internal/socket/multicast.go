@@ -48,11 +48,11 @@ func (c *Conn) JoinMulticast(opts MulticastOptions) error {
 	if !opts.Group.IsMulticast() {
 		return nil
 	}
-	if err := joinOn(c.media, opts); err != nil {
+	if err := joinOn(c.media.Load(), opts); err != nil {
 		return err
 	}
-	if !c.single && c.rtcp != nil {
-		if err := joinOn(c.rtcp, opts); err != nil {
+	if !c.single && c.rtcp.Load() != nil {
+		if err := joinOn(c.rtcp.Load(), opts); err != nil {
 			return err
 		}
 	}
@@ -100,11 +100,11 @@ func (c *Conn) SetMulticast(opts MulticastOptions) error {
 	if !opts.Group.IsMulticast() {
 		return nil
 	}
-	if err := setMulticastOn(c.media, opts); err != nil {
+	if err := setMulticastOn(c.media.Load(), opts); err != nil {
 		return err
 	}
-	if !c.single && c.rtcp != nil {
-		if err := setMulticastOn(c.rtcp, opts); err != nil {
+	if !c.single && c.rtcp.Load() != nil {
+		if err := setMulticastOn(c.rtcp.Load(), opts); err != nil {
 			return err
 		}
 	}

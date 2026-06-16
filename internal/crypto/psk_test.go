@@ -465,3 +465,50 @@ func TestDecryptorRekeyOnNonceChange(t *testing.T) {
 		t.Fatal("decrypt back under nonceA mismatch")
 	}
 }
+
+// TestDecryptorPrecompute verifies the PSK Future Nonce pre-derivation: a
+// Decryptor that pre-derives a future nonce decrypts a packet under it correctly
+// and via the cached key (the next slot is consumed, no lazy re-derivation), and a
+// pre-derivation for an unrelated nonce does not disturb normal decryption.
+func TestDecryptorPrecompute(t *testing.T) {
+	const pass = "rotation-passphrase"
+	plain := []byte("the quick brown fox jumps over a freshly rotated nonce")
+
+	k, err := NewKey([]byte(pass), KeySize128, 0, false)
+	if err != nil {
+		t.Fatalf("NewKey: %v", err)
+	}
+	ct, err := k.Encrypt(7, nil, plain)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	nonce := k.Nonce()
+
+	d, err := NewDecryptor([]byte(pass), KeySize128)
+	if err != nil {
+		t.Fatalf("NewDecryptor: %v", err)
+	}
+	d.Precompute(nonce, KeySize128)
+	if !d.hasNext {
+		t.Fatal("Precompute did not cache a future key")
+	}
+	got, err := d.Decrypt(nonce, 7, nil, ct)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("decrypt mismatch:\n got %q\nwant %q", got, plain)
+	}
+	if d.hasNext {
+		t.Fatal("future slot not consumed after Decrypt promoted it")
+	}
+
+	// A pre-derivation for an unrelated nonce must not break decryption under the
+	// real one (the lazy path still re-derives correctly).
+	d2, _ := NewDecryptor([]byte(pass), KeySize128)
+	d2.Precompute([NonceSize]byte{0xAA, 0xBB, 0xCC, 0xDD}, KeySize128)
+	got2, err := d2.Decrypt(nonce, 7, nil, ct)
+	if err != nil || !bytes.Equal(got2, plain) {
+		t.Fatalf("decrypt after unrelated Precompute: got %q err %v", got2, err)
+	}
+}

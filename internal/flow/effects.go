@@ -215,6 +215,13 @@ type Stats struct {
 	// anomalous-but-not-wrapped or merely-late timestamp does not count here.
 	ClockResync uint64
 
+	// FlowResets counts flow-id changes: a fresh non-retransmit packet whose
+	// flow id (SSRC with the retransmit bit masked) differs from the one the flow
+	// anchored on, so the receiver discarded its buffered state and re-anchored on
+	// the new flow rather than merging two distinct flows into one ring (libRIST's
+	// "Detected flow id change ... resetting state").
+	FlowResets uint64
+
 	// --- Sender-half counters ---
 
 	// Sent counts first-transmission media packets emitted by PushApp.

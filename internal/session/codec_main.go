@@ -713,22 +713,26 @@ func (c *mainCodec) peekEAPOL(b []byte) (eap []byte, ok bool) {
 // decryption or NPD expansion; the caller must treat it as owned until the
 // packet is delivered, per the flow ownership note. Decoded Feedback values own
 // their slices (rtcp.ParseCompound does not alias, and NACK widening allocates).
-func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire.MediaPacket, fbs []wire.Feedback, err error) {
-	region, isRTCP, encrypted, err := c.mainRegion(b)
+func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire.MediaPacket, fbs []wire.Feedback, bn *gre.BufferNegotiation, err error) {
+	region, isRTCP, encrypted, bn, err := c.mainRegion(b)
 	if err != nil {
-		return false, wire.MediaPacket{}, nil, err
+		return false, wire.MediaPacket{}, nil, nil, err
+	}
+	if bn != nil {
+		// A buffer-negotiation control message, decoded on the single decrypt pass.
+		return false, wire.MediaPacket{}, nil, bn, nil
 	}
 	if region == nil {
-		// A VSF control datagram (keepalive / buffer-negotiation): accepted with no
-		// media or feedback, served at the peer layer.
-		return false, wire.MediaPacket{}, nil, nil
+		// A VSF control datagram (keepalive): accepted with no media or feedback,
+		// served at the peer layer.
+		return false, wire.MediaPacket{}, nil, nil, nil
 	}
 	if isRTCP {
 		fbs, err = c.decodeFeedbackMain(region, nackRef, encrypted)
-		return false, wire.MediaPacket{}, fbs, err
+		return false, wire.MediaPacket{}, fbs, nil, err
 	}
 	pkt, err = c.decodeMediaMain(region)
-	return true, pkt, nil, err
+	return true, pkt, nil, nil, err
 }
 
 // mainRegion parses and (per the GRE K bit) decrypts a Main datagram, unwraps the VSF and
@@ -738,12 +742,13 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 // is untouched and it is safe to call as a probe (feedbackCNAME). It DOES mutate the receive
 // Decryptor's per-packet key/nonce state, but harmlessly — every genuine decode re-derives
 // that state from its own GRE header, so a probe leaves nothing a later decode inherits.
-// A nil region with a nil error is a VSF control datagram (keepalive/buffer-negotiation)
-// that carries no media or RTCP.
-func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool, err error) {
+// A nil region with a nil error is a VSF control datagram: a keepalive (bn nil) or
+// a buffer-negotiation (bn non-nil), decoded here on the single decrypt pass so
+// the caller need not decrypt the datagram a second time to recognize it.
+func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool, bn *gre.BufferNegotiation, err error) {
 	hdr, off, err := gre.Parse(b)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, false, nil, err
 	}
 	// Accept version-1 reduced framing and the version-2 VSF wrapper. The VSF
 	// proto sits in the region after the GRE sequence, so (when encrypted) it is
@@ -754,7 +759,7 @@ func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool,
 	case gre.ProtoVSF:
 		isVSF = true
 	default:
-		return nil, false, false, fmt.Errorf("rist: main: GRE proto 0x%04x, want reduced", hdr.ProtType)
+		return nil, false, false, nil, fmt.Errorf("rist: main: GRE proto 0x%04x, want reduced", hdr.ProtType)
 	}
 	region = b[off:]
 
@@ -768,7 +773,7 @@ func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool,
 	if hdr.HasKey {
 		encrypted = true
 		if c.recvKey == nil {
-			return nil, false, false, fmt.Errorf("rist: main: encrypted datagram but no decryptor configured")
+			return nil, false, false, nil, fmt.Errorf("rist: main: encrypted datagram but no decryptor configured")
 		}
 		// Honor the GRE H bit: derive the decryption key at the size the sender
 		// signalled, so a peer configured with a different aes-type still
@@ -776,29 +781,44 @@ func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool,
 		c.recvKey.SetKeyBits(hBitKeySize(hdr.KeySize256))
 		region, err = c.recvKey.Decrypt(hdr.Nonce, hdr.Seq, nil, region)
 		if err != nil {
-			return nil, false, false, err
+			return nil, false, false, nil, err
 		}
 	}
 
 	// Unwrap the version-2 VSF proto (now decrypted): libRIST maps subtype
-	// 0x0000->REDUCED, 0x8000->KEEPALIVE, 0x8002->BUFFER_NEGOTIATION. Only
-	// REDUCED carries media/RTCP we decode; keepalive and buffer-negotiation are
-	// liveness/handshake control already served at the peer layer, so we accept
-	// them without error or action rather than dropping the datagram.
+	// 0x0000->REDUCED, 0x8000->KEEPALIVE, 0x8002->BUFFER_NEGOTIATION. Only REDUCED
+	// carries media/RTCP we decode; a keepalive is liveness served at the peer
+	// layer; a buffer-negotiation is decoded here and returned via bn.
 	if isVSF {
 		vsf, vn, verr := gre.ParseVSFProto(region)
 		if verr != nil {
-			return nil, false, false, verr
+			return nil, false, encrypted, nil, verr
 		}
-		if vsf.Subtype != gre.VSFSubtypeReduced {
-			return nil, false, encrypted, nil
+		switch vsf.Subtype {
+		case gre.VSFSubtypeReduced:
+			region = region[vn:]
+		case gre.VSFSubtypeBufferNegotiation:
+			// Honor a buffer-negotiation only when it is authenticated by encryption
+			// on a keyed session: a cleartext datagram on a keyed session is a forgery
+			// that could shrink the receiver's dynamic playout buffer, so drop it. A
+			// fully-cleartext session has no such protection and accepts it.
+			if c.recvKey != nil && !encrypted {
+				return nil, false, encrypted, nil, nil
+			}
+			parsed, perr := gre.ParseBufferNegotiation(region[vn:])
+			if perr != nil {
+				return nil, false, encrypted, nil, nil // ignore malformed control
+			}
+			return nil, false, encrypted, &parsed, nil
+		default:
+			// Keepalive or any other control subtype: served at the peer layer.
+			return nil, false, encrypted, nil, nil
 		}
-		region = region[vn:]
 	}
 
 	// Strip the reduced-overhead header; the inner packet follows.
 	if _, n, perr := gre.ParseReduced(region); perr != nil {
-		return nil, false, false, perr
+		return nil, false, false, nil, perr
 	} else {
 		region = region[n:]
 	}
@@ -807,10 +827,10 @@ func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool,
 	// the reduced-header port is not consulted). PT 200-205 (minus 128 => 72-77
 	// after masking the marker bit) is RTCP; everything else is RTP media.
 	if len(region) <= rtcpPTByteLow {
-		return nil, false, false, fmt.Errorf("rist: main: inner packet too short to demux")
+		return nil, false, false, nil, fmt.Errorf("rist: main: inner packet too short to demux")
 	}
 	pt := region[rtcpPTByteLow] & 0x7f
-	return region, pt >= rtcpPTMin && pt <= rtcpPTMax, encrypted, nil
+	return region, pt >= rtcpPTMin && pt <= rtcpPTMax, encrypted, nil, nil
 }
 
 // feedbackCNAME returns the SDES CNAME of an ENCRYPTED RTCP feedback datagram. It decrypts
@@ -824,7 +844,7 @@ func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool,
 // a rebind trigger carries the SAME CNAME as the established peer, which that suppression
 // would otherwise hide.
 func (c *mainCodec) feedbackCNAME(b []byte) (cname string, ok bool) {
-	region, isRTCP, encrypted, err := c.mainRegion(b)
+	region, isRTCP, encrypted, _, err := c.mainRegion(b)
 	if err != nil || region == nil || !isRTCP || !encrypted {
 		return "", false
 	}

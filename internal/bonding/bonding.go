@@ -86,14 +86,22 @@ func (p *Path) nackRTT(g *Group) clock.Microseconds { return p.rtt.LastClamped(g
 type Group struct {
 	paths          []*Path
 	timeout        clock.Microseconds
+	dupGrace       clock.Microseconds
 	rttMin, rttMax clock.Microseconds
 }
 
 // NewGroup builds an empty Group. sessionTimeout is the per-path silence after
-// which a path is declared dead (libRIST session_timeout); rttMin/rttMax bound
-// every path's RTT estimate (libRIST rtt_min/rtt_max).
-func NewGroup(sessionTimeout, rttMin, rttMax clock.Microseconds) *Group {
-	return &Group{timeout: sessionTimeout, rttMin: rttMin, rttMax: rttMax}
+// which a path is declared dead (libRIST session_timeout). dupGrace is the extra
+// silence a SMPTE 2022-7 duplicate path keeps being transmitted on after it goes
+// dead, before the sender prunes it from the fan-out — libRIST's hard_dead grace
+// (recovery_buffer_ticks): a peer becomes dead at session_timeout, but the
+// duplicate fan-out keeps sending until dead_since + recovery_buffer. So a path
+// is still reported dead (PathDead, NACK routing) at sessionTimeout, while its
+// 2022-7 redundancy persists until sessionTimeout+dupGrace — a brief return-path
+// RTCP stall no longer sheds seamless protection a libRIST sender would keep.
+// rttMin/rttMax bound every path's RTT estimate (libRIST rtt_min/rtt_max).
+func NewGroup(sessionTimeout, dupGrace, rttMin, rttMax clock.Microseconds) *Group {
+	return &Group{timeout: sessionTimeout, dupGrace: dupGrace, rttMin: rttMin, rttMax: rttMax}
 }
 
 // AddPath registers a path with the given index, weight, and NACK recovery
@@ -235,23 +243,43 @@ func preferred(cand, best *Path, g *Group) bool {
 // ShouldDuplicate reports whether a bonded sender should still fan a media
 // datagram to the given path: the per-path, allocation-free form of
 // DuplicateTargets for the per-packet send loop. It is true for a
-// duplication-mode path (Weight == WeightDuplicate) that is not proven dead
-// (never-seen included; only a path seen and then silent past the session
-// timeout is dropped — libRIST's hard-dead duplicate-peer prune).
+// duplication-mode path (Weight == WeightDuplicate) that is not proven hard-dead
+// (never-seen included; only a path seen and then silent past the session timeout
+// plus the 2022-7 duplicate grace is dropped — libRIST's hard_dead duplicate-peer
+// prune).
 func (g *Group) ShouldDuplicate(index uint8, now clock.Timestamp) bool {
 	p := g.path(index)
 	if p == nil || p.Weight != WeightDuplicate {
 		return false
 	}
-	return g.sendable(p, now)
+	return g.duplicable(p, now)
 }
 
-// sendable reports whether a sender should still transmit on path p as of now: a
-// never-seen path is sendable (a sender blasts every configured peer from the
-// start, before any return traffic proves it live), and only a path seen and then
-// silent past the session timeout is dropped (libRIST's hard-dead prune).
+// liveWithin reports whether path p has been seen and has not been silent longer
+// than window as of now. A never-seen path counts as live (a sender blasts every
+// configured peer from the start, before any return traffic proves it live).
+func (g *Group) liveWithin(p *Path, now clock.Timestamp, window clock.Microseconds) bool {
+	return !(p.seen && now.Sub(p.lastSeen) > window)
+}
+
+// sendable reports whether a sender should still transmit on a WEIGHTED path: live
+// within the bare session timeout, so a dead path's load-share redistributes to
+// the survivors. Weighted paths get NO recovery-buffer grace — that grace is a
+// 2022-7 redundancy concern (see duplicable), not a load-balancing one: libRIST
+// redistributes a dead weighted peer's share at the plain dead state, while only
+// the duplicate fan-out lingers for the hard_dead grace.
 func (g *Group) sendable(p *Path, now clock.Timestamp) bool {
-	return !(p.seen && now.Sub(p.lastSeen) > g.timeout)
+	return g.liveWithin(p, now, g.timeout)
+}
+
+// duplicable reports whether a 2022-7 duplicate path should still be transmitted
+// on: like sendable, but with the extra recovery-buffer grace past the session
+// timeout (libRIST's hard_dead = dead_since + recovery_buffer_ticks). The grace
+// keeps a flapping path's redundancy alive through a brief return-path stall,
+// which is exactly the case it was written for; a path is still reported dead for
+// liveness/NACK routing at the bare session timeout.
+func (g *Group) duplicable(p *Path, now clock.Timestamp) bool {
+	return g.liveWithin(p, now, g.timeout+g.dupGrace)
 }
 
 // HasWeighted reports whether any path is configured for weighted load-sharing
@@ -338,16 +366,16 @@ func (g *Group) SetWeight(index uint8, weight int) {
 // configured for duplication (Weight == WeightDuplicate) that are not currently
 // dead. A never-seen path IS included — a sender transmits on every configured
 // peer from the start, before any return traffic has had a chance to prove it
-// live — and only a path seen and then silent past the session timeout is
-// dropped.
+// live — and only a path seen and then silent past the hard-dead horizon
+// (session_timeout plus the 2022-7 duplicate grace) is dropped.
 func (g *Group) DuplicateTargets(now clock.Timestamp) []uint8 {
 	var out []uint8
 	for _, p := range g.paths {
 		if p.Weight != WeightDuplicate {
 			continue
 		}
-		if p.seen && now.Sub(p.lastSeen) > g.timeout {
-			continue // proven dead
+		if !g.duplicable(p, now) {
+			continue // proven hard-dead (session_timeout + recovery_buffer grace)
 		}
 		out = append(out, p.Index)
 	}

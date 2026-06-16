@@ -288,3 +288,25 @@ func sortedUniq(s []uint32) []uint32 {
 	}
 	return out
 }
+
+// TestBuildUnsupportedRoundTrip checks the Control Message Unsupported Response
+// (CI 0x8020) framing: CI, echoed incoming CI, head bytes, and the 16-byte body.
+func TestBuildUnsupportedRoundTrip(t *testing.T) {
+	u := Unsupported{ResponderSSRC: 0x0ACE0AC1, IncomingCI: 0x7abc, Head: [6]byte{1, 2, 3, 4, 5, 6}}
+	ci, body, err := ParseControl(BuildUnsupported(nil, u))
+	if err != nil {
+		t.Fatalf("ParseControl: %v", err)
+	}
+	if ci != CIUnsupported {
+		t.Fatalf("ci = %#x, want %#x", ci, CIUnsupported)
+	}
+	if want := 4 + 2 + 2 + unsupportedHeadLen + 2; len(body) != want {
+		t.Fatalf("body len = %d, want %d", len(body), want)
+	}
+	if got := uint16(body[4])<<8 | uint16(body[5]); got != u.IncomingCI {
+		t.Errorf("echoed CI = %#x, want %#x", got, u.IncomingCI)
+	}
+	if got := [6]byte(body[8:14]); got != u.Head {
+		t.Errorf("head = % x, want % x", got, u.Head)
+	}
+}

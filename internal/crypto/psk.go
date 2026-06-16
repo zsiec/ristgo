@@ -278,6 +278,10 @@ func (k *Key) Nonce() [NonceSize]byte {
 	return k.nonce
 }
 
+// KeyBits returns the AES key size in bits (128 or 256) this key encrypts under,
+// for the PSK Future Nonce Announcement's key-size field.
+func (k *Key) KeyBits() int { return k.keyBits }
+
 // rekey generates a fresh non-zero nonce with the correct B-bit, derives the
 // AES cipher from it, and resets the used-times counter.
 func (k *Key) rekey() error {
@@ -340,6 +344,18 @@ type Decryptor struct {
 	ctr       ctrState
 	hasNonce  bool
 	usedTimes uint64 // packets decrypted under the current nonce (reuse guard)
+
+	// Pre-derived "future nonce" slot (PSK Future Nonce Announcement, TR-06-3
+	// §5.3.9): when a sender announces the nonce it is about to rotate to,
+	// Precompute derives the AES key for it here so the first packet under the new
+	// nonce decrypts without the expensive PBKDF2 step. Decrypt promotes it to the
+	// live slot. Unlike libRIST (which overwrites the current key on announcement),
+	// caching it separately means an out-of-order announcement cannot disturb
+	// decryption of packets still arriving under the current nonce.
+	nextNonce [NonceSize]byte
+	nextBlock cipher.Block
+	nextBits  int
+	hasNext   bool
 }
 
 // NewDecryptor constructs a Decryptor for the given passphrase and AES key
@@ -385,6 +401,37 @@ func (d *Decryptor) SetKeyBits(keyBits int) {
 	}
 	d.keyBits = keyBits
 	d.hasNonce = false // force re-derivation at the new key size
+	d.hasNext = false  // a pre-derived future key at the old size is now stale
+}
+
+// Precompute derives and caches the AES key for an announced future nonce
+// (PSK Future Nonce Announcement, TR-06-3 §5.3.9) so a later Decrypt under it is
+// PBKDF2-free. keyBits is the announced AES key size (128 or 256); a zero or
+// invalid size reuses the current size. It is a no-op for a zero nonce, the
+// current nonce, or one already cached, and silently ignores a derivation error
+// (the lazy Decrypt path still re-derives correctly when the real packet arrives).
+func (d *Decryptor) Precompute(nonce [NonceSize]byte, keyBits int) {
+	if isZeroNonce(nonce) {
+		return
+	}
+	if d.hasNonce && nonce == d.nonce {
+		return // already the live key
+	}
+	bits := keyBits
+	if bits != KeySize128 && bits != KeySize256 {
+		bits = d.keyBits
+	}
+	if d.hasNext && nonce == d.nextNonce && bits == d.nextBits {
+		return // already pre-derived
+	}
+	block, err := deriveBlock(d.password, nonce[:], bits, d.raw)
+	if err != nil {
+		return
+	}
+	d.nextNonce = nonce
+	d.nextBlock = block
+	d.nextBits = bits
+	d.hasNext = true
 }
 
 // Decrypt decrypts len(src) payload bytes carried under the given inbound GRE
@@ -398,20 +445,31 @@ func (d *Decryptor) Decrypt(nonce [NonceSize]byte, seq uint32, dst, src []byte) 
 		return dst, ErrZeroNonce
 	}
 	if !d.hasNonce || nonce != d.nonce {
-		// Assign the field first, then derive from d.nonce[:]: slicing the
-		// value parameter (nonce[:]) would force the whole parameter onto the
-		// heap on every call (escape analysis is conservative across the cold
-		// rekey branch), defeating the 0-alloc warm path. Slicing the heap
-		// field instead keeps the steady-state call allocation-free.
-		d.nonce = nonce
-		block, err := deriveBlock(d.password, d.nonce[:], d.keyBits, d.raw)
-		if err != nil {
-			d.hasNonce = false
-			return dst, err
+		if d.hasNext && nonce == d.nextNonce {
+			// Promote the pre-derived future-nonce key (PSK Future Nonce
+			// Announcement): no PBKDF2, no allocation.
+			d.nonce = nonce
+			d.ctr.block = d.nextBlock
+			d.keyBits = d.nextBits
+			d.hasNonce = true
+			d.usedTimes = 0
+			d.hasNext = false
+		} else {
+			// Assign the field first, then derive from d.nonce[:]: slicing the
+			// value parameter (nonce[:]) would force the whole parameter onto the
+			// heap on every call (escape analysis is conservative across the cold
+			// rekey branch), defeating the 0-alloc warm path. Slicing the heap
+			// field instead keeps the steady-state call allocation-free.
+			d.nonce = nonce
+			block, err := deriveBlock(d.password, d.nonce[:], d.keyBits, d.raw)
+			if err != nil {
+				d.hasNonce = false
+				return dst, err
+			}
+			d.ctr.block = block
+			d.hasNonce = true
+			d.usedTimes = 0
 		}
-		d.ctr.block = block
-		d.hasNonce = true
-		d.usedTimes = 0
 	}
 	// Defense-in-depth: refuse once the packet count under this nonce passes
 	// the reuse limit. A conformant sender rotates its nonce —

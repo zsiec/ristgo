@@ -96,8 +96,16 @@ type advCodec struct {
 	// recvKey is the PSK decryptor, or nil when encryption is disabled. It
 	// re-derives its AES key whenever the inbound psk_nonce changes, so it
 	// follows the peer's nonce rotation without needing the optional PSK
-	// future-nonce announcement.
+	// future-nonce announcement (which it nonetheless honors via Precompute to
+	// avoid the PBKDF2 hiccup at rotation).
 	recvKey *crypto.Decryptor
+
+	// announce* hold a pending PSK Future Nonce Announcement (TR-06-3 §5.3.9):
+	// when encodeAdvMedia rotates the send key to a fresh nonce, it records the new
+	// nonce + key size here so the host can announce it to the peer (takeNonceAnnounce).
+	announceNonce [crypto.NonceSize]byte
+	announceBits  int
+	hasAnnounce   bool
 
 	// compression enables LZ4 payload compression on the media send path.
 	compression bool
@@ -204,6 +212,7 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 	// payload only, IV from the 32-bit sequence, nonce read AFTER Encrypt (the
 	// key may rotate on send). The psk_iv field carries the sequence big-endian.
 	if c.sendKey != nil {
+		before := c.sendKey.Nonce()
 		ct, err := c.sendKey.Encrypt(pkt.Seq, nil, payload)
 		if err != nil {
 			return dst, err
@@ -215,6 +224,13 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 		var iv [adv.PSKIVSize]byte
 		binary.BigEndian.PutUint32(iv[:], pkt.Seq)
 		params.PSKIV = iv[:]
+		if nonce != before {
+			// The key rotated to a fresh nonce on this packet; queue a PSK Future
+			// Nonce announcement so the receiver pre-derives the new key (§5.3.9).
+			c.announceNonce = nonce
+			c.announceBits = c.sendKey.KeyBits()
+			c.hasAnnounce = true
+		}
 	}
 
 	return adv.Build(dst, params, payload)
@@ -460,10 +476,31 @@ func (c *advCodec) decodeControl(payload []byte) ([]wire.Feedback, error) {
 			return nil, nil
 		}
 		return []wire.Feedback{wire.FlowAttribute{JSON: append([]byte(nil), body...)}}, nil
-	case adv.CIKeepalive, adv.CIPSKNonce:
+	case adv.CIKeepalive:
+		return nil, nil
+	case adv.CIPSKNonce:
+		// PSK Future Nonce Announcement (TR-06-3 §5.3.9): pre-derive the AES key for
+		// the nonce the sender is about to rotate to, so the first packet under it
+		// decrypts without the (expensive) PBKDF2 step. A no-op when this side is not
+		// decrypting; a malformed body is ignored (the lazy path re-derives anyway).
+		if c.recvKey != nil {
+			if p, perr := adv.ParsePSKNonce(body); perr == nil {
+				c.recvKey.Precompute(p.Nonce, int(p.KeyBits))
+			}
+		}
+		return nil, nil
+	case adv.CIUnsupported:
+		// A peer reporting it did not understand one of OUR control messages: log
+		// at the host, but never reply (replying to an Unsupported with another
+		// Unsupported would loop).
 		return nil, nil
 	default:
-		return nil, nil
+		// An unrecognized control index (§5.3.10): signal the host to originate a
+		// Control Message Unsupported Response echoing the CI and the first 48 bits
+		// of the body so the peer learns we did not understand it.
+		var head [6]byte
+		copy(head[:], body)
+		return []wire.Feedback{wire.UnsupportedControl{CI: ci, Head: head}}, nil
 	}
 }
 
@@ -557,4 +594,26 @@ func (c *advCodec) frameControlFrag(dst, payload []byte, first, last bool, ts ui
 // 1 MHz timestamp stamped into the packet header.
 func (c *advCodec) keepaliveDatagram(ts uint32) ([]byte, error) {
 	return c.frameControl(nil, adv.BuildKeepalive(nil, adv.Keepalive{Caps: adv.KeepaliveCapI}), ts)
+}
+
+// unsupportedDatagram frames a Control Message Unsupported Response (TR-06-3
+// §5.3.10) reporting an unrecognized inbound control index.
+func (c *advCodec) unsupportedDatagram(u adv.Unsupported, ts uint32) ([]byte, error) {
+	return c.frameControl(nil, adv.BuildUnsupported(nil, u), ts)
+}
+
+// takeNonceAnnounce returns a pending PSK future-nonce announcement (the nonce the
+// send key just rotated to and its key size) exactly once, clearing it. ok is
+// false when no rotation has occurred since the last call.
+func (c *advCodec) takeNonceAnnounce() (nonce [crypto.NonceSize]byte, keyBits int, ok bool) {
+	if !c.hasAnnounce {
+		return nonce, 0, false
+	}
+	c.hasAnnounce = false
+	return c.announceNonce, c.announceBits, true
+}
+
+// pskNonceDatagram frames a PSK Future Nonce Announcement (TR-06-3 §5.3.9).
+func (c *advCodec) pskNonceDatagram(p adv.PSKNonce, ts uint32) ([]byte, error) {
+	return c.frameControl(nil, adv.BuildPSKNonce(nil, p), ts)
 }

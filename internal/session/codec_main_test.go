@@ -154,7 +154,7 @@ func TestMainMediaRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}
-			isMedia, got, _, err := dec.decodeMain(dg, 0)
+			isMedia, got, _, _, err := dec.decodeMain(dg, 0)
 			if err != nil {
 				t.Fatalf("decode: %v", err)
 			}
@@ -255,7 +255,7 @@ func TestMainRetransmitDedup(t *testing.T) {
 // mustMedia decodes b and fails unless it is a media packet.
 func mustMedia(t *testing.T, c *mainCodec, b []byte) (wire.MediaPacket, []wire.Feedback) {
 	t.Helper()
-	isMedia, pkt, fbs, err := c.decodeMain(b, 0)
+	isMedia, pkt, fbs, _, err := c.decodeMain(b, 0)
 	if err != nil {
 		t.Fatalf("decodeMain: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestMainFeedbackRoundTrip(t *testing.T) {
 			// NACK widening resolves in the current epoch. The host supplies it;
 			// the media decoder's reference is meaningless on the side that
 			// receives NACKs (which never decodes inbound media).
-			isMedia, _, out, err := dec.decodeMain(dg, 300)
+			isMedia, _, out, _, err := dec.decodeMain(dg, 300)
 			if err != nil {
 				t.Fatalf("decode: %v", err)
 			}
@@ -345,7 +345,7 @@ func TestMainNackEXTSEQ(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	isMedia, _, out, err := dec.decodeMain(dg, 0)
+	isMedia, _, out, _, err := dec.decodeMain(dg, 0)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -377,12 +377,12 @@ func TestMainPTDemux(t *testing.T) {
 	enc, dec := newCodecPair(t, 0, false, ssrc)
 
 	media, _ := enc.encodeMainMedia(nil, wire.MediaPacket{Seq: 7, SourceTime: mainSrcNTP(0), SSRC: ssrc, Payload: []byte{9}})
-	if isMedia, _, _, err := dec.decodeMain(media, 0); err != nil || !isMedia {
+	if isMedia, _, _, _, err := dec.decodeMain(media, 0); err != nil || !isMedia {
 		t.Fatalf("media datagram: isMedia=%v err=%v", isMedia, err)
 	}
 
 	fb, _ := enc.encodeMainFeedback(nil, rtcp.EmptyReceiverReport{SSRC: ssrc}, []wire.Feedback{wire.RttEchoRequest{Timestamp: 1}}, false)
-	if isMedia, _, _, err := dec.decodeMain(fb, 0); err != nil || isMedia {
+	if isMedia, _, _, _, err := dec.decodeMain(fb, 0); err != nil || isMedia {
 		t.Fatalf("feedback datagram: isMedia=%v err=%v", isMedia, err)
 	}
 }
@@ -397,7 +397,7 @@ func TestMainEncryptedNeedsDecryptor(t *testing.T) {
 	plainDec := newMainCodec(nil, nil, false, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, ssrc, "c", false)
 
 	dg, _ := enc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SourceTime: mainSrcNTP(0), SSRC: ssrc, Payload: []byte{1}})
-	if _, _, _, err := plainDec.decodeMain(dg, 0); err == nil {
+	if _, _, _, _, err := plainDec.decodeMain(dg, 0); err == nil {
 		t.Fatal("encrypted datagram decoded without a decryptor, want error")
 	}
 }
@@ -414,7 +414,7 @@ func TestMainCleartextAcceptedWithDecryptor(t *testing.T) {
 	_, rd, _ := pskPair(t, "k", crypto.KeySize128)
 	cipherDec := newMainCodec(nil, rd, false, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, ssrc, "c", false)
 	dg2, _ := plainEnc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SourceTime: mainSrcNTP(0), SSRC: ssrc, Payload: []byte{0xAB}})
-	isMedia, pkt, _, err := cipherDec.decodeMain(dg2, 0)
+	isMedia, pkt, _, _, err := cipherDec.decodeMain(dg2, 0)
 	if err != nil || !isMedia {
 		t.Fatalf("cleartext datagram with decryptor: isMedia=%v err=%v, want cleartext media decode", isMedia, err)
 	}
@@ -457,7 +457,7 @@ func TestMainNPDFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	isMedia, m, _, err := dec.decodeMain(dg, 0)
+	isMedia, m, _, _, err := dec.decodeMain(dg, 0)
 	if err != nil || !isMedia {
 		t.Fatalf("decode: media=%v err=%v", isMedia, err)
 	}
@@ -480,7 +480,7 @@ func TestMainDecodeShortInputs(t *testing.T) {
 		{0x10, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, 0xB3, 0x07, 0xB0, 0x80, 0x21}, // wrong proto
 	}
 	for i, b := range cases {
-		if _, _, _, err := c.decodeMain(b, 0); err == nil {
+		if _, _, _, _, err := c.decodeMain(b, 0); err == nil {
 			t.Errorf("case %d: decodeMain(% x) = nil error, want error", i, b)
 		}
 	}
@@ -513,13 +513,13 @@ func FuzzDecodeMain(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		// Plain decoder: must not panic.
 		plain := newMainCodec(nil, nil, false, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, 0x2, "c", false)
-		_, _, _, _ = plain.decodeMain(b, 0)
+		_, _, _, _, _ = plain.decodeMain(b, 0)
 		_, _, _, _ = plain.peekOOB(b) // tunnel-type demux must not panic on arbitrary input
 
 		// Encrypting decoder: must not panic on arbitrary ciphertext either.
 		_, rd, k256 := pskPair(t, "fuzz", crypto.KeySize128)
 		cipher := newMainCodec(nil, rd, k256, gre.DefaultVirtSrcPort, gre.DefaultVirtDstPort, false, 0x2, "c", false)
-		_, _, _, _ = cipher.decodeMain(b, 0)
+		_, _, _, _, _ = cipher.decodeMain(b, 0)
 		_, _, _, _ = cipher.peekOOB(b)
 	})
 }
@@ -567,7 +567,7 @@ func TestDecodeMainVSFWrapper(t *testing.T) {
 	wrapped, _ := hdr.AppendTo(nil)
 	wrapped = gre.VSFProto{Type: gre.VSFTypeRIST, Subtype: gre.VSFSubtypeReduced}.AppendTo(wrapped)
 	wrapped = append(wrapped, dg[off:]...)
-	isMedia, got, _, err := dec.decodeMain(wrapped, 0)
+	isMedia, got, _, _, err := dec.decodeMain(wrapped, 0)
 	if err != nil {
 		t.Fatalf("decode VSF-reduced: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestDecodeMainVSFWrapper(t *testing.T) {
 	ka, _ := gre.Header{Version: 2, HasSeq: true, ProtType: gre.ProtoVSF}.AppendTo(nil)
 	ka = gre.VSFProto{Type: gre.VSFTypeRIST, Subtype: gre.VSFSubtypeKeepalive}.AppendTo(ka)
 	ka = append(ka, 0x00, 0x01, 0x02, 0x03) // arbitrary keepalive body
-	if isMedia, _, _, err := dec.decodeMain(ka, 0); err != nil || isMedia {
+	if isMedia, _, _, _, err := dec.decodeMain(ka, 0); err != nil || isMedia {
 		t.Fatalf("VSF keepalive: isMedia=%v err=%v, want (false, nil)", isMedia, err)
 	}
 }
@@ -730,7 +730,7 @@ func TestDecodeMainCNAMEEmission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMainFeedback: %v", err)
 	}
-	_, _, fbs, err := dec.decodeMain(dg, 0)
+	_, _, fbs, _, err := dec.decodeMain(dg, 0)
 	if err != nil {
 		t.Fatalf("decodeMain (encrypted, first): %v", err)
 	}
@@ -741,7 +741,7 @@ func TestDecodeMainCNAMEEmission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMainFeedback 2: %v", err)
 	}
-	_, _, fbs2, err := dec.decodeMain(dg2, 0)
+	_, _, fbs2, _, err := dec.decodeMain(dg2, 0)
 	if err != nil {
 		t.Fatalf("decodeMain (encrypted, second): %v", err)
 	}
@@ -755,7 +755,7 @@ func TestDecodeMainCNAMEEmission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cleartext encodeMainFeedback: %v", err)
 	}
-	_, _, cfbs, err := cDec.decodeMain(cdg, 0)
+	_, _, cfbs, _, err := cDec.decodeMain(cdg, 0)
 	if err != nil {
 		t.Fatalf("decodeMain (cleartext): %v", err)
 	}
