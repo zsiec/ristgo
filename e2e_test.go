@@ -28,7 +28,10 @@ func freeEvenPort(t *testing.T) int {
 		if p%2 != 0 {
 			p--
 		}
-		if p <= 0 {
+		// Reject ports near the top of the range: callers bind neighbour ports up
+		// to p+4 (the +1 RTCP / +2 column / +4 row FEC sockets), so p+4 must stay
+		// a valid port (<= 65535), else the bind fails with "invalid argument".
+		if p <= 0 || p+4 > 65535 {
 			continue
 		}
 		c1, e1 := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p})
