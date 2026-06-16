@@ -1365,6 +1365,17 @@ func localHardwareMAC() [6]byte {
 // sendGREKeepalive emits one GRE keepalive advertising this node's MAC and
 // capability bits at the given GRE version (libRIST
 // _librist_proto_gre_send_keepalive). It is the Main-profile capability/liveness
+// localCaps returns the Main-profile keepalive capabilities this session
+// advertises: the standard set, plus the SMPTE-2022 FEC flag (P) when FEC is
+// enabled, so a peer learns FEC is in use (TR-06-2 keepalive Capability Flags).
+func (s *Session) localCaps() gre.Capabilities {
+	caps := gre.StandardCapabilities()
+	if s.fecEnabled() {
+		caps.P = true
+	}
+	return caps
+}
+
 // beacon, distinct from the periodic RTCP. A no-op until the peer is learned.
 func (s *Session) sendGREKeepalive(version uint8) {
 	if s.cfg.OneWay {
@@ -1373,7 +1384,7 @@ func (s *Session) sendGREKeepalive(version uint8) {
 	if s.main == nil || !s.peer.RTCP.IsValid() {
 		return
 	}
-	ka := gre.Keepalive{MAC: s.localMAC, Caps: gre.StandardCapabilities()}
+	ka := gre.Keepalive{MAC: s.localMAC, Caps: s.localCaps()}
 	b, err := s.main.encodeKeepalive(nil, ka, version)
 	if err != nil {
 		s.logf("gre keepalive encode: %v", err)

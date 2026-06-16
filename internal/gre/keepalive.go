@@ -59,7 +59,7 @@ type Capabilities struct {
 	N bool // Null-packet deletion (capabilities1 bit 0).
 	L bool // Pair-split (capabilities1 bit 1).
 	E bool // SMPTE 2022-7 (capabilities1 bit 2).
-	P bool // capabilities1 bit 3.
+	P bool // SMPTE-2022 FEC support (capabilities1 bit 3).
 	A bool // capabilities1 bit 4.
 	B bool // Bonding (capabilities1 bit 5).
 	R bool // capabilities1 bit 6.
