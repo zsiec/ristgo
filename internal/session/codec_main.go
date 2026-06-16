@@ -161,6 +161,35 @@ type mainCodec struct {
 	extScratch    []byte
 	regionScratch []byte
 	ctScratch     []byte
+
+	// fecReduceScratch and fecCanonScratch back fecPayload's null canonicalization
+	// (kept separate from the encode scratches so neither aliases the other).
+	fecReduceScratch []byte
+	fecCanonScratch  []byte
+}
+
+// fecPayload returns the payload the FEC must be computed over when this codec is
+// the media codec (TR-06-2 §8.6.2). With null-packet deletion active, FEC shall be
+// computed over the payload with null packets canonicalized to the form the receiver
+// reconstructs after expansion (0xFF fill, zeroed continuity/error/priority), so the
+// sender's FEC matches the receiver's post-expansion payload. With NPD off, or a
+// payload that has no null packets, the payload is returned unchanged. The FEC XOR
+// covers only this media payload, never the NPD extension header (§8.6.2).
+func (c *mainCodec) fecPayload(payload []byte) []byte {
+	if !c.npdEnabled {
+		return payload
+	}
+	reduced, bits, suppressed, err := npd.Suppress(c.fecReduceScratch[:0], payload)
+	c.fecReduceScratch = reduced
+	if err != nil || suppressed == 0 {
+		return payload // no canonicalizable nulls; FEC over the payload as-is
+	}
+	canon, err := npd.Expand(c.fecCanonScratch[:0], reduced, bits)
+	if err != nil {
+		return payload
+	}
+	c.fecCanonScratch = canon
+	return canon
 }
 
 // newMainCodec constructs a Main-profile codec. sendKey and recvKey may be nil

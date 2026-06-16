@@ -248,6 +248,7 @@ func buildMainParams(cfg Config) (*session.MainParams, error) {
 	mp := &session.MainParams{
 		VirtSrcPort: cfg.VirtSrcPort,
 		VirtDstPort: cfg.VirtDstPort,
+		NPD:         cfg.NullPacketDeletion,
 	}
 	if cfg.Secret == "" {
 		// No pre-shared secret. With SRP credentials this is the

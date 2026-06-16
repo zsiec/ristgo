@@ -118,6 +118,14 @@ func WithCompression() Option { return func(c *Config) { c.Compression = true } 
 // corrupted delivery, not an error. Enable it only when both ends are ristgo.
 func WithFragmentSize(n int) Option { return func(c *Config) { c.FragmentSize = n } }
 
+// WithNullPacketDeletion enables Main-profile null-packet deletion on the send path
+// (TR-06-2 §8.3): the sender suppresses MPEG-TS null packets and signals them in the
+// RIST NPD extension, saving stuffing bandwidth. Main profile only; see
+// [Config.NullPacketDeletion].
+func WithNullPacketDeletion() Option {
+	return func(c *Config) { c.NullPacketDeletion = true }
+}
+
 // WithFEC enables SMPTE ST 2022-1 forward error correction over a Columns (L) by
 // Rows (D) matrix. It is 2-D (column + row) FEC, recovering any single loss per row
 // and per column; pair it with [WithColumnOnlyFEC] (in either order) for 1-D

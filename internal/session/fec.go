@@ -100,7 +100,14 @@ func (s *Session) fecOnSend(now clock.Timestamp, pkt wire.MediaPacket, datagram 
 	if s.adv != nil {
 		fps = s.fecEnc.Push(pkt.Seq, 0, 0, datagram) // recover exact wire bytes
 	} else {
-		fps = s.fecEnc.Push(pkt.Seq, rtpTSFromSource(pkt.SourceTime), fecPT, pkt.Payload)
+		payload := pkt.Payload
+		if s.main != nil {
+			// TR-06-2 §8.6.2: when null-packet deletion is active, FEC is computed
+			// over the payload with nulls canonicalized to the receiver's expanded
+			// form. A no-op when NPD is off or the payload carries no nulls.
+			payload = s.main.fecPayload(pkt.Payload)
+		}
+		fps = s.fecEnc.Push(pkt.Seq, rtpTSFromSource(pkt.SourceTime), fecPT, payload)
 	}
 	for _, fp := range fps {
 		s.sendFEC(now, fp)

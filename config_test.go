@@ -501,6 +501,18 @@ func TestConfigValidate(t *testing.T) {
 		{"weight negative", func(c *Config) { c.Weight = -1 },
 			"rist: Weight must be at least 0 (0 = duplicate)"},
 
+		// Null-packet deletion: Main profile only.
+		{"npd on main", func(c *Config) {
+			c.Profile = ProfileMain
+			c.NullPacketDeletion = true
+		}, ""},
+		{"npd on simple rejected", func(c *Config) { c.NullPacketDeletion = true },
+			"rist: NullPacketDeletion requires ProfileMain"},
+		{"npd on advanced rejected", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.NullPacketDeletion = true
+		}, "rist: NullPacketDeletion requires ProfileMain"},
+
 		// Multicast: MulticastTTL range (0..255), MulticastLoopback always OK.
 		{"multicast ttl zero (OS default)", func(c *Config) { c.MulticastTTL = 0 }, ""},
 		{"multicast ttl mid", func(c *Config) { c.MulticastTTL = 32 }, ""},

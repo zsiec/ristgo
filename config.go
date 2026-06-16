@@ -237,6 +237,16 @@ type Config struct {
 	// ports. See [FECConfig].
 	FEC *FECConfig
 
+	// NullPacketDeletion enables Main-profile null-packet deletion on the send path
+	// (TR-06-2 §8.3): the sender suppresses MPEG-TS null packets (PID 0x1FFF) and
+	// signals their positions in the RIST NPD RTP extension, saving the bandwidth of
+	// transmitting stuffing. The receiver reconstructs canonical null packets (0xFF
+	// fill) in their place; a non-canonical null packet is therefore not preserved
+	// byte-for-byte, matching libRIST. Main profile only. It composes with FEC: FEC
+	// is computed over the canonicalized payload (§8.6.2). The receiver handles NPD
+	// from any peer regardless of this setting; this flag controls only emission.
+	NullPacketDeletion bool
+
 	// Weight is the load-balancing weight applied uniformly to every path of a
 	// bonded sender built from the []string form (NewBondedSender / DialBonded /
 	// WithWeight / the ?weight= URL parameter). 0 (the default, libRIST
@@ -405,6 +415,10 @@ func (cfg *Config) validate() error {
 		if carriage == FECCarriageInBand && cfg.Profile != ProfileAdvanced {
 			return errors.New("rist: in-band FEC carriage requires ProfileAdvanced")
 		}
+	}
+
+	if cfg.NullPacketDeletion && cfg.Profile != ProfileMain {
+		return errors.New("rist: NullPacketDeletion requires ProfileMain")
 	}
 
 	if cfg.DTLS != nil {
