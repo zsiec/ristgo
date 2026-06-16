@@ -3,6 +3,7 @@ package ristgo
 import (
 	"fmt"
 
+	"github.com/zsiec/ristgo/internal/fec"
 	"github.com/zsiec/ristgo/internal/session"
 )
 
@@ -26,11 +27,13 @@ import (
 // over the RTP payload, the form that interoperates with any ST 2022-1 receiver (the
 // Advanced in-band carriage is ristgo-to-ristgo).
 //
+// Set [FECConfig.Variant] to [FECVariant2022_5] for the high-bit-rate ST 2022-5 wire
+// format (SMPTE ST 2022-5:2013 §7.3), which raises the matrix ceiling to L*D <= 6000.
+//
 // # Not yet supported
 //
 //   - FEC together with link bonding (2022-7 duplication already provides seamless
 //     multipath recovery) is rejected by validation.
-//   - ST 2022-5 (the high-bitrate variant; only ST 2022-1 is implemented).
 //   - Encrypted FEC packets.
 type FECConfig struct {
 	// Columns is L, the matrix width (the spacing between a column's packets).
@@ -43,7 +46,25 @@ type FECConfig struct {
 	// sensible default per profile: in-band Advanced control messages for the
 	// Advanced profile, separate UDP ports for the Simple profile.
 	Carriage FECCarriage
+	// Variant selects the SMPTE FEC wire format. The zero value is ST 2022-1; set
+	// it to [FECVariant2022_5] for the high-bit-rate ST 2022-5 format, which carries
+	// a 16-bit base sequence and 10-bit matrix dimensions (raising the matrix ceiling
+	// to L*D <= 6000) for interop with ST 2022-5/ST 2022-6 equipment.
+	Variant FECVariant
 }
+
+// FECVariant selects the SMPTE FEC wire format. The matrix math is identical; the
+// header layout and matrix limits differ (see [FECConfig.Variant]).
+type FECVariant uint8
+
+const (
+	// FECVariant2022_1 is SMPTE ST 2022-1, the default (TR-06-2 §8.4 / TR-06-3
+	// §5.3.5).
+	FECVariant2022_1 FECVariant = iota
+	// FECVariant2022_5 is SMPTE ST 2022-5, the high-bit-rate format defined in
+	// SMPTE ST 2022-5:2013 §7.3.
+	FECVariant2022_5
+)
 
 // FECCarriage selects how SMPTE ST 2022-1 FEC packets travel.
 type FECCarriage int
@@ -72,21 +93,30 @@ func (f *FECConfig) carriage(advanced bool) FECCarriage {
 	return FECCarriageSeparatePorts
 }
 
-// validate enforces the TR-06-3 ST 2022-1 matrix bounds: L in [1,20] (column-only)
-// or [4,20] (2-D), D in [4,20], and L*D <= 100.
+// validate enforces the TR-06-3 matrix bounds for the configured variant. ST 2022-1:
+// L in [1,20] (column-only) or [4,20] (2-D), D in [4,20], L*D <= 100. ST 2022-5:
+// L in [1,1020] or [4,1020], D in [4,255], L*D <= 6000.
 func (f *FECConfig) validate() error {
+	maxL, maxD, maxMatrix, std := 20, 20, 100, "ST 2022-1"
+	switch f.Variant {
+	case FECVariant2022_1:
+	case FECVariant2022_5:
+		maxL, maxD, maxMatrix, std = 1020, 255, 6000, "ST 2022-5"
+	default:
+		return fmt.Errorf("rist: FEC Variant %d is not a known SMPTE FEC variant", f.Variant)
+	}
 	minL := 4
 	if f.ColumnOnly {
 		minL = 1
 	}
-	if f.Columns < minL || f.Columns > 20 {
-		return fmt.Errorf("rist: FEC Columns (L) must be in [%d,20], got %d", minL, f.Columns)
+	if f.Columns < minL || f.Columns > maxL {
+		return fmt.Errorf("rist: FEC Columns (L) must be in [%d,%d] for %s, got %d", minL, maxL, std, f.Columns)
 	}
-	if f.Rows < 4 || f.Rows > 20 {
-		return fmt.Errorf("rist: FEC Rows (D) must be in [4,20], got %d", f.Rows)
+	if f.Rows < 4 || f.Rows > maxD {
+		return fmt.Errorf("rist: FEC Rows (D) must be in [4,%d] for %s, got %d", maxD, std, f.Rows)
 	}
-	if f.Columns*f.Rows > 100 {
-		return fmt.Errorf("rist: FEC matrix L*D = %d exceeds the ST 2022-1 limit of 100", f.Columns*f.Rows)
+	if f.Columns*f.Rows > maxMatrix {
+		return fmt.Errorf("rist: FEC matrix L*D = %d exceeds the %s limit of %d", f.Columns*f.Rows, std, maxMatrix)
 	}
 	return nil
 }
@@ -97,10 +127,15 @@ func toSessionFEC(f *FECConfig, advanced bool) *session.FECParams {
 	if f == nil {
 		return nil
 	}
+	variant := fec.Variant20221
+	if f.Variant == FECVariant2022_5 {
+		variant = fec.Variant20225
+	}
 	return &session.FECParams{
 		Cols:          f.Columns,
 		Rows:          f.Rows,
 		ColumnOnly:    f.ColumnOnly,
 		SeparatePorts: f.carriage(advanced) == FECCarriageSeparatePorts,
+		Variant:       variant,
 	}
 }

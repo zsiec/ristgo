@@ -131,6 +131,18 @@ func WithFEC(columns, rows int) Option {
 	}
 }
 
+// WithFEC2022_5 enables FEC in the high-bit-rate SMPTE ST 2022-5 wire format over a
+// Columns (L) by Rows (D) matrix (see [WithFEC] for the matrix semantics). ST 2022-5
+// raises the matrix ceiling to L in [1,1020], D in [4,255], L*D <= 6000, for interop
+// with ST 2022-5 / ST 2022-6 equipment. Pair it with [WithColumnOnlyFEC] in either
+// order for 1-D column-only.
+func WithFEC2022_5(columns, rows int) Option {
+	return func(c *Config) {
+		colOnly := c.FEC != nil && c.FEC.ColumnOnly
+		c.FEC = &FECConfig{Columns: columns, Rows: rows, ColumnOnly: colOnly, Variant: FECVariant2022_5}
+	}
+}
+
 // WithColumnOnlyFEC restricts FEC (see [WithFEC]) to column-only (1-D) protection,
 // roughly halving the overhead at the cost of recovering only column losses. It may
 // be applied before or after WithFEC.

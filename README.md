@@ -4,9 +4,9 @@ A pure-Go implementation of the **RIST** (Reliable Internet Stream Transport)
 protocol, the VSF TR-06 family of technical recommendations.
 
 > **Status: feature-complete, pre-1.0.** The full RIST stack is implemented and
-> tested, covering all three profiles, SMPTE 2022-7 bonding, SMPTE ST 2022-1 FEC,
-> source adaptation, and a pure-Go DTLS transport, and it interoperates with
-> libRIST and OpenSSL.
+> tested, covering all three profiles, SMPTE 2022-7 bonding, SMPTE ST 2022-1 and
+> ST 2022-5 FEC, source adaptation, and a pure-Go DTLS transport, and it
+> interoperates with libRIST and OpenSSL.
 > The public API is small and stable in shape. No compatibility guarantees are
 > made before a tagged 1.0, so expect occasional changes.
 
@@ -197,17 +197,19 @@ n, proto, _ := rx.ReadOOBTyped(buf)           // dispatch on the protocol tag
 // proto == ristgo.OOBProtocolIP for libRIST and default WriteOOB
 ```
 
-### Forward error correction (SMPTE ST 2022-1)
+### Forward error correction (SMPTE ST 2022-1 and ST 2022-5)
 
 `WithFEC` adds 2-D (row + column) XOR FEC over the media: the sender emits FEC
 packets for each row and column of an L×D matrix, and the receiver recovers any
 single loss per row or column with no NACK round trip, complementing ARQ. The
 decoder is driven by each FEC packet's own sequence base, so it recovers correctly
-even if the first packet of the stream is lost.
+even if the first packet of the stream is lost and makes no block-alignment
+assumption (it interoperates with a traffic-shaping, non-block-aligned sender).
 
 ```go
-tx, _ := ristgo.Dial(ctx, "host:5000", ristgo.WithFEC(10, 5)) // 10x5 matrix
-// ristgo.WithColumnOnlyFEC() for 1-D column-only (half the overhead)
+tx, _ := ristgo.Dial(ctx, "host:5000", ristgo.WithFEC(10, 5)) // 10x5 matrix, ST 2022-1
+// ristgo.WithColumnOnlyFEC()    for 1-D column-only (half the overhead)
+// ristgo.WithFEC2022_5(20, 10)  for the high-bit-rate ST 2022-5 format
 ```
 
 FEC works on every profile. The Simple and Main profiles carry standard ST 2022-1
@@ -217,6 +219,10 @@ The Advanced profile instead carries FEC in-band as control messages on the data
 port (TR-06-3 §5.3.5), computed over the full encrypted datagram so it composes with
 payload fragmentation and PSK encryption. `FECConfig.Carriage` selects between them
 when both apply; the default is in-band for Advanced and separate ports otherwise.
+
+`FECConfig.Variant` selects the wire format: ST 2022-1 (the default, L×D ≤ 100) or the
+high-bit-rate ST 2022-5 (SMPTE ST 2022-5:2013 §7.3, a 16-bit base and 10-bit matrix
+dimensions, L×D ≤ 6000) for interop with ST 2022-5 / ST 2022-6 equipment.
 `Stats.FECRecovered` counts packets reconstructed by FEC.
 
 ### Source-adaptive bitrate (TR-06-4 Part 1)
@@ -278,7 +284,7 @@ Everything below is implemented and tested.
 | Stream multiplexing (MultiReceiver: N flows demultiplexed per port) | all | TR-06-1..3 |
 | SMPTE 2022-7 bonding, seamless multipath reconstruction | all | TR-06-1..3 |
 | Weighted load-share bonding (per-path weights, runtime SetWeight) | all | libRIST weight |
-| Forward error correction (SMPTE ST 2022-1, 2-D XOR; separate-port + Advanced in-band carriage) | Simple, Advanced | TR-06-2 §8.4, TR-06-3 §5.3.5 |
+| Forward error correction (SMPTE ST 2022-1 and ST 2022-5, 2-D XOR; separate-port + Advanced in-band carriage) | all | TR-06-2 §8.4, TR-06-3 §5.3.5 |
 | Source adaptation (Link Quality Messages, encoder-rate callback) | all | TR-06-4 Part 1 |
 | IP multicast (group membership, multicast TTL, egress interface, source filter) | all | n/a |
 | Reversed-role transport (caller-receive, listener-send) | all | n/a |

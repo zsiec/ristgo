@@ -27,14 +27,15 @@ import (
 // Index 0x0022 row / 0x0023 column) on the data port, or standard ST 2022-1 RTP
 // packets on dedicated UDP ports (media port + 2 column, + 4 row).
 
-// FECParams sizes the FEC matrix, selects column-only vs 2-D, and chooses the
-// carriage (in-band Advanced control messages, or standard ST 2022-1 on separate
-// UDP ports).
+// FECParams sizes the FEC matrix, selects column-only vs 2-D, picks the ST 2022-1
+// or ST 2022-5 wire format, and chooses the carriage (in-band Advanced control
+// messages, or standard ST 2022-x on separate UDP ports).
 type FECParams struct {
 	Cols          int // L: columns
 	Rows          int // D: rows
 	ColumnOnly    bool
-	SeparatePorts bool // carry FEC on dedicated UDP ports (else Advanced in-band)
+	SeparatePorts bool        // carry FEC on dedicated UDP ports (else Advanced in-band)
+	Variant       fec.Variant // ST 2022-1 (default) or ST 2022-5
 }
 
 // fecPayloadSize bounds the protected payload the FEC matrix accumulates; it must
@@ -57,7 +58,12 @@ const (
 func (s *Session) fecEnabled() bool { return s.cfg.FEC != nil }
 
 func (s *Session) fecConfig() fec.Config {
-	return fec.Config{Cols: s.cfg.FEC.Cols, Rows: s.cfg.FEC.Rows, ColumnOnly: s.cfg.FEC.ColumnOnly}
+	return fec.Config{
+		Cols:       s.cfg.FEC.Cols,
+		Rows:       s.cfg.FEC.Rows,
+		ColumnOnly: s.cfg.FEC.ColumnOnly,
+		Variant:    s.cfg.FEC.Variant,
+	}
 }
 
 // fecSourceRTP reconstructs the normalized source time of a Simple- or Main-profile
@@ -116,9 +122,10 @@ func (s *Session) sendFEC(now clock.Timestamp, fp fec.Packet) {
 		s.sendFECSeparate(fp)
 		return
 	}
-	ci := adv.CIFEC20221Col
+	rowCI, colCI := s.fecControlIndices()
+	ci := colCI
 	if fp.Direction == fec.Row {
-		ci = adv.CIFEC20221Row
+		ci = rowCI
 	}
 	body := adv.BuildControl(nil, ci, fp.Data)
 	if len(body) <= fecMaxCtrlBody {
@@ -190,19 +197,26 @@ func fecFragRole(first, last bool) wire.FragRole {
 	}
 }
 
-// fecIsControlIndex reports whether ci is a FEC control index ristgo can decode.
-// Only the ST 2022-1 indices are recognized: TR-06-3 §5.3.5 defers the ST 2022-5
-// FEC packet to the header in SMPTE ST 2022-5:2013 §7.3, which is a different layout
-// that ristgo does not implement, so a received ST 2022-5 FEC message (CI 0x0020/
-// 0x0021) is left to the unsupported-control-message path rather than misparsed as
-// ST 2022-1.
-func fecIsControlIndex(ci uint16) bool {
-	switch ci {
-	case adv.CIFEC20221Row, adv.CIFEC20221Col:
-		return true
-	default:
+// fecControlIndices returns the (row, column) in-band FEC control indices for the
+// configured variant: ST 2022-1 uses 0x0022/0x0023, ST 2022-5 uses 0x0020/0x0021
+// (TR-06-3 §5.3.5).
+func (s *Session) fecControlIndices() (row, col uint16) {
+	if s.cfg.FEC != nil && s.cfg.FEC.Variant == fec.Variant20225 {
+		return adv.CIFEC20225Row, adv.CIFEC20225Col
+	}
+	return adv.CIFEC20221Row, adv.CIFEC20221Col
+}
+
+// fecControlIndex reports whether ci is the in-band FEC control index ristgo decodes
+// for the configured variant. A FEC message in the other variant's index is left to
+// the unsupported-control-message path rather than misparsed under the wrong header,
+// since the session's decoder only understands its configured wire format.
+func (s *Session) fecControlIndex(ci uint16) bool {
+	if s.cfg.FEC == nil {
 		return false
 	}
+	row, col := s.fecControlIndices()
+	return ci == row || ci == col
 }
 
 // fecRecvRTP feeds one received Simple- or Main-profile media packet (its inner RTP

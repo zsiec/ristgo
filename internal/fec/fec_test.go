@@ -258,6 +258,206 @@ func TestDecoderRandomLossProperty(t *testing.T) {
 	}
 }
 
+// TestHeader5RoundTrip checks the SMPTE 2022-5 FEC header (§7.3) encodes and decodes
+// byte-stably across its flag, 16-bit base, and 10-bit Offset/NA fields, and that a
+// short buffer is rejected.
+func TestHeader5RoundTrip(t *testing.T) {
+	for _, h := range []Header5{
+		{PTRecovery: 96, SNBase: 0x1234, TSRecovery: 0xDEADBEEF, LengthRecovery: 1316, Offset: 5, NA: 4},
+		{PRecovery: true, XRecovery: true, CCRecovery: 0x0f, MRecovery: true, PTRecovery: 0x7F, SNBase: 0xFFFF, TSRecovery: 0, LengthRecovery: 0xFFFF, Offset: 1, NA: 20},
+		{Offset: na10Max, NA: na10Max, SNBase: 0x8001}, // 10-bit field maxima
+	} {
+		b := h.AppendTo(nil)
+		if len(b) != HeaderSize {
+			t.Fatalf("encoded header is %d bytes, want %d", len(b), HeaderSize)
+		}
+		got, off, err := ParseHeader5(b)
+		if err != nil || off != HeaderSize {
+			t.Fatalf("ParseHeader5: off=%d err=%v", off, err)
+		}
+		if got != h {
+			t.Fatalf("2022-5 header round-trip:\n got  %+v\n want %+v", got, h)
+		}
+	}
+	// Reserved bits (b[10:12], low 6 of the Offset/NA octets, E/R) must be ignored:
+	// setting them on parse input must not change the decoded fields.
+	b := Header5{Offset: 5, NA: 4, SNBase: 7}.AppendTo(nil)
+	b[10], b[11] = 0xFF, 0xFF // Reserved
+	b[13] |= 0x3f             // Offset's 6 reserved low bits
+	b[15] |= 0x3f             // NA's 6 reserved low bits
+	b[0] |= 0xc0              // E, R
+	got, _, _ := ParseHeader5(b)
+	if got.Offset != 5 || got.NA != 4 || got.SNBase != 7 {
+		t.Fatalf("reserved bits leaked into fields: %+v", got)
+	}
+	if _, _, err := ParseHeader5(make([]byte, HeaderSize-1)); err == nil {
+		t.Fatal("ParseHeader5 accepted a short buffer")
+	}
+}
+
+// TestVariant20225Recovers runs the core recovery scenarios through the ST 2022-5
+// wire format (Variant20225), proving the high-bit-rate header drives the same XOR
+// matrix: column-only single loss, 2-D single loss, and the recursive 2-D cascade.
+func TestVariant20225Recovers(t *testing.T) {
+	t.Run("column-only", func(t *testing.T) {
+		cfg := Config{Cols: 5, Rows: 4, ColumnOnly: true, Variant: Variant20225}
+		const isn = 1000
+		events, orig := encodeStream(cfg, isn, cfg.matrixSize()*3)
+		drop := map[uint32]bool{}
+		for k := 0; k < cfg.Cols; k++ {
+			drop[seqAdd(isn, k*cfg.Cols+k)] = true // one per column
+		}
+		rec := replay(cfg, isn, events, drop, orig, t)
+		for s := range drop {
+			if !rec[s] {
+				t.Fatalf("2022-5 column-only failed to recover seq %d", s)
+			}
+		}
+	})
+	t.Run("2d-single", func(t *testing.T) {
+		cfg := Config{Cols: 5, Rows: 4, Variant: Variant20225}
+		const isn = 60000 // near the 16-bit base wrap, to exercise widening
+		events, orig := encodeStream(cfg, isn, cfg.matrixSize()*3)
+		drop := map[uint32]bool{seqAdd(isn, 7): true}
+		rec := replay(cfg, isn, events, drop, orig, t)
+		if !rec[seqAdd(isn, 7)] {
+			t.Fatal("2022-5 2-D FEC failed to recover a single loss across the 16-bit base wrap")
+		}
+	})
+	t.Run("recursive", func(t *testing.T) {
+		cfg := Config{Cols: 4, Rows: 4, Variant: Variant20225}
+		const isn = 200
+		events, orig := encodeStream(cfg, isn, cfg.matrixSize()*2)
+		drop := map[uint32]bool{seqAdd(isn, 0): true, seqAdd(isn, 1): true, seqAdd(isn, 4): true}
+		rec := replay(cfg, isn, events, drop, orig, t)
+		for s := range drop {
+			if !rec[s] {
+				t.Fatalf("2022-5 recursive 2-D failed to recover seq %d", s)
+			}
+		}
+	})
+}
+
+// TestVariant20225RandomLossProperty drives seeded random loss through the ST 2022-5
+// decoder, asserting the same invariants as the 2022-1 property test: nothing
+// fabricated, and every single-per-matrix loss recovered.
+func TestVariant20225RandomLossProperty(t *testing.T) {
+	for seed := uint64(1); seed <= 40; seed++ {
+		rng := splitmix64(seed)
+		cfg := Config{Cols: 4 + int(rng.next()%5), Rows: 4 + int(rng.next()%5), Variant: Variant20225}
+		matrices := 4
+		isn := uint32(rng.next())
+		events, orig := encodeStream(cfg, isn, cfg.matrixSize()*matrices)
+		sparse := seed%3 == 0
+		drop := map[uint32]bool{}
+		if sparse {
+			for m := 1; m < matrices; m++ {
+				pos := int(rng.next()) % cfg.matrixSize()
+				drop[seqAdd(isn, m*cfg.matrixSize()+pos)] = true
+			}
+		} else {
+			for i := 0; i < cfg.matrixSize()*matrices; i++ {
+				if rng.next()%100 < 12 {
+					drop[seqAdd(isn, i)] = true
+				}
+			}
+		}
+		rec := replay(cfg, int(isn), events, drop, orig, t)
+		if sparse {
+			for s := range drop {
+				if !rec[s] {
+					t.Fatalf("seed %d (L=%d D=%d): 2022-5 single per-matrix loss seq %d not recovered", seed, cfg.Cols, cfg.Rows, s)
+				}
+			}
+		}
+	}
+}
+
+// makeColFEC5 hand-builds one ST 2022-5 column FEC packet protecting the D media
+// datagrams {base, base+L, ..., base+(D-1)L}, as an external (e.g. ST 2022-6)
+// sender would. It lets a test feed column FEC with arbitrary, staggered bases.
+func makeColFEC5(base uint32, L, D int, orig map[uint32][]byte) []byte {
+	g := newGroup(base, testPayloadSize)
+	for j := 0; j < D; j++ {
+		s := seqAdd(base, j*L)
+		g.clip(uint16(len(orig[s])), mkPT(s), mkTS(s), orig[s])
+	}
+	h := Header5{LengthRecovery: g.lengthClip, PTRecovery: g.ptClip, TSRecovery: g.tsClip,
+		SNBase: uint16(base), Offset: uint16(L), NA: uint16(D)}
+	return append(h.AppendTo(nil), g.payloadClip...)
+}
+
+// TestDecoderNonBlockAligned proves the decoder makes no block-alignment assumption
+// (ST 2022-5 §7.1 / Annex B, Figure B.1): it recovers from column FEC whose bases are
+// staggered (advancing by less than a full block) and overlap, deriving the protected
+// set from each header's SNBase + j*Offset alone. This is what interop with a
+// traffic-shaping ST 2022-5 sender requires.
+func TestDecoderNonBlockAligned(t *testing.T) {
+	const (
+		L   = 5
+		D   = 3
+		isn = 0
+	)
+	// Generate enough media payloads to cover the staggered columns below.
+	orig := map[uint32][]byte{}
+	for i := 0; i < 40; i++ {
+		s := seqAdd(isn, i)
+		orig[s] = mkPayload(s)
+	}
+	// Non-block-aligned column FEC: bases advance by 3 (not by 1 within one block),
+	// so the columns are offset in time and overlap. Each protects {base, base+5, base+10}.
+	bases := []uint32{0, 3, 6, 9, 12}
+	// Drop exactly one media datagram from each staggered column.
+	dropFor := map[uint32]uint32{0: 5, 3: 13, 6: 16, 9: 9, 12: 22} // base -> dropped member
+	drop := map[uint32]bool{}
+	for _, m := range dropFor {
+		drop[m] = true
+	}
+
+	dec := NewDecoder(Config{Cols: L, Rows: D, Variant: Variant20225}, testPayloadSize, isn)
+	recovered := map[uint32]bool{}
+	// Feed all (non-dropped) media first, then the FEC, mimicking column FEC arriving
+	// after its block.
+	for i := 0; i < 40; i++ {
+		s := seqAdd(isn, i)
+		if drop[s] {
+			continue
+		}
+		for _, r := range dec.PushMedia(s, mkTS(s), mkPT(s), orig[s]) {
+			recovered[r.Seq] = true
+		}
+	}
+	for _, base := range bases {
+		for _, r := range dec.PushFEC(makeColFEC5(base, L, D, orig)) {
+			if !bytes.Equal(r.Payload, orig[r.Seq]) {
+				t.Fatalf("non-block-aligned recovery of seq %d corrupt", r.Seq)
+			}
+			recovered[r.Seq] = true
+		}
+	}
+	for m := range drop {
+		if !recovered[m] {
+			t.Fatalf("decoder failed to recover staggered-column loss seq %d", m)
+		}
+	}
+}
+
+// FuzzParseHeader5 asserts the ST 2022-5 header parser never panics on arbitrary input.
+func FuzzParseHeader5(f *testing.F) {
+	f.Add([]byte(nil))
+	f.Add(make([]byte, HeaderSize))
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if h, off, err := ParseHeader5(b); err == nil {
+			if off != HeaderSize {
+				t.Fatalf("off=%d on success", off)
+			}
+			if h.Offset > na10Max || h.NA > na10Max {
+				t.Fatalf("10-bit field overflow: %+v", h)
+			}
+		}
+	})
+}
+
 // FuzzParseHeader asserts the header parser never panics on arbitrary input.
 func FuzzParseHeader(f *testing.F) {
 	f.Add([]byte(nil))

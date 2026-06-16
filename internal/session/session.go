@@ -1185,13 +1185,13 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 					if !p.FirstFrag || !p.LastFrag {
 						full, ok := s.fecCtrlReasm.push(fecFragRole(p.FirstFrag, p.LastFrag), p.Payload, false)
 						if ok {
-							if ci, body, cerr := adv.ParseControl(full); cerr == nil && fecIsControlIndex(ci) {
+							if ci, body, cerr := adv.ParseControl(full); cerr == nil && s.fecControlIndex(ci) {
 								s.fecOnRecvFEC(now, body)
 							}
 						}
 						return
 					}
-					if ci, body, cerr := adv.ParseControl(p.Payload); cerr == nil && fecIsControlIndex(ci) {
+					if ci, body, cerr := adv.ParseControl(p.Payload); cerr == nil && s.fecControlIndex(ci) {
 						s.fecOnRecvFEC(now, body)
 						return
 					}

@@ -2,12 +2,26 @@ package fec
 
 import "github.com/zsiec/ristgo/internal/seq"
 
+// Variant selects the FEC wire format: SMPTE ST 2022-1 (the default) or the high
+// bit rate ST 2022-5. The XOR matrix is identical; only the FEC header layout and
+// the base-sequence width differ (see [Header] and [Header5]).
+type Variant uint8
+
+const (
+	// Variant20221 is SMPTE ST 2022-1 (24-bit base, 8-bit Offset/NA).
+	Variant20221 Variant = iota
+	// Variant20225 is SMPTE ST 2022-5 (16-bit base, 10-bit Offset/NA).
+	Variant20225
+)
+
 // Config sizes the FEC matrix: Cols (L) columns by Rows (D) rows. ColumnOnly
-// suppresses the row (horizontal) FEC, keeping only column (vertical) FEC.
+// suppresses the row (horizontal) FEC, keeping only column (vertical) FEC. Variant
+// selects the ST 2022-1 or ST 2022-5 wire format.
 type Config struct {
 	Cols       int // L: number of columns (>= 1)
 	Rows       int // D: number of rows (>= 1)
 	ColumnOnly bool
+	Variant    Variant
 }
 
 func (c Config) matrixSize() int { return c.Cols * c.Rows }
@@ -142,21 +156,36 @@ func (e *Encoder) Push(s, ts uint32, pt uint8, payload []byte) []Packet {
 	return out
 }
 
-// emit builds a FEC packet (header + XOR payload) from a completed group.
+// emit builds a FEC packet (header + XOR payload) from a completed group, encoding
+// the ST 2022-1 or ST 2022-5 header per the configured variant.
 func (e *Encoder) emit(g *fecGroup, dir Direction) Packet {
-	h := Header{
-		LengthRecovery: g.lengthClip,
-		PTRecovery:     g.ptClip,
-		TSRecovery:     g.tsClip,
-		Direction:      dir,
+	offset, na := e.cfg.Cols, e.cfg.Rows // column: stride L over D members
+	if dir == Row {
+		offset, na = 1, e.cfg.Cols // row: stride 1 over L members
 	}
-	h.setBase24(g.base)
-	if dir == Column {
-		h.Offset, h.NA = uint8(e.cfg.Cols), uint8(e.cfg.Rows)
+	data := make([]byte, 0, HeaderSize+e.payloadSize)
+	if e.cfg.Variant == Variant20225 {
+		h := Header5{
+			LengthRecovery: g.lengthClip,
+			PTRecovery:     g.ptClip,
+			TSRecovery:     g.tsClip,
+			SNBase:         uint16(g.base),
+			Offset:         uint16(offset),
+			NA:             uint16(na),
+		}
+		data = h.AppendTo(data)
 	} else {
-		h.Offset, h.NA = 1, uint8(e.cfg.Cols)
+		h := Header{
+			LengthRecovery: g.lengthClip,
+			PTRecovery:     g.ptClip,
+			TSRecovery:     g.tsClip,
+			Direction:      dir,
+			Offset:         uint8(offset),
+			NA:             uint8(na),
+		}
+		h.setBase24(g.base)
+		data = h.AppendTo(data)
 	}
-	data := h.AppendTo(make([]byte, 0, HeaderSize+e.payloadSize))
 	data = append(data, g.payloadClip...)
 	return Packet{Direction: dir, Data: data}
 }
@@ -228,25 +257,42 @@ func (d *Decoder) PushMedia(s, ts uint32, pt uint8, payload []byte) []Recovered 
 	return d.out
 }
 
-// PushFEC parses a FEC packet (already stripped of its carriage framing) and
-// returns any packets it allowed FEC to recover.
+// PushFEC parses a FEC packet (already stripped of its carriage framing) in the
+// configured variant and returns any packets it allowed FEC to recover.
 func (d *Decoder) PushFEC(fec []byte) []Recovered {
 	d.out = d.out[:0]
-	h, off, err := ParseHeader(fec)
-	if err != nil {
-		return nil
+	var (
+		base               uint32
+		stride, count, off int
+		lengthRec          uint16
+		ptRec              uint8
+		tsRec              uint32
+	)
+	if d.cfg.Variant == Variant20225 {
+		h, o, err := ParseHeader5(fec)
+		if err != nil {
+			return nil
+		}
+		base, stride, count, off = d.widen(uint32(h.SNBase)), int(h.Offset), int(h.NA), o
+		lengthRec, ptRec, tsRec = h.LengthRecovery, h.PTRecovery&0x7f, h.TSRecovery
+	} else {
+		h, o, err := ParseHeader(fec)
+		if err != nil {
+			return nil
+		}
+		base, stride, count, off = d.widen(h.base24()), int(h.Offset), int(h.NA), o
+		lengthRec, ptRec, tsRec = h.LengthRecovery, h.PTRecovery&0x7f, h.TSRecovery
 	}
-	stride, count := int(h.Offset), int(h.NA)
-	if stride <= 0 || count <= 1 || count > 256 {
+	if stride <= 0 || count <= 1 || count > na10Max {
 		return nil // malformed geometry; ignore
 	}
 	d.fecs = append(d.fecs, storedFEC{
-		base:      d.widen(h.base24()),
+		base:      base,
 		stride:    stride,
 		count:     count,
-		lengthRec: h.LengthRecovery,
-		ptRec:     h.PTRecovery & 0x7f,
-		tsRec:     h.TSRecovery,
+		lengthRec: lengthRec,
+		ptRec:     ptRec,
+		tsRec:     tsRec,
 		payload:   append([]byte(nil), fec[off:]...),
 	})
 	d.recoverAll()
@@ -265,13 +311,18 @@ func (d *Decoder) advance(s uint32) {
 	}
 }
 
-// widen maps a 24-bit FEC base sequence to the full 32-bit space using the latest
-// media sequence as context (a FEC packet always protects sequences near the
-// current window).
-func (d *Decoder) widen(base24 uint32) uint32 {
-	cand := (d.lastSeq &^ 0xFFFFFF) | (base24 & 0xFFFFFF)
+// widen maps a truncated FEC base sequence to the full 32-bit space using the latest
+// media sequence as context (a FEC packet always protects sequences near the current
+// window). ST 2022-1 truncates to 24 bits, ST 2022-5 to 16; the window is always far
+// smaller than either span, so the nearest candidate is unambiguous.
+func (d *Decoder) widen(base uint32) uint32 {
+	mask, span := uint32(0xFFFFFF), uint32(1<<24)
+	if d.cfg.Variant == Variant20225 {
+		mask, span = 0xFFFF, 1<<16
+	}
+	cand := (d.lastSeq &^ mask) | (base & mask)
 	best := cand
-	for _, c := range [2]uint32{cand + (1 << 24), cand - (1 << 24)} {
+	for _, c := range [2]uint32{cand + span, cand - span} {
 		if abs(seqDiff(d.lastSeq, c)) < abs(seqDiff(d.lastSeq, best)) {
 			best = c
 		}

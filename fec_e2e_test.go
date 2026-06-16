@@ -191,9 +191,23 @@ func (p *fecSepProxy) Close() {
 // dropping one media packet per matrix. With no return channel (no ARQ), the
 // stream still reconstructs bit-exact, proving FEC alone recovered every loss.
 func TestE2EFECSeparatePortsSimple(t *testing.T) {
+	runSepPortsSimpleFEC(t, &ristgo.FECConfig{Columns: 5, Rows: 5})
+}
+
+// TestE2EFEC2022_5SeparatePortsSimple runs the same one-way Simple-profile,
+// FEC-only recovery but in the SMPTE ST 2022-5 wire format (§7.3 header). Simple
+// media carries no RTP padding/extension/CSRC/marker, so the 2022-5 recovery flag
+// fields are zero and the FEC is byte-compatible with an external ST 2022-5 receiver.
+func TestE2EFEC2022_5SeparatePortsSimple(t *testing.T) {
+	runSepPortsSimpleFEC(t, &ristgo.FECConfig{Columns: 5, Rows: 5, Variant: ristgo.FECVariant2022_5})
+}
+
+// runSepPortsSimpleFEC drives the separate-port Simple-profile FEC-only recovery for
+// the given matrix/variant.
+func runSepPortsSimpleFEC(t *testing.T, fecCfg *ristgo.FECConfig) {
 	const totalBytes = 256 * 1024
 	const chunk = 1316
-	const cols, rows = 5, 5
+	cols, rows := fecCfg.Columns, fecCfg.Rows
 
 	recvMedia := distinctEvenPort(t)
 	proxyMedia := distinctEvenPort(t, recvMedia)
@@ -201,7 +215,7 @@ func TestE2EFECSeparatePortsSimple(t *testing.T) {
 	cfg := ristgo.DefaultConfig() // Simple profile
 	cfg.BufferMin = 600 * time.Millisecond
 	cfg.BufferMax = 600 * time.Millisecond
-	cfg.FEC = &ristgo.FECConfig{Columns: cols, Rows: rows}
+	cfg.FEC = fecCfg
 
 	rx, err := ristgo.NewOneWayReceiver(fmt.Sprintf("127.0.0.1:%d", recvMedia), cfg)
 	if err != nil {
@@ -682,6 +696,20 @@ func TestE2EFECWithFragmentation(t *testing.T) {
 // (not only ARQ) carried the recovery. ARQ remains the backstop, so completeness
 // is guaranteed regardless.
 func TestE2EFECRecoversAdvanced(t *testing.T) {
+	runAdvInbandFEC(t, &ristgo.FECConfig{Columns: 5, Rows: 5})
+}
+
+// TestE2EFEC2022_5Advanced runs the Advanced-profile in-band FEC recovery in the
+// SMPTE ST 2022-5 wire format (Control Index 0x0020/0x0021, §7.3 header). The
+// protected unit is the full Advanced datagram, so 2022-5 recovers exact bytes just
+// as 2022-1 does, exercising the variant's CI selection and header on the wire.
+func TestE2EFEC2022_5Advanced(t *testing.T) {
+	runAdvInbandFEC(t, &ristgo.FECConfig{Columns: 5, Rows: 5, Variant: ristgo.FECVariant2022_5})
+}
+
+// runAdvInbandFEC drives Advanced-profile in-band FEC recovery for the given
+// matrix/variant over a lossy link, asserting bit-exact delivery and FEC recovery.
+func runAdvInbandFEC(t *testing.T, fecCfg *ristgo.FECConfig) {
 	const totalBytes = 256 * 1024
 	const chunk = 1316
 
@@ -694,7 +722,7 @@ func TestE2EFECRecoversAdvanced(t *testing.T) {
 	cfg := advConfig("", 0, false)
 	cfg.BufferMin = 500 * time.Millisecond
 	cfg.BufferMax = 500 * time.Millisecond
-	cfg.FEC = &ristgo.FECConfig{Columns: 5, Rows: 5} // 2-D, 25-packet matrix
+	cfg.FEC = fecCfg
 
 	rx, err := ristgo.NewReceiver(fmt.Sprintf("127.0.0.1:%d", recvPort), cfg)
 	if err != nil {
