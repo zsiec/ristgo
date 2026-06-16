@@ -201,6 +201,16 @@ func BindUDP(host string, port int) (*net.UDPConn, error) {
 	return bind(host, port)
 }
 
+// SocketBufferBytes is the UDP send and receive buffer ristgo requests on every
+// socket. The OS-default UDP receive buffer (notably ~208 KB on Linux) overflows
+// under a sender's startup burst, silently dropping media at the kernel before the
+// read goroutine drains it — a loss the peer then has to recover by retransmission,
+// or, if its congestion control reacts to the reported loss, by throttling. libRIST
+// raises its own socket buffers (1 MB) for the same reason. The kernel clamps the
+// request to its maximum (net.core.rmem_max / wmem_max on Linux), so enlarging it is
+// best-effort: a clamp or failure must not fail the bind.
+const SocketBufferBytes = 1 << 21 // 2 MiB
+
 // bindNet opens an unconnected UDP socket on host:port in the given network
 // ("udp", "udp4", or "udp6"). An empty network defaults to "udp".
 func bindNet(network, host string, port int) (*net.UDPConn, error) {
@@ -211,7 +221,15 @@ func bindNet(network, host string, port int) (*net.UDPConn, error) {
 	if host == "" {
 		addr.IP = nil
 	}
-	return net.ListenUDP(network, addr)
+	conn, err := net.ListenUDP(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	// Best-effort buffer enlargement; the kernel clamps to its max, and a failure
+	// to grow the buffer must not fail the bind.
+	_ = conn.SetReadBuffer(SocketBufferBytes)
+	_ = conn.SetWriteBuffer(SocketBufferBytes)
+	return conn, nil
 }
 
 // MediaPort returns the local media (even) port the transport is bound to.
