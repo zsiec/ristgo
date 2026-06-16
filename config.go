@@ -331,15 +331,23 @@ type Config struct {
 
 // DTLSConfig selects the DTLS 1.2 mode and credentials for Main-profile
 // transport security. Set exactly one of PSK or the certificate fields.
+//
+// All five TR-06-2 §6.2 mandatory cipher suites are supported and negotiated
+// automatically based on the configured credentials: a PSK enables the PSK suite;
+// an ECDSA P-256 certificate enables the ECDHE_ECDSA suites; an RSA certificate
+// enables the ECDHE_RSA suites and TLS_RSA_WITH_NULL_SHA256 (which is
+// integrity-only — it does NOT encrypt). Stronger, forward-secret suites are
+// preferred. Use DisabledSuites to turn individual suites off (the §6.2 SHALL).
 type DTLSConfig struct {
 	// PSK enables TLS_PSK_WITH_AES_128_GCM_SHA256: a shared secret on both ends.
 	// PSKIdentity is the identity hint exchanged (informational).
 	PSK         []byte
 	PSKIdentity string
 
-	// CertPEM and KeyPEM enable TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 with a
-	// supplied ECDSA P-256 certificate and key (PEM). On a receiver they are the
-	// presented server certificate; if omitted on a receiver, a self-signed
+	// CertPEM and KeyPEM supply the certificate and key (PEM). The certificate may
+	// be ECDSA P-256 (enabling the ECDHE_ECDSA suites) or RSA (enabling the
+	// ECDHE_RSA suites and RSA_WITH_NULL_SHA256). On a receiver they are the
+	// presented server certificate; if omitted on a receiver, a self-signed ECDSA
 	// certificate is generated. On a sender they are sent only for mutual auth.
 	CertPEM []byte
 	KeyPEM  []byte
@@ -352,7 +360,39 @@ type DTLSConfig struct {
 	// InsecureSkipVerify disables peer-certificate verification (cert mode). Use
 	// only for testing; prefer PeerFingerprint.
 	InsecureSkipVerify bool
+
+	// DisabledSuites lists cipher suites to turn off by their IANA id, satisfying
+	// TR-06-2 §6.2's requirement that a device let the user disable individual
+	// suites. A disabled suite is neither offered nor selected; disabling every
+	// usable suite fails the handshake rather than falling back. The DTLSSuite*
+	// constants name the supported ids.
+	DisabledSuites []uint16
+
+	// AllowNullCipher opts in to DTLSSuiteRSAWithNULLSHA256, which authenticates but
+	// does NOT encrypt. It is OFF by default: a confidentiality-free suite must not
+	// be reachable just because a certificate was configured. Set it only when an
+	// unencrypted-but-authenticated transport is a deliberate requirement.
+	AllowNullCipher bool
 }
+
+// DTLS cipher suite ids (IANA TLS registry), for DTLSConfig.DisabledSuites. They
+// are the TR-06-2 §6.2 mandatory suites plus the PSK suite RIST uses. The values
+// must stay equal to the internal dtls package's suite ids.
+const (
+	// DTLSSuitePSKWithAES128GCMSHA256 is TLS_PSK_WITH_AES_128_GCM_SHA256 (RFC 5487).
+	DTLSSuitePSKWithAES128GCMSHA256 uint16 = 0x00A8
+	// DTLSSuiteRSAWithNULLSHA256 is TLS_RSA_WITH_NULL_SHA256 (RFC 5246): integrity
+	// only, NO confidentiality; off unless DTLSConfig.AllowNullCipher is set.
+	DTLSSuiteRSAWithNULLSHA256 uint16 = 0x003B
+	// DTLSSuiteECDHEECDSAWithAES128GCMSHA256 is TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (RFC 5289).
+	DTLSSuiteECDHEECDSAWithAES128GCMSHA256 uint16 = 0xC02B
+	// DTLSSuiteECDHEECDSAWithAES256GCMSHA384 is TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 (RFC 5289).
+	DTLSSuiteECDHEECDSAWithAES256GCMSHA384 uint16 = 0xC02C
+	// DTLSSuiteECDHERSAWithAES128GCMSHA256 is TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (RFC 5289).
+	DTLSSuiteECDHERSAWithAES128GCMSHA256 uint16 = 0xC02F
+	// DTLSSuiteECDHERSAWithAES256GCMSHA384 is TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 (RFC 5289).
+	DTLSSuiteECDHERSAWithAES256GCMSHA384 uint16 = 0xC030
+)
 
 // DefaultConfig returns a Config with default values matching libRIST's
 // RIST_DEFAULT_* macros, except Profile: libRIST defaults to the Main profile,

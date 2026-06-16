@@ -49,18 +49,19 @@ func freeUDPPort(t *testing.T) int {
 	return c.LocalAddr().(*net.UDPAddr).Port
 }
 
-// writePEM writes a certificate + EC private key as PEM files for openssl.
+// writePEM writes a certificate + private key (ECDSA or RSA) as PEM files for
+// openssl. The key is marshalled as PKCS#8, which openssl reads for either type.
 func writePEM(t *testing.T, cert *Certificate) (certFile, keyFile string) {
 	t.Helper()
 	dir := t.TempDir()
 	certFile = dir + "/cert.pem"
 	keyFile = dir + "/key.pem"
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.DER[0]})
-	keyDER, err := x509.MarshalECPrivateKey(cert.PrivateKey)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
 	if err != nil {
 		t.Fatalf("marshal key: %v", err)
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
 		t.Fatalf("write cert: %v", err)
 	}
@@ -219,6 +220,78 @@ func TestInteropClientECDHE(t *testing.T) {
 	)
 	defer srv.stop(t)
 	clientExchange(t, srv, port, &Config{PeerCertFingerprint: cert.Fingerprint()})
+}
+
+// TestInteropClientSuites runs ristgo as the DTLS client against an openssl
+// s_server pinned to each TR-06-2 §6.2 mandatory cipher suite in turn, proving
+// the SHA-256/SHA-384 PRFs, AES-128/256-GCM, the ECDSA and RSA certificate paths,
+// RSA key transport, and the NULL+HMAC record layer all interoperate with an
+// independent stack on the wire (not just ristgo↔ristgo).
+func TestInteropClientSuites(t *testing.T) {
+	openssl := opensslPath(t)
+	ecdsaCert, err := GenerateSelfSigned("ristgo-ecdsa")
+	if err != nil {
+		t.Fatalf("ecdsa cert: %v", err)
+	}
+	rsaCert, err := GenerateSelfSignedRSA("ristgo-rsa")
+	if err != nil {
+		t.Fatalf("rsa cert: %v", err)
+	}
+	cases := []struct {
+		name       string
+		cert       *Certificate
+		opensslCph string
+	}{
+		{"ECDHE_ECDSA_AES256_GCM_SHA384", ecdsaCert, "ECDHE-ECDSA-AES256-GCM-SHA384"},
+		{"ECDHE_RSA_AES128_GCM_SHA256", rsaCert, "ECDHE-RSA-AES128-GCM-SHA256"},
+		{"ECDHE_RSA_AES256_GCM_SHA384", rsaCert, "ECDHE-RSA-AES256-GCM-SHA384"},
+		// NULL cipher: openssl gates it behind security level 0 (no confidentiality).
+		{"RSA_WITH_NULL_SHA256", rsaCert, "NULL-SHA256:@SECLEVEL=0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			certFile, keyFile := writePEM(t, tc.cert)
+			port := freeUDPPort(t)
+			srv := startServer(t, openssl, port,
+				"-cert", certFile, "-key", keyFile, "-cipher", tc.opensslCph)
+			defer srv.stop(t)
+			// AllowNullCipher is needed for the integrity-only RSA_WITH_NULL case and
+			// is harmless for the others (the GCM suite is still preferred).
+			clientExchange(t, srv, port, &Config{PeerCertFingerprint: tc.cert.Fingerprint(), AllowNullCipher: true})
+		})
+	}
+}
+
+// TestInteropServerSuites runs ristgo as the DTLS server with openssl s_client
+// pinned to each new cipher suite, proving the server-side encoding of the
+// AES-256/SHA-384, RSA, and NULL paths.
+func TestInteropServerSuites(t *testing.T) {
+	openssl := opensslPath(t)
+	ecdsaCert, err := GenerateSelfSigned("ristgo-ecdsa")
+	if err != nil {
+		t.Fatalf("ecdsa cert: %v", err)
+	}
+	rsaCert, err := GenerateSelfSignedRSA("ristgo-rsa")
+	if err != nil {
+		t.Fatalf("rsa cert: %v", err)
+	}
+	cases := []struct {
+		name       string
+		cert       *Certificate
+		opensslCph string
+	}{
+		{"ECDHE_ECDSA_AES256_GCM_SHA384", ecdsaCert, "ECDHE-ECDSA-AES256-GCM-SHA384"},
+		{"ECDHE_RSA_AES256_GCM_SHA384", rsaCert, "ECDHE-RSA-AES256-GCM-SHA384"},
+		{"RSA_WITH_NULL_SHA256", rsaCert, "NULL-SHA256:@SECLEVEL=0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// AllowNullCipher is needed for the integrity-only RSA_WITH_NULL case and
+			// is harmless for the others (the GCM suite is still preferred).
+			runServerInterop(t, openssl, &Config{Certificate: tc.cert, AllowNullCipher: true},
+				"-cipher", tc.opensslCph)
+		})
+	}
 }
 
 // TestInteropServerPSK runs ristgo as the DTLS server and openssl s_client as the

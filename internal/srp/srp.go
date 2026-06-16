@@ -264,6 +264,16 @@ func sessionKey(s *big.Int) [hashLen]byte {
 // hashed at their MINIMAL big-endian length (hash_bignum / hash_update_bignum),
 // NOT PADded — only k and u use PAD in the PAD-compliant variant. The salt, like
 // libRIST's BIGNUM ctx->s, is canonicalized to minimal length (canonSalt).
+//
+// This is the FLAT one-pass hash of the six elements, which is the standard SRP-6a
+// M1 and what libRIST computes. It deliberately differs from the literal TR-06-2
+// Annex D.9 worked example, which writes the inner term NESTED —
+// M1 = SHA256( SHA256(N) xor SHA256(g), SHA256(I, s, A, B, K) ) — hashing
+// (I, s, A, B, K) once before the outer hash. ristgo follows libRIST (the
+// authoritative interop reference, which ships no nested variant) rather than the
+// nested D.9 form, so a strictly-D.9 peer would not interoperate on M1/M2; this is
+// an intentional interop-over-literal-conformance choice (see the project's
+// libRIST-faithful policy), not an oversight.
 func (gr *Group) calcM1(username string, salt []byte, a, b *big.Int, key [hashLen]byte) [hashLen]byte {
 	hN := Hash(minimalBytes(gr.N))
 	hG := Hash(minimalBytes(gr.G))

@@ -128,6 +128,22 @@ func (s *Session) receiverReport() rtcp.ReceiverReport {
 // even with no media in flight. The ticker only calls it when the flow has not
 // transmitted for a full interval, so it does not double the flow's own echo
 // cadence.
+//
+// RTCP rate (TR-06-1 §5.2.1) is satisfied by this cadence, not by a separate
+// rate computation:
+//
+//   - Req 1 (successive RTCP ≤ 100 ms apart): the flow originates an RTT-echo
+//     compound every rttEchoInterval = 100 ms continuously once the flow has
+//     started (TimerRttEcho re-arms itself regardless of whether media keeps
+//     flowing), so the interval never exceeds 100 ms on a live flow; this keepalive
+//     only fills a longer idle gap and never widens it.
+//   - Req 2 (RTCP ≤ 5% of the media rate, with Req 1 taking precedence at very low
+//     bitrate): the only periodic RTCP is that fixed ~100 ms baseline (a tiny
+//     compound) plus event-driven NACKs, which the flow already paces to the
+//     recovery bandwidth. The baseline is Req-1-mandated, so it takes precedence
+//     when 5% of a low media rate would be smaller; at normal/high media rates the
+//     baseline is far below 5%. ristgo therefore never emits RTCP above the 5%
+//     ceiling in a case Req 1 does not already excuse.
 func (s *Session) sendKeepalive(now clock.Timestamp) {
 	if s.cfg.OneWay {
 		return // one-way transport emits no RTCP, only media

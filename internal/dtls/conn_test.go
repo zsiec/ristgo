@@ -157,8 +157,9 @@ func TestHandshakeECDHEInsecure(t *testing.T) {
 	)
 	defer client.Close()
 	cs, leaf := client.ConnectionState()
-	if cs != tlsECDHEECDSAWithAES128GCMSHA256 {
-		t.Fatalf("client suite = %#04x, want ECDHE_ECDSA", cs)
+	// The strongest ECDHE_ECDSA suite (AES-256-GCM/SHA-384) is preferred.
+	if cs != tlsECDHEECDSAWithAES256GCMSHA384 {
+		t.Fatalf("client suite = %#04x, want ECDHE_ECDSA_AES256_GCM_SHA384", cs)
 	}
 	if leaf == nil {
 		t.Fatal("client did not capture the server certificate")
@@ -221,7 +222,9 @@ func TestHandshakePreferCert(t *testing.T) {
 		&Config{PSK: []byte("secret"), Certificate: cert},
 	)
 	defer client.Close()
-	if cs, _ := client.ConnectionState(); cs != tlsECDHEECDSAWithAES128GCMSHA256 {
+	// A certificate suite (forward-secret ECDHE_ECDSA) is preferred over PSK; the
+	// strongest one (AES-256-GCM/SHA-384) wins.
+	if cs, _ := client.ConnectionState(); cs != tlsECDHEECDSAWithAES256GCMSHA384 {
 		t.Fatalf("suite = %#04x, want ECDHE_ECDSA preferred", cs)
 	}
 	exchange(t, client, server)

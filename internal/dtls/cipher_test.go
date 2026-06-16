@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+// testSuite is the default suite (AES-128-GCM/SHA-256) used by the key-schedule
+// and handshake unit tests that derive keys directly.
+func testSuite() cipherSuiteInfo {
+	s, _ := lookupSuite(tlsECDHEECDSAWithAES128GCMSHA256)
+	return s
+}
+
 // TestRecordProtectionRoundTrip derives keys on two independent endpoints from
 // the same master secret and randoms, then seals on one and opens on the other —
 // proving the key schedule is deterministic and the AEAD framing round-trips.
@@ -14,11 +21,11 @@ func TestRecordProtectionRoundTrip(t *testing.T) {
 	clientRandom := bytes.Repeat([]byte{0x01}, 32)
 	serverRandom := bytes.Repeat([]byte{0x02}, 32)
 
-	a, err := deriveKeys(master, clientRandom, serverRandom)
+	a, err := deriveKeys(testSuite(), master, clientRandom, serverRandom)
 	if err != nil {
 		t.Fatalf("deriveKeys a: %v", err)
 	}
-	b, err := deriveKeys(master, clientRandom, serverRandom)
+	b, err := deriveKeys(testSuite(), master, clientRandom, serverRandom)
 	if err != nil {
 		t.Fatalf("deriveKeys b: %v", err)
 	}
@@ -52,7 +59,7 @@ func TestRecordProtectionRoundTrip(t *testing.T) {
 // errBadRecordMAC.
 func TestRecordProtectionTamper(t *testing.T) {
 	master := bytes.Repeat([]byte{0x5A}, masterSecretLength)
-	keys, err := deriveKeys(master, make([]byte, 32), make([]byte, 32))
+	keys, err := deriveKeys(testSuite(), master, make([]byte, 32), make([]byte, 32))
 	if err != nil {
 		t.Fatalf("deriveKeys: %v", err)
 	}
@@ -82,7 +89,7 @@ func TestRecordProtectionTamper(t *testing.T) {
 }
 
 func TestOpenShortFragment(t *testing.T) {
-	keys, err := deriveKeys(make([]byte, 48), make([]byte, 32), make([]byte, 32))
+	keys, err := deriveKeys(testSuite(), make([]byte, 48), make([]byte, 32), make([]byte, 32))
 	if err != nil {
 		t.Fatalf("deriveKeys: %v", err)
 	}

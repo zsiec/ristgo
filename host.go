@@ -32,6 +32,8 @@ func buildDTLSConfig(dc *DTLSConfig, isClient bool) (*dtls.Config, error) {
 		PSKIdentity:         []byte(dc.PSKIdentity),
 		InsecureSkipVerify:  dc.InsecureSkipVerify,
 		PeerCertFingerprint: dc.PeerFingerprint,
+		DisabledSuites:      dc.DisabledSuites,
+		AllowNullCipher:     dc.AllowNullCipher,
 	}
 	if len(dc.CertPEM) > 0 || len(dc.KeyPEM) > 0 {
 		cert, err := dtls.CertificateFromPEM(dc.CertPEM, dc.KeyPEM)

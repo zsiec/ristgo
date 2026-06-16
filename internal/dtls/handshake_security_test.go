@@ -64,6 +64,7 @@ func (c *Conn) noCVClientHandshake() error {
 	}
 	serverRandom := sh.random
 	useEMS := sh.extMasterSecret
+	c.suite = testSuite()
 
 	var serverECDHEPub []byte
 	for done := false; !done; {
@@ -114,7 +115,7 @@ func (c *Conn) noCVClientHandshake() error {
 	c.emitHandshake(f5, typeClientKeyExchange, 0, clientKX, true)
 
 	master := c.deriveMaster(pms, useEMS, clientRandom, serverRandom)
-	keys, err := deriveKeys(master, clientRandom, serverRandom)
+	keys, err := deriveKeys(testSuite(), master, clientRandom, serverRandom)
 	if err != nil {
 		return err
 	}
@@ -122,7 +123,7 @@ func (c *Conn) noCVClientHandshake() error {
 	c.keysReady = true
 
 	emitCCS(f5)
-	clientVerify := finishedVerifyData(master, labelClientFinished, c.transcriptHash())
+	clientVerify := finishedVerifyData(c.suite.newHash, master, labelClientFinished, c.transcriptHash())
 	c.emitHandshake(f5, typeFinished, 1, marshalFinished(clientVerify), true)
 	if err := c.sendFlight(f5); err != nil {
 		return err
@@ -239,7 +240,8 @@ func (c *Conn) noEMSServerFlight4() error {
 	if err != nil {
 		return err
 	}
-	c.cipherSuite = suite
+	c.cipherSuite = suite.id
+	c.suite = suite
 	clientRandom := ch.random
 	serverRandom := make([]byte, randomLen)
 	if _, err := readFullRand(cfg, serverRandom); err != nil {
@@ -251,7 +253,7 @@ func (c *Conn) noEMSServerFlight4() error {
 	shBody, _ := serverHello{
 		version:     versionDTLS12,
 		random:      serverRandom,
-		cipherSuite: suite,
+		cipherSuite: suite.id,
 		// extMasterSecret deliberately false (the stripped extension).
 	}.marshalBody()
 	c.emitHandshake(f4, typeServerHello, 0, shBody, true)
@@ -262,15 +264,16 @@ func (c *Conn) noEMSServerFlight4() error {
 		return err
 	}
 	_ = priv
-	ske := serverKeyExchange{curve: namedGroupSecp256r1, publicKey: pub, sigScheme: sigSchemeECDSAP256SHA256}
+	ske := serverKeyExchange{curve: namedGroupSecp256r1, publicKey: pub}
 	signed := make([]byte, 0)
 	signed = append(signed, clientRandom...)
 	signed = append(signed, serverRandom...)
 	signed = append(signed, ske.signedParams()...)
-	sig, err := signECDSA(cfg.Certificate.PrivateKey, signed)
+	sigScheme, sig, err := signHandshake(cfg.Certificate, signed)
 	if err != nil {
 		return err
 	}
+	ske.sigScheme = sigScheme
 	ske.signature = sig
 	skeBody, _ := ske.marshalBody()
 	c.emitHandshake(f4, typeServerKeyExchange, 0, skeBody, true)
@@ -389,4 +392,24 @@ func TestEmptyClientCertWithRequireStillRejected(t *testing.T) {
 	}
 	client.Close()
 	server.Close()
+}
+
+// TestServerKeyExchangeBeforeCertificateRejected proves a malformed/malicious
+// server flight that sends ServerKeyExchange before (or without) the Certificate
+// message is rejected with an error, not a nil-pointer panic — arbitrary peer input
+// must never panic (CLAUDE.md). It exercises verifyServerKeyExchange with c.peerLeaf
+// still nil.
+func TestServerKeyExchangeBeforeCertificateRejected(t *testing.T) {
+	c := &Conn{} // peerLeaf nil: no Certificate processed yet
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("verifyServerKeyExchange panicked on a pre-Certificate ServerKeyExchange: %v", r)
+		}
+	}()
+	// A well-formed ECDHE SKE body (curve_type=named_curve, secp256r1, empty point);
+	// it must be rejected for arriving before the Certificate, regardless of body.
+	body := []byte{3, 0x00, 0x17, 0x00}
+	if _, err := c.verifyServerKeyExchange(body, make([]byte, 32), make([]byte, 32)); err == nil {
+		t.Fatal("expected an error for ServerKeyExchange before Certificate, got nil")
+	}
 }

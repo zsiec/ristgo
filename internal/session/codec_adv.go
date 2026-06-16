@@ -177,6 +177,13 @@ func (c *advCodec) encodeAdvMedia(dst []byte, pkt wire.MediaPacket) ([]byte, err
 	}
 
 	first, last := fragBits(pkt.Frag)
+	// EncType=TypeDirect with NO Payload Format Descriptor (params.PFD stays nil, so
+	// the P flag is 0). TR-06-3 §5.2.7 says a sender "shall always include" the PFD
+	// when Type=5; ristgo omits it to match libRIST, which likewise ships Direct
+	// media with P=0 and no descriptor (the payload is intra-tunnel opaque, so the
+	// descriptor is unused on both ends). This is an intentional libRIST-faithful
+	// deviation from the letter of §5.2.7 (interop over literal conformance), not an
+	// oversight; a peer that strictly requires the descriptor would see P=0 here.
 	params := adv.Params{
 		Seq:        pkt.Seq,
 		Timestamp:  advTSFromSource(pkt.SourceTime),

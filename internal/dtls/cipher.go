@@ -3,48 +3,60 @@ package dtls
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 )
 
-// Record protection with AES-128-GCM (RFC 5288), the AEAD used by both supported
-// cipher suites, framed for DTLS 1.2 (RFC 6347 §4.1.2.1, RFC 5246 §6.2.3.3).
+// Record protection. Two record-protection schemes are supported, selected by the
+// negotiated suite: AES-GCM (RFC 5288), the AEAD used by every GCM suite, framed
+// for DTLS 1.2 (RFC 6347 §4.1.2.1, RFC 5246 §6.2.3.3); and a NULL cipher with an
+// appended HMAC (RFC 5246 §6.2.3.1) for TLS_RSA_WITH_NULL_SHA256, which provides
+// integrity but NO confidentiality.
 
 const (
-	// aesGCMKeyLen is the AES-128 key size; gcmFixedIVLen the per-direction salt
-	// (the implicit part of the nonce) from the key block; gcmExplicitNonceLen
-	// the on-the-wire explicit nonce; gcmTagLen the GCM authentication tag.
-	aesGCMKeyLen        = 16
+	// gcmFixedIVLen is the per-direction salt (the implicit part of the GCM
+	// nonce) taken from the key block; gcmExplicitNonceLen the on-the-wire
+	// explicit nonce; gcmTagLen the GCM authentication tag.
 	gcmFixedIVLen       = 4
 	gcmExplicitNonceLen = 8
 	gcmTagLen           = 16
 
-	// gcmOverhead is the bytes a sealed record adds over its plaintext: the
+	// gcmOverhead is the bytes a sealed GCM record adds over its plaintext: the
 	// explicit nonce prepended on the wire plus the trailing tag.
 	gcmOverhead = gcmExplicitNonceLen + gcmTagLen
-
-	// keyBlockLen is the key-expansion output for AES-128-GCM with no MAC key:
-	// two write keys (16) and two fixed IVs (4) — RFC 5246 §6.3, RFC 5288 §3.
-	keyBlockLen = 2*aesGCMKeyLen + 2*gcmFixedIVLen
 )
 
-// errBadRecordMAC is returned when a record fails AEAD authentication or is too
-// short to hold the explicit nonce and tag. It is deliberately uniform (no
-// distinction between "short" and "tag mismatch") to avoid an oracle.
+// errBadRecordMAC is returned when a record fails authentication or is too short
+// to hold its overhead (explicit nonce + tag for GCM, or the trailing MAC for the
+// NULL suite). It is deliberately uniform (no distinction between "short" and
+// "auth mismatch") to avoid an oracle.
 var errBadRecordMAC = errors.New("rist: dtls: bad record MAC")
 
-// halfConn protects one direction of the connection: the AES-GCM AEAD keyed for
-// that direction plus its 4-byte fixed IV (salt). It is not safe for concurrent
-// use; the conn serializes each direction onto its own halfConn.
-type halfConn struct {
+// halfConn protects one direction of the connection. It is not safe for
+// concurrent use; the conn serializes each direction onto its own halfConn.
+type halfConn interface {
+	// seal returns the protected record fragment for the given record header
+	// fields and plaintext.
+	seal(epoch uint16, seq uint64, typ contentType, version [2]byte, plaintext []byte) []byte
+	// open authenticates (and, for GCM, decrypts) a record fragment, returning a
+	// freshly-allocated plaintext the caller owns. It never panics and returns
+	// errBadRecordMAC for any failure.
+	open(r record) ([]byte, error)
+}
+
+// gcmHalfConn is AES-GCM record protection: the AEAD keyed for one direction plus
+// its 4-byte fixed IV (salt). The AES key may be 128- or 256-bit.
+type gcmHalfConn struct {
 	aead cipher.AEAD
 	salt [gcmFixedIVLen]byte
 }
 
-// newHalfConn builds a direction's record protection from its write key and
-// fixed IV (each sliced out of the key block).
-func newHalfConn(key, fixedIV []byte) (*halfConn, error) {
+// newGCMHalfConn builds a direction's GCM record protection from its write key
+// (16 or 32 bytes) and fixed IV (each sliced out of the key block).
+func newGCMHalfConn(key, fixedIV []byte) (*gcmHalfConn, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("rist: dtls: aes: %w", err)
@@ -53,16 +65,16 @@ func newHalfConn(key, fixedIV []byte) (*halfConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rist: dtls: gcm: %w", err)
 	}
-	h := &halfConn{aead: aead}
+	h := &gcmHalfConn{aead: aead}
 	copy(h.salt[:], fixedIV)
 	return h, nil
 }
 
-// seal encrypts plaintext into a record fragment for the given record header
-// fields. The wire fragment is explicit_nonce(8) || GCM(ciphertext+tag); the GCM
-// nonce is salt(4) || explicit(8) where the explicit nonce is the 64-bit record
-// sequence (epoch<<48 | seq), and the AAD is the DTLS additional-data block.
-func (h *halfConn) seal(epoch uint16, seq uint64, typ contentType, version [2]byte, plaintext []byte) []byte {
+// seal encrypts plaintext into a record fragment. The wire fragment is
+// explicit_nonce(8) || GCM(ciphertext+tag); the GCM nonce is salt(4) ||
+// explicit(8) where the explicit nonce is the 64-bit record sequence
+// (epoch<<48 | seq), and the AAD is the DTLS additional-data block.
+func (h *gcmHalfConn) seal(epoch uint16, seq uint64, typ contentType, version [2]byte, plaintext []byte) []byte {
 	recordSeq := seqAndEpoch(epoch, seq)
 
 	var nonce [gcmFixedIVLen + gcmExplicitNonceLen]byte
@@ -76,11 +88,8 @@ func (h *halfConn) seal(epoch uint16, seq uint64, typ contentType, version [2]by
 	return h.aead.Seal(out, nonce[:], plaintext, aad)
 }
 
-// open authenticates and decrypts a record fragment, returning the plaintext. It
-// never panics and returns errBadRecordMAC for any failure (short fragment, tag
-// mismatch). The GCM nonce uses the explicit nonce carried in the fragment; the
-// AAD uses the record header's epoch/seq/type/version and the recovered length.
-func (h *halfConn) open(r record) ([]byte, error) {
+// open authenticates and decrypts a GCM record fragment.
+func (h *gcmHalfConn) open(r record) ([]byte, error) {
 	if len(r.fragment) < gcmOverhead {
 		return nil, errBadRecordMAC
 	}
@@ -101,9 +110,51 @@ func (h *halfConn) open(r record) ([]byte, error) {
 	return pt, nil
 }
 
-// aeadAAD builds the 13-byte AEAD additional-data block for a DTLS record
+// nullMACHalfConn is the NULL-cipher-with-HMAC record protection of
+// TLS_RSA_WITH_NULL_SHA256 (RFC 5246 §6.2.3.1): the fragment is plaintext || MAC,
+// where MAC = HMAC_hash(MAC_write_key, seq_num || type || version || length ||
+// plaintext) over the DTLS additional-data block and the plaintext. The data is
+// authenticated but NOT encrypted — it provides integrity only.
+type nullMACHalfConn struct {
+	macKey  []byte
+	newHash func() hash.Hash
+	macLen  int
+}
+
+func (h *nullMACHalfConn) mac(epoch uint16, seq uint64, typ contentType, version [2]byte, plaintext []byte) []byte {
+	m := hmac.New(h.newHash, h.macKey)
+	m.Write(aeadAAD(epoch, seq, typ, version, len(plaintext)))
+	m.Write(plaintext)
+	return m.Sum(nil)
+}
+
+func (h *nullMACHalfConn) seal(epoch uint16, seq uint64, typ contentType, version [2]byte, plaintext []byte) []byte {
+	mac := h.mac(epoch, seq, typ, version, plaintext)
+	out := make([]byte, 0, len(plaintext)+len(mac))
+	out = append(out, plaintext...)
+	return append(out, mac...)
+}
+
+func (h *nullMACHalfConn) open(r record) ([]byte, error) {
+	if len(r.fragment) < h.macLen {
+		return nil, errBadRecordMAC
+	}
+	split := len(r.fragment) - h.macLen
+	body := r.fragment[:split]
+	gotMAC := r.fragment[split:]
+	want := h.mac(r.epoch, r.seq, r.typ, r.version, body)
+	if !hmac.Equal(gotMAC, want) {
+		return nil, errBadRecordMAC
+	}
+	// Copy out: body aliases the read buffer, but the caller retains the returned
+	// plaintext across later reads (matching the fresh allocation GCM open returns).
+	return append([]byte(nil), body...), nil
+}
+
+// aeadAAD builds the 13-byte additional-data / MAC-prefix block for a DTLS record
 // (RFC 6347 §4.1.2.1): seq_num(8) || type(1) || version(2) || length(2), where
-// seq_num is the 64-bit epoch||sequence and length is the plaintext length.
+// seq_num is the 64-bit epoch||sequence and length is the plaintext length. It is
+// the AEAD AAD for GCM and the MAC-input prefix for the NULL suite.
 func aeadAAD(epoch uint16, seq uint64, typ contentType, version [2]byte, plaintextLen int) []byte {
 	var aad [13]byte
 	binary.BigEndian.PutUint64(aad[0:8], seqAndEpoch(epoch, seq))
@@ -117,31 +168,53 @@ func aeadAAD(epoch uint16, seq uint64, typ contentType, version [2]byte, plainte
 // connKeys holds both directions' record-protection halves, derived from the
 // master secret and the two randoms.
 type connKeys struct {
-	clientWrite *halfConn // client encrypts / server decrypts
-	serverWrite *halfConn // server encrypts / client decrypts
+	clientWrite halfConn // client protects / server opens
+	serverWrite halfConn // server protects / client opens
 }
 
-// deriveKeys runs the key-expansion PRF and splits the key block into both
-// directions' AES-128-GCM halves (RFC 5246 §6.3). The key-expansion seed is
-// server_random || client_random — the reverse of the master-secret seed.
-func deriveKeys(master, clientRandom, serverRandom []byte) (connKeys, error) {
+// deriveKeys runs the key-expansion PRF for the negotiated suite and splits the
+// key block into both directions' record-protection halves (RFC 5246 §6.3). The
+// key-expansion seed is server_random || client_random — the reverse of the
+// master-secret seed. The key block layout is
+// client_MAC || server_MAC || client_key || server_key || client_IV || server_IV
+// where the MAC keys are empty for an AEAD suite and the enc keys + IVs are empty
+// for the NULL suite.
+func deriveKeys(suite cipherSuiteInfo, master, clientRandom, serverRandom []byte) (connKeys, error) {
 	seed := make([]byte, 0, len(serverRandom)+len(clientRandom))
 	seed = append(seed, serverRandom...)
 	seed = append(seed, clientRandom...)
-	kb := prf(master, labelKeyExpansion, seed, keyBlockLen)
 
-	clientWriteKey := kb[0:aesGCMKeyLen]
-	serverWriteKey := kb[aesGCMKeyLen : 2*aesGCMKeyLen]
-	clientWriteIV := kb[2*aesGCMKeyLen : 2*aesGCMKeyLen+gcmFixedIVLen]
-	serverWriteIV := kb[2*aesGCMKeyLen+gcmFixedIVLen : keyBlockLen]
+	encLen := suite.keyLen
+	macLen := suite.macLen
+	ivLen := 0
+	if suite.aead {
+		ivLen = gcmFixedIVLen
+	}
+	blockLen := 2*macLen + 2*encLen + 2*ivLen
+	kb := prf(suite.newHash, master, labelKeyExpansion, seed, blockLen)
 
-	cw, err := newHalfConn(clientWriteKey, clientWriteIV)
-	if err != nil {
-		return connKeys{}, err
+	off := 0
+	take := func(n int) []byte { s := kb[off : off+n]; off += n; return s }
+	clientMAC := take(macLen)
+	serverMAC := take(macLen)
+	clientKey := take(encLen)
+	serverKey := take(encLen)
+	clientIV := take(ivLen)
+	serverIV := take(ivLen)
+
+	if suite.aead {
+		cw, err := newGCMHalfConn(clientKey, clientIV)
+		if err != nil {
+			return connKeys{}, err
+		}
+		sw, err := newGCMHalfConn(serverKey, serverIV)
+		if err != nil {
+			return connKeys{}, err
+		}
+		return connKeys{clientWrite: cw, serverWrite: sw}, nil
 	}
-	sw, err := newHalfConn(serverWriteKey, serverWriteIV)
-	if err != nil {
-		return connKeys{}, err
-	}
-	return connKeys{clientWrite: cw, serverWrite: sw}, nil
+	return connKeys{
+		clientWrite: &nullMACHalfConn{macKey: clientMAC, newHash: suite.newHash, macLen: macLen},
+		serverWrite: &nullMACHalfConn{macKey: serverMAC, newHash: suite.newHash, macLen: macLen},
+	}, nil
 }

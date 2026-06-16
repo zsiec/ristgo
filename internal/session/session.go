@@ -1237,11 +1237,24 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 				}
 				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(p); derr == nil {
 					if isMedia {
+						// Expedite bit (TR-06-3 §5.2.3, p.Expedite): a sender sets it to
+						// request immediate output. ristgo delivers media strictly IN ORDER
+						// (a core invariant of the deterministic flow — see the four
+						// invariants in PLAN.md), so it does NOT implement the optional
+						// out-of-order expedited-media output a set E bit on a *media* packet
+						// would ask for; honoring it would skip a gap and break in-order
+						// delivery. The E bit's mandatory use is on CONTROL packets (§5.3:
+						// "shall be set for all Control packets"), and those ARE processed
+						// immediately on receipt (feedAdvFeedback below feeds the flow/host
+						// at once, never through the reorder buffer) — so every packet the
+						// spec requires E on is handled immediately.
 						s.feedMedia(now, 0, pkt)
 						if s.fecEnabled() {
 							s.fecRecvAdv(now, pkt.Seq, data) // protect/recover the full wire datagram
 						}
 					} else {
+						// Control packet (E=1 per §5.3): processed immediately here, never
+						// buffered — the receiver-SHALL of §5.2.3 for E-marked packets.
 						s.feedAdvFeedback(now, fbs)
 					}
 				} else {

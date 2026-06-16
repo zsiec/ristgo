@@ -369,10 +369,17 @@ type certificateRequest struct{}
 
 func (certificateRequest) marshalBody() ([]byte, error) {
 	b := cryptobyte.NewBuilder(nil)
-	// certificate_types = { ecdsa_sign(64) }
-	b.AddUint8LengthPrefixed(func(c *cryptobyte.Builder) { c.AddUint8(64) })
-	// supported_signature_algorithms = { ecdsa_secp256r1_sha256 }
-	b.AddUint16LengthPrefixed(func(c *cryptobyte.Builder) { c.AddUint16(sigSchemeECDSAP256SHA256) })
+	// certificate_types = { rsa_sign(1), ecdsa_sign(64) }
+	b.AddUint8LengthPrefixed(func(c *cryptobyte.Builder) {
+		c.AddUint8(1)
+		c.AddUint8(64)
+	})
+	// supported_signature_algorithms = the full offered set (ECDSA + RSA, SHA-256/384)
+	b.AddUint16LengthPrefixed(func(c *cryptobyte.Builder) {
+		for _, sa := range offeredSignatureAlgorithms {
+			c.AddUint16(sa)
+		}
+	})
 	// certificate_authorities = empty
 	b.AddUint16LengthPrefixed(func(c *cryptobyte.Builder) {})
 	return b.Bytes()
@@ -396,6 +403,25 @@ func parseClientKeyExchangePSK(body []byte) ([]byte, error) {
 		return nil, errMalformed
 	}
 	return append([]byte(nil), id...), nil
+}
+
+// clientKeyExchangeRSA carries the RSA-encrypted pre-master secret
+// (RFC 5246 §7.4.7.1): EncryptedPreMasterSecret as opaque<0..2^16-1>.
+type clientKeyExchangeRSA struct{ encrypted []byte }
+
+func (m clientKeyExchangeRSA) marshalBody() ([]byte, error) {
+	b := cryptobyte.NewBuilder(nil)
+	b.AddUint16LengthPrefixed(func(c *cryptobyte.Builder) { c.AddBytes(m.encrypted) })
+	return b.Bytes()
+}
+
+func parseClientKeyExchangeRSA(body []byte) ([]byte, error) {
+	s := cryptobyte.String(body)
+	var enc cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&enc) || !s.Empty() {
+		return nil, errMalformed
+	}
+	return append([]byte(nil), enc...), nil
 }
 
 // clientKeyExchangeECDHE carries the client's ephemeral EC point (RFC 4492 §5.7).

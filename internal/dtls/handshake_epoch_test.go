@@ -82,6 +82,7 @@ func (c *Conn) plaintextFinishedClientHandshake() error {
 	}
 	serverRandom := sh.random
 	useEMS := sh.extMasterSecret
+	c.suite = testSuite()
 	for done := false; !done; {
 		msg, err = c.readHandshakeMessage(overall)
 		if err != nil {
@@ -100,14 +101,14 @@ func (c *Conn) plaintextFinishedClientHandshake() error {
 	f5 := &flight{}
 	c.emitHandshake(f5, typeClientKeyExchange, 0, clientKX, true)
 	master := c.deriveMaster(pms, useEMS, clientRandom, serverRandom)
-	keys, err := deriveKeys(master, clientRandom, serverRandom)
+	keys, err := deriveKeys(testSuite(), master, clientRandom, serverRandom)
 	if err != nil {
 		return err
 	}
 	c.keys = keys
 	c.keysReady = true
 	emitCCS(f5)
-	clientVerify := finishedVerifyData(master, labelClientFinished, c.transcriptHash())
+	clientVerify := finishedVerifyData(c.suite.newHash, master, labelClientFinished, c.transcriptHash())
 	// Epoch 0 here (a conforming client uses epoch 1).
 	c.emitHandshake(f5, typeFinished, 0, marshalFinished(clientVerify), true)
 	if err := c.sendFlight(f5); err != nil {

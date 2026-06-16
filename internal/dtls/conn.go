@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"time"
 )
@@ -32,10 +33,28 @@ type Config struct {
 	PSK         []byte
 	PSKIdentity []byte
 
-	// Certificate, when non-nil, enables TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.
-	// A server in cert mode must supply one; a client supplies one only for
-	// mutual authentication.
+	// Certificate, when non-nil, enables the certificate-authenticated suites. An
+	// ECDSA P-256 certificate enables the ECDHE_ECDSA suites; an RSA certificate
+	// enables the ECDHE_RSA suites and RSA_WITH_NULL_SHA256 (integrity only). A
+	// server in cert mode must supply one (and the suite it can serve follows the
+	// certificate's key type); a client supplies one only for mutual authentication.
 	Certificate *Certificate
+
+	// DisabledSuites lists cipher suites (by their IANA id) the user has turned
+	// off, satisfying TR-06-2 §6.2's requirement that a device "provide a means for
+	// the user to disable individual cipher suites." A disabled suite is neither
+	// offered (client) nor selected (server). Disabling every suite a config could
+	// otherwise use fails the handshake (no common suite), which is the intended
+	// effect of an operator turning everything off.
+	DisabledSuites []uint16
+
+	// AllowNullCipher opts in to the integrity-only TLS_RSA_WITH_NULL_SHA256 suite,
+	// which authenticates but does NOT encrypt. It is OFF by default: even though a
+	// remote peer cannot downgrade to it (the Finished MAC binds the negotiated
+	// suite), a confidentiality-free suite must not be reachable just because a
+	// certificate was configured. Set it only when an unencrypted-but-authenticated
+	// transport is a deliberate requirement.
+	AllowNullCipher bool
 
 	// RequireClientCert makes a server send a CertificateRequest and reject a
 	// client that does not authenticate with a certificate.
@@ -100,15 +119,82 @@ func (c *Config) normalize() *Config {
 func (c *Config) offersPSK() bool { return c.PSK != nil }
 
 // offersCert reports whether this endpoint can PRESENT a certificate — required
-// for a server to accept the ECDHE_ECDSA suite, and for a client to satisfy a
+// for a server to accept a certificate suite, and for a client to satisfy a
 // CertificateRequest (mutual auth).
 func (c *Config) offersCert() bool { return c.Certificate != nil }
 
 // canVerifyCert reports whether this endpoint can VERIFY a peer certificate, the
-// condition for a client to offer the ECDHE_ECDSA suite (the certificate it
+// condition for a client to offer a certificate suite (the certificate it
 // verifies is the server's, so the client needs none of its own).
 func (c *Config) canVerifyCert() bool {
 	return c.InsecureSkipVerify || c.pinnedFingerprint || c.RootCAs != nil
+}
+
+// suiteDisabled reports whether the user turned suite id off (§6.2 disable knob).
+func (c *Config) suiteDisabled(id uint16) bool {
+	return slices.Contains(c.DisabledSuites, id)
+}
+
+// suiteUsable reports the gates common to both roles, independent of key-exchange:
+// the suite is not disabled, and a confidentiality-free suite is allowed only on
+// explicit opt-in. RSA_WITH_NULL_SHA256 provides integrity but NO encryption, so it
+// must NEVER be offered or selected by default — otherwise a config that supplied a
+// certificate merely for the encrypted ECDHE_RSA suites would silently also permit a
+// cleartext media session. It is reachable only when AllowNullCipher is set (a
+// remote peer still cannot downgrade to it — the Finished MAC binds the suite — but
+// off-by-default removes the misconfiguration footgun).
+func (c *Config) suiteUsable(s cipherSuiteInfo) bool {
+	if c.suiteDisabled(s.id) {
+		return false
+	}
+	if !s.aead && !c.AllowNullCipher {
+		return false
+	}
+	return true
+}
+
+// clientCanOffer reports whether the client may offer suite s: it is usable (not
+// disabled, NULL only on opt-in) and the config can run its key exchange — a PSK for
+// the PSK suite, or the ability to verify the server's certificate for a certificate
+// suite (the client needs no certificate of its own to verify the server's).
+func (c *Config) clientCanOffer(s cipherSuiteInfo) bool {
+	if !c.suiteUsable(s) {
+		return false
+	}
+	if s.kx == kxPSK {
+		return c.offersPSK()
+	}
+	return c.canVerifyCert()
+}
+
+// serverCanSelect reports whether the server may select suite s: it is usable (not
+// disabled, NULL only on opt-in) and the config can serve it — a PSK for the PSK
+// suite, or a certificate whose key type (ECDSA/RSA) matches the suite's
+// authentication method.
+func (c *Config) serverCanSelect(s cipherSuiteInfo) bool {
+	if !c.suiteUsable(s) {
+		return false
+	}
+	if s.kx == kxPSK {
+		return c.offersPSK()
+	}
+	if !c.offersCert() {
+		return false
+	}
+	at, ok := c.Certificate.keyType()
+	return ok && at == s.auth
+}
+
+// clientSuites returns the cipher suites the client offers, in the table's
+// preference order, filtered by what the config can do and what is disabled.
+func (c *Config) clientSuites() []uint16 {
+	var out []uint16
+	for _, s := range suiteTable {
+		if c.clientCanOffer(s) {
+			out = append(out, s.id)
+		}
+	}
+	return out
 }
 
 // maxDatagram bounds an outbound DTLS datagram to stay under a conservative path
@@ -151,6 +237,7 @@ type Conn struct {
 	keysReady bool
 
 	cipherSuite uint16
+	suite       cipherSuiteInfo // descriptor for cipherSuite, set once negotiated
 	peerLeaf    *x509.Certificate
 
 	handshakeDone bool
@@ -284,14 +371,14 @@ func (c *Conn) writeRecord(typ contentType, epoch uint16, payload []byte) error 
 // sealHalf / openHalf return the halfConn used to protect/parse a record in the
 // given direction. The client encrypts with clientWrite and decrypts with
 // serverWrite; the server does the reverse.
-func (c *Conn) sealHalf(uint16) *halfConn {
+func (c *Conn) sealHalf(uint16) halfConn {
 	if c.isClient {
 		return c.keys.clientWrite
 	}
 	return c.keys.serverWrite
 }
 
-func (c *Conn) openHalf(uint16) *halfConn {
+func (c *Conn) openHalf(uint16) halfConn {
 	if c.isClient {
 		return c.keys.serverWrite
 	}
@@ -390,21 +477,14 @@ func isTimeout(err error) bool {
 func fingerprintOf(der []byte) [32]byte { return sha256.Sum256(der) }
 
 // selectSuite picks the cipher suite both sides can do given cfg and the peer's
-// offered list, preferring ECDHE_ECDSA over PSK when both are possible.
-func selectSuite(cfg *Config, offered []uint16) (uint16, error) {
-	has := func(id uint16) bool {
-		for _, o := range offered {
-			if o == id {
-				return true
-			}
+// offered list, walking suiteTable in server-preference order (forward-secret and
+// stronger suites first; the integrity-only NULL suite last) and returning the
+// first the server can serve that the client offered.
+func selectSuite(cfg *Config, offered []uint16) (cipherSuiteInfo, error) {
+	for _, s := range suiteTable {
+		if cfg.serverCanSelect(s) && slices.Contains(offered, s.id) {
+			return s, nil
 		}
-		return false
 	}
-	if cfg.offersCert() && has(tlsECDHEECDSAWithAES128GCMSHA256) {
-		return tlsECDHEECDSAWithAES128GCMSHA256, nil
-	}
-	if cfg.offersPSK() && has(tlsPSKWithAES128GCMSHA256) {
-		return tlsPSKWithAES128GCMSHA256, nil
-	}
-	return 0, fmt.Errorf("rist: dtls: no common cipher suite")
+	return cipherSuiteInfo{}, fmt.Errorf("rist: dtls: no common cipher suite")
 }

@@ -1,8 +1,8 @@
 package dtls
 
 import (
-	"crypto/ecdsa"
 	"crypto/hmac"
+	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
 	"errors"
@@ -76,8 +76,10 @@ func (c *Conn) serverHandshake() error {
 		c.sendAlert(alertHandshakeFailure)
 		return err
 	}
-	c.cipherSuite = suite
-	isECDHE := suite == tlsECDHEECDSAWithAES128GCMSHA256
+	c.cipherSuite = suite.id
+	c.suite = suite
+	isECDHE := suite.kx == kxECDHE
+	usesCert := suite.kx != kxPSK
 	useEMS := ch.extMasterSecret
 
 	serverRandom := make([]byte, randomLen)
@@ -85,13 +87,13 @@ func (c *Conn) serverHandshake() error {
 		return fmt.Errorf("rist: dtls: server random: %w", err)
 	}
 
-	// Flight 4: ServerHello, [Certificate, ServerKeyExchange,
+	// Flight 4: ServerHello, [Certificate, [ServerKeyExchange],
 	// [CertificateRequest]], ServerHelloDone.
 	f4 := &flight{}
 	shBody, _ := serverHello{
 		version:             versionDTLS12,
 		random:              serverRandom,
-		cipherSuite:         suite,
+		cipherSuite:         suite.id,
 		extMasterSecret:     useEMS,
 		pointFormats:        isECDHE && ch.pointFormatsOffered,
 		secureRenegotiation: ch.secureRenegotiation,
@@ -99,32 +101,35 @@ func (c *Conn) serverHandshake() error {
 	c.emitHandshake(f4, typeServerHello, 0, shBody, true)
 
 	var ecdhePriv ecdhePrivate
-	if isECDHE {
+	if usesCert {
 		certBody, _ := certificateMsg{chain: cfg.Certificate.DER}.marshalBody()
 		c.emitHandshake(f4, typeCertificate, 0, certBody, true)
-
+	}
+	if isECDHE {
 		priv, pub, err := generateECDHE(cfg.Rand)
 		if err != nil {
 			return err
 		}
 		ecdhePriv = priv
-		ske := serverKeyExchange{curve: namedGroupSecp256r1, publicKey: pub, sigScheme: sigSchemeECDSAP256SHA256}
+		ske := serverKeyExchange{curve: namedGroupSecp256r1, publicKey: pub}
 		signed := make([]byte, 0, len(clientRandom)+len(serverRandom)+len(ske.signedParams()))
 		signed = append(signed, clientRandom...)
 		signed = append(signed, serverRandom...)
 		signed = append(signed, ske.signedParams()...)
-		sig, err := signECDSA(cfg.Certificate.PrivateKey, signed)
+		sigScheme, sig, err := signHandshake(cfg.Certificate, signed)
 		if err != nil {
 			return err
 		}
+		ske.sigScheme = sigScheme
 		ske.signature = sig
 		skeBody, _ := ske.marshalBody()
 		c.emitHandshake(f4, typeServerKeyExchange, 0, skeBody, true)
-
-		if cfg.RequireClientCert {
-			crBody, _ := certificateRequest{}.marshalBody()
-			c.emitHandshake(f4, typeCertificateRequest, 0, crBody, true)
-		}
+	}
+	// A kxRSA suite has no ServerKeyExchange: the client RSA-encrypts the
+	// pre-master to our certificate's public key.
+	if usesCert && cfg.RequireClientCert {
+		crBody, _ := certificateRequest{}.marshalBody()
+		c.emitHandshake(f4, typeCertificateRequest, 0, crBody, true)
 	}
 	c.emitHandshake(f4, typeServerHelloDone, 0, nil, true)
 	if err := c.sendFlight(f4); err != nil {
@@ -136,7 +141,6 @@ func (c *Conn) serverHandshake() error {
 		pms        []byte
 		master     []byte
 		clientCert *x509.Certificate // parsed+verified client leaf, NOT yet authenticated
-		clientLeaf *ecdsa.PublicKey  // its ECDSA key, for the CertificateVerify check
 		gotCKE     bool
 		sawValidCV bool // a CertificateVerify whose signature verified was received
 	)
@@ -178,44 +182,24 @@ func (c *Conn) serverHandshake() error {
 				}
 				// Hold the leaf aside; it is NOT authenticated until a
 				// CertificateVerify proves possession of its private key
-				// (RFC 5246 §7.4.8). Do not expose it via c.peerLeaf yet — in
-				// ECDHE the client Finished MAC verifies without the cert's key,
-				// so CertificateVerify is the only proof of possession. Assigning
+				// (RFC 5246 §7.4.8). Do not expose it via c.peerLeaf yet — the
+				// client Finished MAC verifies without the cert's key, so
+				// CertificateVerify is the only proof of possession. Assigning
 				// c.peerLeaf here would let an attacker holding only the victim's
 				// public certificate (no private key) authenticate as the owner.
 				clientCert = leaf
-				clientLeaf, _ = leaf.PublicKey.(*ecdsa.PublicKey)
 			}
 		case typeClientKeyExchange:
-			if isECDHE {
-				pub, err := parseClientKeyExchangeECDHE(msg.body)
-				if err != nil {
-					return err
-				}
-				if pms, err = ecdhePremaster(ecdhePriv, pub); err != nil {
-					c.sendAlert(alertHandshakeFailure)
-					return err
-				}
-			} else {
-				identity, err := parseClientKeyExchangePSK(msg.body)
-				if err != nil {
-					return err
-				}
-				// The shared PSK is the real authenticator (a wrong key fails at
-				// Finished), but when a PSK identity is configured, reject a
-				// mismatched client identity early — it signals a wrong or
-				// misconfigured peer. Constant-time to avoid leaking the identity.
-				if len(cfg.PSKIdentity) > 0 && subtle.ConstantTimeCompare(identity, cfg.PSKIdentity) != 1 {
-					c.sendAlert(alertHandshakeFailure)
-					return errors.New("rist: dtls: client PSK identity does not match configured identity")
-				}
-				pms = pskPremaster(cfg.PSK)
+			pms, err = c.serverKeyExchangePMS(suite, ecdhePriv, msg.body, ch)
+			if err != nil {
+				c.sendAlert(alertHandshakeFailure)
+				return err
 			}
 			gotCKE = true
 			// Transcript now runs through ClientKeyExchange: derive keys so the
 			// epoch-1 Finished that follows can be decrypted.
 			master = c.deriveMaster(pms, useEMS, clientRandom, serverRandom)
-			keys, err := deriveKeys(master, clientRandom, serverRandom)
+			keys, err := deriveKeys(suite, master, clientRandom, serverRandom)
 			if err != nil {
 				return err
 			}
@@ -226,16 +210,16 @@ func (c *Conn) serverHandshake() error {
 			if err != nil {
 				return err
 			}
-			if clientLeaf == nil {
+			if clientCert == nil {
 				return errors.New("rist: dtls: CertificateVerify without a client certificate")
 			}
 			// The signature covers the transcript up to but not including this
 			// CertificateVerify; addToTranscript(msg) above already appended it, so
 			// verify against the transcript with the CV body removed.
 			signedLen := len(c.transcript) - len(msg.fullMessageBytes())
-			if !verifyECDSA(clientLeaf, c.transcript[:signedLen], cv.signature) {
+			if err := verifyHandshakeSignature(clientCert.PublicKey, cv.sigScheme, c.transcript[:signedLen], cv.signature); err != nil {
 				c.sendAlert(alertDecryptError)
-				return errors.New("rist: dtls: client CertificateVerify invalid")
+				return fmt.Errorf("rist: dtls: client CertificateVerify: %w", err)
 			}
 			// Proof of possession established (RFC 5246 §7.4.8): the client holds
 			// the private key for clientCert. Only now may the leaf be treated as
@@ -253,13 +237,13 @@ func (c *Conn) serverHandshake() error {
 	}
 	// Proof-of-possession gate (RFC 5246 §7.4.8). A client that presents a
 	// non-empty Certificate MUST follow it with a CertificateVerify signed by the
-	// matching private key; in ECDHE the Finished MAC alone proves nothing about
-	// the certificate, so without this check an attacker holding only a victim's
-	// public cert could impersonate the cert owner — defeating RequireClientCert
-	// and PeerCertFingerprint pinning. Require a verified CertificateVerify
-	// whenever a client certificate was presented or mutual auth is mandated, and
-	// only then promote the leaf to the authenticated c.peerLeaf.
-	if (clientLeaf != nil || cfg.RequireClientCert) && !sawValidCV {
+	// matching private key; the Finished MAC alone proves nothing about the
+	// certificate, so without this check an attacker holding only a victim's public
+	// cert could impersonate the cert owner — defeating RequireClientCert and
+	// PeerCertFingerprint pinning. Require a verified CertificateVerify whenever a
+	// client certificate was presented or mutual auth is mandated, and only then
+	// promote the leaf to the authenticated c.peerLeaf.
+	if (clientCert != nil || cfg.RequireClientCert) && !sawValidCV {
 		c.sendAlert(alertBadCertificate)
 		return errors.New("rist: dtls: client did not authenticate (missing CertificateVerify)")
 	}
@@ -269,7 +253,7 @@ func (c *Conn) serverHandshake() error {
 
 	// Verify the client Finished over the transcript through CertificateVerify /
 	// ClientKeyExchange (it is not yet in the transcript).
-	expectedClientVerify := finishedVerifyData(master, labelClientFinished, c.transcriptHash())
+	expectedClientVerify := finishedVerifyData(suite.newHash, master, labelClientFinished, c.transcriptHash())
 	if !hmac.Equal(expectedClientVerify, msg.body) {
 		c.sendAlert(alertDecryptError)
 		return errors.New("rist: dtls: client Finished verify_data mismatch")
@@ -279,7 +263,7 @@ func (c *Conn) serverHandshake() error {
 	// Flight 6: server CCS + Finished.
 	f6 := &flight{}
 	emitCCS(f6)
-	serverVerify := finishedVerifyData(master, labelServerFinished, c.transcriptHash())
+	serverVerify := finishedVerifyData(suite.newHash, master, labelServerFinished, c.transcriptHash())
 	c.emitHandshake(f6, typeFinished, 1, marshalFinished(serverVerify), true)
 	if err := c.sendFlight(f6); err != nil {
 		return err
@@ -287,4 +271,47 @@ func (c *Conn) serverHandshake() error {
 
 	c.sendEpoch = 1
 	return nil
+}
+
+// serverKeyExchangePMS recovers the pre-master secret from a ClientKeyExchange for
+// the negotiated suite's key exchange: ECDHE (the client's point against our
+// ephemeral key), RSA key transport (decrypt with our certificate's private key,
+// Bleichenbacher-mitigated), or PSK (the shared key, with an optional identity
+// check).
+func (c *Conn) serverKeyExchangePMS(suite cipherSuiteInfo, ecdhePriv ecdhePrivate, body []byte, ch clientHello) ([]byte, error) {
+	cfg := c.cfg
+	switch suite.kx {
+	case kxECDHE:
+		pub, err := parseClientKeyExchangeECDHE(body)
+		if err != nil {
+			return nil, err
+		}
+		return ecdhePremaster(ecdhePriv, pub)
+	case kxRSA:
+		enc, err := parseClientKeyExchangeRSA(body)
+		if err != nil {
+			return nil, err
+		}
+		rsaKey, ok := cfg.Certificate.PrivateKey.(*rsa.PrivateKey)
+		if !ok {
+			return nil, errors.New("rist: dtls: RSA suite but server certificate is not RSA")
+		}
+		// Bleichenbacher-mitigated: a decrypt failure yields a random pre-master, so
+		// the handshake fails indistinguishably at Finished rather than leaking a
+		// padding oracle.
+		return decryptRSAPremaster(cfg.Rand, rsaKey, enc)
+	default: // kxPSK
+		identity, err := parseClientKeyExchangePSK(body)
+		if err != nil {
+			return nil, err
+		}
+		// The shared PSK is the real authenticator (a wrong key fails at Finished),
+		// but when a PSK identity is configured, reject a mismatched client identity
+		// early — it signals a wrong or misconfigured peer. Constant-time to avoid
+		// leaking the identity.
+		if len(cfg.PSKIdentity) > 0 && subtle.ConstantTimeCompare(identity, cfg.PSKIdentity) != 1 {
+			return nil, errors.New("rist: dtls: client PSK identity does not match configured identity")
+		}
+		return pskPremaster(cfg.PSK), nil
+	}
 }

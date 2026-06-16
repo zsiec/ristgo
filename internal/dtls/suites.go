@@ -21,32 +21,26 @@ const (
 	typeFinished           handshakeType = 20
 )
 
-// Cipher suites (the two this package supports), AES-128-GCM + SHA-256.
-//
-// Deferred deviation from RFC 7525 §4.2 / RFC 8422 mandatory-to-implement set
-// (finding L7): of the five suites RFC 7525 §6.2 recommends, only
-// ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 is implemented (plus the PSK suite RIST
-// actually uses). The omissions are deliberate:
-//
-//   - ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 is NOT a clean extension of the
-//     existing machinery: it changes BOTH the bulk key length (AES-256) and the
-//     PRF/Finished/transcript hash (SHA-384). The PRF (prf/pHash) and the
-//     handshake transcript hash (transcriptHash) are fixed to SHA-256 and woven
-//     through the master-secret/EMS derivation, CertificateVerify, and both
-//     Finished computations; parametrizing the hash would touch the entire key
-//     schedule and every transcript consumer in both handshake drivers. Given no
-//     interop oracle (see below), AES-128-GCM/SHA-256 — itself a recommended,
-//     128-bit-secure AEAD suite — is the single supported GCM strength.
-//   - The ECDHE_RSA_* and DHE_RSA_* suites need an RSA certificate/signature
-//     path distinct from the ECDSA one and are out of scope.
-//
-// There is no interop cost: libRIST ships no DTLS, so there is no reference peer
-// whose suite list ristgo must match; the supported suites are validated against
-// OpenSSL (see doc.go). Adding AES-256-GCM/SHA-384 is tracked as future work
-// behind a hash-parametrized PRF and transcript.
+// Cipher suites. The five TR-06-2 §6.2 mandatory-to-implement suites are all
+// supported (see suiteTable), plus the PSK suite RIST itself uses. The
+// PRF/transcript hash is parametrized per suite (SHA-256 or SHA-384, see
+// cipherSuiteInfo.newHash), AES-128 and AES-256 GCM are both wired, and there is
+// an RSA certificate/signature path alongside the ECDSA one and an RSA
+// key-transport + NULL-cipher (integrity-only) path for RSA_WITH_NULL_SHA256.
+// RSA_WITH_NULL_SHA256 provides NO confidentiality; it is mandatory to *support*
+// but is OFF by default and reachable only via Config.AllowNullCipher (so a
+// certificate config cannot silently enable a cleartext session), and like every
+// suite can also be turned off per the user's policy (the §6.2 disable knob). The
+// supported set is validated against OpenSSL
+// (see the interop test); libRIST ships no DTLS, so there is no reference peer
+// whose suite list ristgo must match.
 const (
 	tlsPSKWithAES128GCMSHA256        uint16 = 0x00A8 // RFC 5487
+	tlsRSAWithNULLSHA256             uint16 = 0x003B // RFC 5246 — integrity only
 	tlsECDHEECDSAWithAES128GCMSHA256 uint16 = 0xC02B // RFC 5289
+	tlsECDHEECDSAWithAES256GCMSHA384 uint16 = 0xC02C // RFC 5289
+	tlsECDHERSAWithAES128GCMSHA256   uint16 = 0xC02F // RFC 5289
+	tlsECDHERSAWithAES256GCMSHA384   uint16 = 0xC030 // RFC 5289
 )
 
 // Extension types (RFC 5246, RFC 4492/8422, RFC 7627).
@@ -64,13 +58,32 @@ const namedGroupSecp256r1 uint16 = 23
 // EC point format: uncompressed only (RFC 8422 §5.1.2).
 const ecPointUncompressed uint8 = 0
 
-// Signature scheme: ecdsa_secp256r1_sha256 (RFC 8446 §4.2.3 value, valid as the
-// TLS 1.2 SignatureAndHashAlgorithm {hash=sha256(4), sig=ecdsa(3)}).
+// Signature schemes: the TLS 1.2 SignatureAndHashAlgorithm pairs {hash, sig}
+// (RFC 5246 §7.4.1.4.1), encoded hash<<8 | sig. ristgo offers ECDSA and RSA
+// (PKCS#1 v1.5) over SHA-256 and SHA-384, so a peer's certificate of either type
+// and either suite hash can be authenticated. It signs its own messages with the
+// SHA-256 variant for its certificate's key type (always a valid choice for the
+// supported suites); it accepts either hash on the verify path so an OpenSSL peer
+// that prefers SHA-384 still interoperates.
 const (
-	sigSchemeECDSAP256SHA256 uint16 = 0x0403
-	hashAlgSHA256            uint8  = 4
-	sigAlgECDSA              uint8  = 3
+	sigSchemeECDSAP256SHA256 uint16 = 0x0403 // {sha256(4), ecdsa(3)}
+	sigSchemeECDSAP256SHA384 uint16 = 0x0503 // {sha384(5), ecdsa(3)}
+	sigSchemeRSAPKCS1SHA256  uint16 = 0x0401 // {sha256(4), rsa(1)}
+	sigSchemeRSAPKCS1SHA384  uint16 = 0x0501 // {sha384(5), rsa(1)}
+
+	hashAlgSHA256 uint8 = 4
+	hashAlgSHA384 uint8 = 5
+	sigAlgRSA     uint8 = 1
+	sigAlgECDSA   uint8 = 3
 )
+
+// offeredSignatureAlgorithms is the signature_algorithms extension ristgo sends:
+// ECDSA and RSA over both SHA-256 and SHA-384, so a peer may authenticate with an
+// ECDSA-P256 or RSA certificate and sign under either suite's hash.
+var offeredSignatureAlgorithms = []uint16{
+	sigSchemeECDSAP256SHA256, sigSchemeECDSAP256SHA384,
+	sigSchemeRSAPKCS1SHA256, sigSchemeRSAPKCS1SHA384,
+}
 
 // compressionNull is the only compression method (RFC 5246 §6.1).
 const compressionNull uint8 = 0

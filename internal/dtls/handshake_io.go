@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"time"
 )
 
@@ -53,11 +54,18 @@ func (c *Conn) addToTranscript(m handshakeMessage) {
 	c.transcript = append(c.transcript, m.fullMessageBytes()...)
 }
 
-// transcriptHash returns SHA-256 over the handshake transcript so far — the seed
-// for the master secret (EMS), CertificateVerify, and Finished verify_data.
+// transcriptHash returns the negotiated suite's hash over the handshake
+// transcript so far — the seed for the master secret (EMS), CertificateVerify, and
+// Finished verify_data. It falls back to SHA-256 before a suite is negotiated
+// (no transcript-hash consumer runs that early).
 func (c *Conn) transcriptHash() []byte {
-	sum := sha256.Sum256(c.transcript)
-	return sum[:]
+	newHash := c.suite.newHash
+	if newHash == nil {
+		newHash = func() hash.Hash { return sha256.New() }
+	}
+	h := newHash()
+	h.Write(c.transcript)
+	return h.Sum(nil)
 }
 
 // sendFlight records f as the retransmission unit, resets the retransmit timer,
