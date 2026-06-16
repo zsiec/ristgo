@@ -120,20 +120,34 @@ func TestInteropMainGoRxHeavyLossRecovery(t *testing.T) {
 // 25%-loss proxy -> ristgo Advanced Receiver. The Advanced native NACK control
 // plane must recover a quarter of the stream.
 //
-// SKIPPED — KNOWN ISSUE. Unlike Simple and Main (which recover 25% loss byte-exact
-// here), the Advanced profile vs the real libRIST sender does NOT reliably recover
-// at 25%: ~1 in 10 runs ends with lost>=1 (the trailing flush masks the byte count
-// while the SHA differs). The 10%-loss companion TestInteropAdvGoRxLossyRecovery is
-// solid, so this is a high-loss-only degradation, distinct from the (fixed) libRIST
-// RTT-overflow bug. It is NOT a recovery-buffer tuning limit: raising the buffer
-// from 1000ms to 3000ms makes it dramatically WORSE (15/15 fail, lost 8-37, with
-// the proxy dropping far more — ristgo floods retransmit traffic), which points at
-// a NACK-cadence / retransmit-storm interaction in the Advanced control plane
-// rather than insufficient time. Left in-tree as the repro harness; remove this
-// Skip to investigate. Simple/Main 25% (above) provide the heavy-loss coverage in
-// the meantime.
+// SKIPPED — LIBRIST BUG, NOT RISTGO. The Advanced profile vs the real libRIST
+// sender does not reliably recover at 25% (~1 in 10 runs ends with lost>=1; the
+// trailing flush masks the byte count while the SHA differs). Root-caused to
+// libRIST, definitively:
+//   - ristgo<->ristgo Advanced at 25% recovers byte-exact every time
+//     (TestE2EAdvHeavyLossRecovery), with a tight 1:1 NACK->retransmit ratio.
+//   - libRIST<->libRIST Advanced at 25% FAILS deterministically too (both tools,
+//     same proxy): libRIST cannot recover 25% loss from itself.
+//
+// Confirmed control: libRIST<->libRIST recovers 5% and 10% loss byte-exact through
+// this same proxy but fails at 25% — so the harness is sound and 25% is a real
+// libRIST limit, not a proxy artifact.
+//
+// Mechanism, confirmed in libRIST source (src/rist-common.c rist_process_nack):
+// the receiver's re-NACK interval is clamp(eight_times_rtt/8, rtt_min, rtt_max) *
+// 1.1, and eight_times_rtt is fed by the Advanced RTT echo whose handler shifts the
+// round-trip diff >>16 instead of >>32 (src/adv_ctrl.c), inflating it ~2^16 so it
+// pins to rtt_max (500ms default). With re-NACKs only every ~550ms inside the
+// ~1.1*recovery_buffer window, libRIST attempts only ~2 retransmits per packet —
+// never the max_retries (20) it is configured for. Two attempts suffice at <=10%
+// loss but not at 25%, where a packet's retransmit is itself often dropped. ristgo
+// measures RTT correctly (sub-ms on loopback -> rtt_min floor), re-NACKs ~every
+// 5.5ms (~20 attempts), and recovers 25% (TestE2EAdvHeavyLossRecovery). This cannot
+// pass until libRIST fixes the >>16 overflow; Simple/Main 25% (above) and the
+// Go<->Go test provide heavy-loss coverage. Left in-tree as the repro harness —
+// remove this Skip once libRIST is fixed.
 func TestInteropAdvGoRxHeavyLossRecovery(t *testing.T) {
-	t.Skip("known issue: Advanced 25%-loss recovery vs libRIST is unreliable (see doc comment); 10% is solid")
+	t.Skip("libRIST bug: libRIST<->libRIST Advanced 25%-loss also fails (see doc comment); ristgo<->ristgo 25% is byte-exact")
 
 	sender := libristTool(t, "ristsender")
 	goPort := freeMainPort(t)
