@@ -139,34 +139,33 @@ func TestInteropMainGoRxHeavyLossRecovery(t *testing.T) {
 // 25%-loss proxy -> ristgo Advanced Receiver. The Advanced native NACK control
 // plane must recover a quarter of the stream.
 //
-// SKIPPED — LIBRIST BUG, NOT RISTGO. The Advanced profile vs the real libRIST
-// sender does not reliably recover at 25% (~1 in 10 runs ends with lost>=1; the
-// trailing flush masks the byte count while the SHA differs). Root-caused to
-// libRIST, definitively:
-//   - ristgo<->ristgo Advanced at 25% recovers byte-exact every time
-//     (TestE2EAdvHeavyLossRecovery), with a tight 1:1 NACK->retransmit ratio.
-//   - libRIST<->libRIST Advanced at 25% FAILS deterministically too (both tools,
-//     same proxy): libRIST cannot recover 25% loss from itself.
+// SKIPPED — LIBRIST BUG, NOT RISTGO (root cause found, fix verified). The
+// Advanced profile vs the real libRIST sender does not reliably recover at 25%
+// (~1 in 10 runs ends with lost>=1; the trailing flush masks the byte count while
+// the SHA differs). It is NOT ristgo: ristgo<->ristgo Advanced 25% recovers
+// byte-exact every time (TestE2EAdvHeavyLossRecovery), and libRIST<->libRIST 25%
+// fails too (5%/10% recover, 25% does not — so the harness is sound).
 //
-// Confirmed control: libRIST<->libRIST recovers 5% and 10% loss byte-exact through
-// this same proxy but fails at 25% — so the harness is sound and 25% is a real
-// libRIST limit, not a proxy artifact.
+// Root cause (traced through libRIST source and confirmed by patching it):
+// libRIST's Advanced RTT-echo response handler (src/adv_ctrl.c, case
+// RIST_ADV_CI_RTT_ECHO_RESP) computes rtt = (rtt_ntp * 1e6) >> 16, but rtt_ntp is
+// already in NTP ticks (RIST_CLOCK units) — the unit last_rtt wants — so the
+// *1e6>>16 rescale inflates the sender's last_rtt ~15x (real ~7ms loopback RTT
+// becomes ~111ms). The sender's retry-suppression gate (src/udp.c,
+// rist_retry_enqueue) then refuses a re-NACK whenever delta < clamp(last_rtt,...);
+// the receiver re-NACKs every ~55ms, but the gate's rtt is ~111ms, so every
+// re-NACK is dropped (bloat_skip). At 25% loss a retransmit is itself often
+// dropped and needs a re-NACK, so those packets are never resent -> lost. At <=10%
+// re-NACKs are rarely needed, so it works.
 //
-// Mechanism, confirmed in libRIST source (src/rist-common.c rist_process_nack):
-// the receiver's re-NACK interval is clamp(eight_times_rtt/8, rtt_min, rtt_max) *
-// 1.1, and eight_times_rtt is fed by the Advanced RTT echo whose handler shifts the
-// round-trip diff >>16 instead of >>32 (src/adv_ctrl.c), inflating it ~2^16 so it
-// pins to rtt_max (500ms default). With re-NACKs only every ~550ms inside the
-// ~1.1*recovery_buffer window, libRIST attempts only ~2 retransmits per packet —
-// never the max_retries (20) it is configured for. Two attempts suffice at <=10%
-// loss but not at 25%, where a packet's retransmit is itself often dropped. ristgo
-// measures RTT correctly (sub-ms on loopback -> rtt_min floor), re-NACKs ~every
-// 5.5ms (~20 attempts), and recovers 25% (TestE2EAdvHeavyLossRecovery). This cannot
-// pass until libRIST fixes the >>16 overflow; Simple/Main 25% (above) and the
-// Go<->Go test provide heavy-loss coverage. Left in-tree as the repro harness —
-// remove this Skip once libRIST is fixed.
+// Verified fix: changing that one line so last_rtt keeps rtt_ntp (ticks) makes the
+// sender's bloat_skip go 41->0 and this test pass 5/5 against a patched libRIST;
+// libRIST<->libRIST then recovers the whole 25% stream except seq 0 (a separate
+// cold-start edge — a receiver cannot NACK before its first-seen sequence — which
+// ristgo's receiver does handle). Until that fix lands upstream this stays skipped;
+// Simple/Main 25% (above) and the Go<->Go test carry the heavy-loss coverage.
 func TestInteropAdvGoRxHeavyLossRecovery(t *testing.T) {
-	t.Skip("libRIST bug: libRIST<->libRIST Advanced 25%-loss also fails (see doc comment); ristgo<->ristgo 25% is byte-exact")
+	t.Skip("libRIST bug (verified): adv_ctrl.c RTT-echo >>16 inflates the sender's last_rtt, tripping its delta<rtt retry gate; fix verified locally. ristgo<->ristgo 25% is byte-exact")
 
 	sender := libristTool(t, "ristsender")
 	goPort := freeMainPort(t)
