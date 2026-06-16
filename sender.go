@@ -237,9 +237,10 @@ func newAdvSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 // its inbound RTCP, so until a receiver appears RemoteAddr is unspecified and
 // submitted media is held (the recovery buffer) or dropped rather than sent.
 //
-// DTLS and EAP-SRP are not yet supported in listener-send mode; PSK (Secret)
-// encryption on the Main and Advanced profiles is. See [ListenSender] for the
-// context-aware constructor with functional options.
+// DTLS is not supported in listener-send mode; PSK (Secret) encryption on the Main
+// and Advanced profiles, and EAP-SRP on the Main profile (the listening sender is the
+// authenticatee), are. See [ListenSender] for the context-aware constructor with
+// functional options.
 func NewListenerSender(addr string, cfg Config) (*Sender, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -248,8 +249,8 @@ func NewListenerSender(addr string, cfg Config) (*Sender, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
-	if cfg.DTLS != nil || cfg.Username != "" {
-		return nil, fmt.Errorf("%w: DTLS and EAP-SRP are not yet supported in listener-send mode", ErrInvalidConfig)
+	if cfg.DTLS != nil {
+		return nil, fmt.Errorf("%w: DTLS is not yet supported in listener-send mode", ErrInvalidConfig)
 	}
 	switch cfg.Profile {
 	case ProfileSimple:
@@ -286,7 +287,8 @@ func newSimpleListenerSender(addr string, cfg Config) (*Sender, error) {
 }
 
 // newMainListenerSender binds the Main-profile single GRE port at addr and waits
-// for a caller-receiver.
+// for a caller-receiver. With EAP-SRP credentials the listening sender is the
+// authenticatee (it sends the EAPOL-Start once a caller is learned).
 func newMainListenerSender(addr string, cfg Config) (*Sender, error) {
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
@@ -294,6 +296,9 @@ func newMainListenerSender(addr string, cfg Config) (*Sender, error) {
 	}
 	mp, err := buildMainParams(cfg)
 	if err != nil {
+		return nil, err
+	}
+	if mp.EAPClient, err = buildEAPClient(cfg); err != nil {
 		return nil, err
 	}
 	conn, err := socket.ListenSingle(host, port)

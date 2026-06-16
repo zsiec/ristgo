@@ -662,3 +662,104 @@ func TestGREKeepaliveRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestFeedbackCNAMEGate verifies the NAT-rebind trigger gate (mainCodec.feedbackCNAME): it
+// returns the CNAME ONLY for an ENCRYPTED RTCP feedback datagram, and rejects cleartext
+// feedback, media, and garbage — so a forger with no key (cannot encrypt) or a cleartext
+// sender (use_key_as_passphrase media) cannot supply a CNAME to force a re-association.
+func TestFeedbackCNAMEGate(t *testing.T) {
+	const ssrc = 0x0ACE0AC0
+
+	// Encrypted RTCP feedback carries the CNAME ("cam" per newCodecPair).
+	enc, dec := newCodecPair(t, crypto.KeySize128, false, ssrc)
+	dg, err := enc.encodeMainFeedback(nil, rtcp.EmptyReceiverReport{SSRC: ssrc}, nil, false)
+	if err != nil {
+		t.Fatalf("encodeMainFeedback: %v", err)
+	}
+	if cname, ok := dec.feedbackCNAME(dg); !ok || cname != "cam" {
+		t.Fatalf("encrypted feedback: got (%q,%v), want (\"cam\",true)", cname, ok)
+	}
+
+	// Cleartext feedback (no key) must NOT yield a CNAME — a forger could send this.
+	cEnc, cDec := newCodecPair(t, 0, false, ssrc)
+	cdg, err := cEnc.encodeMainFeedback(nil, rtcp.EmptyReceiverReport{SSRC: ssrc}, nil, false)
+	if err != nil {
+		t.Fatalf("cleartext encodeMainFeedback: %v", err)
+	}
+	if cname, ok := cDec.feedbackCNAME(cdg); ok {
+		t.Fatalf("cleartext feedback yielded CNAME %q; it must be rejected (forgeable)", cname)
+	}
+
+	// Encrypted media is not RTCP feedback: no SDES, so no CNAME.
+	mdg, err := enc.encodeMainMedia(nil, wire.MediaPacket{Seq: 1, SourceTime: mainSrcNTP(0), SSRC: ssrc, Payload: []byte{0xAB, 0xCD}})
+	if err != nil {
+		t.Fatalf("encodeMainMedia: %v", err)
+	}
+	if _, ok := dec.feedbackCNAME(mdg); ok {
+		t.Fatal("media datagram yielded a CNAME; it must be rejected")
+	}
+
+	// Garbage from a forger.
+	if _, ok := dec.feedbackCNAME([]byte("not a valid GRE datagram at all")); ok {
+		t.Fatal("garbage yielded a CNAME")
+	}
+}
+
+// TestDecodeMainCNAMEEmission verifies the steady-state CNAME learn path used by the host's
+// learnPeerCNAME: decodeMain surfaces a wire.PeerIdentity ONLY from an ENCRYPTED RTCP
+// datagram (a cleartext SDES is forgeable and must not populate the rebind identity key) and
+// ONLY when the CNAME changes (so the hot RX feedback path allocates nothing per datagram).
+func TestDecodeMainCNAMEEmission(t *testing.T) {
+	const ssrc = 0x0ACE0AC0
+
+	countCNAME := func(fbs []wire.Feedback) (string, int) {
+		n := 0
+		last := ""
+		for _, fb := range fbs {
+			if pi, ok := fb.(wire.PeerIdentity); ok {
+				n++
+				last = pi.CNAME
+			}
+		}
+		return last, n
+	}
+
+	// Encrypted feedback: the FIRST decode surfaces the CNAME, the SECOND (unchanged) does not.
+	enc, dec := newCodecPair(t, crypto.KeySize128, false, ssrc)
+	dg, err := enc.encodeMainFeedback(nil, rtcp.EmptyReceiverReport{SSRC: ssrc}, nil, false)
+	if err != nil {
+		t.Fatalf("encodeMainFeedback: %v", err)
+	}
+	_, _, fbs, err := dec.decodeMain(dg, 0)
+	if err != nil {
+		t.Fatalf("decodeMain (encrypted, first): %v", err)
+	}
+	if cn, n := countCNAME(fbs); n != 1 || cn != "cam" {
+		t.Fatalf("first encrypted decode: got (%q, %d PeerIdentity), want (\"cam\", 1)", cn, n)
+	}
+	dg2, err := enc.encodeMainFeedback(nil, rtcp.EmptyReceiverReport{SSRC: ssrc}, nil, false)
+	if err != nil {
+		t.Fatalf("encodeMainFeedback 2: %v", err)
+	}
+	_, _, fbs2, err := dec.decodeMain(dg2, 0)
+	if err != nil {
+		t.Fatalf("decodeMain (encrypted, second): %v", err)
+	}
+	if _, n := countCNAME(fbs2); n != 0 {
+		t.Fatalf("second encrypted decode emitted %d PeerIdentity for an unchanged CNAME; want 0 (no per-datagram alloc)", n)
+	}
+
+	// Cleartext feedback: never surfaces a CNAME (forgeable).
+	cEnc, cDec := newCodecPair(t, 0, false, ssrc)
+	cdg, err := cEnc.encodeMainFeedback(nil, rtcp.EmptyReceiverReport{SSRC: ssrc}, nil, false)
+	if err != nil {
+		t.Fatalf("cleartext encodeMainFeedback: %v", err)
+	}
+	_, _, cfbs, err := cDec.decodeMain(cdg, 0)
+	if err != nil {
+		t.Fatalf("decodeMain (cleartext): %v", err)
+	}
+	if _, n := countCNAME(cfbs); n != 0 {
+		t.Fatalf("cleartext decode surfaced %d PeerIdentity; a cleartext SDES must never populate the rebind identity key", n)
+	}
+}

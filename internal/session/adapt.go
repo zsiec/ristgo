@@ -229,10 +229,37 @@ func (s *Session) feedFeedback(now clock.Timestamp, fbs []wire.Feedback) {
 			s.handleLQM(v.LQM)
 		case wire.FlowAttribute:
 			s.handleFlowAttr(v.JSON)
+		case wire.PeerIdentity:
+			s.learnPeerCNAME(v.CNAME)
 		default:
 			s.flow.FeedFeedback(now, fb)
 		}
 	}
+}
+
+// learnPeerCNAME records the peer's SDES CNAME for NAT-rebind re-association. Two gates bind
+// it to the authenticated peer: the codec only surfaces a wire.PeerIdentity from an ENCRYPTED
+// RTCP datagram (decodeFeedbackMain), so the CNAME rode an envelope keyed from the per-peer
+// session key K — a forger with no key, or a cleartext sender, cannot supply one; and this
+// session-level srpAuthenticated gate ensures a shared-PSK or plaintext session (where the
+// envelope is forgeable) never records a CNAME at all. Without both, trusting the CNAME as
+// identity would enable a peer-record hijack.
+func (s *Session) learnPeerCNAME(cname string) {
+	if cname == "" || !s.srpAuthenticated() {
+		return
+	}
+	s.peerCNAME = cname
+}
+
+// srpAuthenticated reports whether an EAP-SRP handshake for this session has EVER completed
+// (an authenticated per-peer identity is established). It gates CNAME-based re-association
+// and the source-restriction on inbound datagrams. It deliberately keys off everAuthed, not
+// the live authed: during an in-flight NAT-rebind re-auth authed is false, but the identity
+// is still established, so foreign-source datagrams must stay gated (otherwise a second
+// source could slip through the normal path while authed is down). A shared PSK (no EAP
+// role) or plaintext session never qualifies.
+func (s *Session) srpAuthenticated() bool {
+	return (s.eapClient != nil || s.eapServer != nil) && s.everAuthed
 }
 
 // handleFlowAttr surfaces one inbound Advanced Flow Attribute (TR-06-3 §5.3.7) to

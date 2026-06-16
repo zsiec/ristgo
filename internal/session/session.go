@@ -315,6 +315,30 @@ type Session struct {
 	// holds delivery until authed.
 	eapClient *eap.Authenticatee
 	eapServer *eap.Authenticator
+	// eapStartSent records that the authenticatee's EAPOL-Start has been emitted.
+	// A caller authenticatee knows its peer at start-up and sends it immediately; a
+	// listener authenticatee (listener-sender topology) cannot speak until it learns
+	// the caller, so the loop defers the Start until the peer's address is known.
+	eapStartSent bool
+	// peerCNAME is the peer's RTCP SDES canonical name, recorded ONLY from an
+	// authenticated EAP-SRP session (forgeable otherwise). It is the identity key for
+	// NAT source-port rebind re-association (see maybeReassociate). Empty until learned.
+	peerCNAME string
+	// everAuthed records that the EAP-SRP handshake has succeeded at least once, so a
+	// LATER handshake failure or a regression out of SUCCESS is treated as a re-auth (a
+	// held re-auth, not an initial-auth failure that tears the session down). This is the
+	// session-layer signal, written only here on the SUCCESS transition and read by
+	// srpAuthenticated/handleEAP; it is distinct from eap.Authenticator.everAuthed, which
+	// is the role's own internal LOGOFF guard — neither reads the other, so they are not
+	// kept in lockstep across the layer boundary.
+	everAuthed bool
+	// reauthing is true while a NAT-rebind / in-band EAP re-authentication is in flight to
+	// a migrated or regressed tuple: media is held (authed false) and further new-source
+	// datagrams are ignored until the fresh handshake completes (success) or the session is
+	// torn down at reauthDeadline. While it is set, the ordinary session-timeout teardown is
+	// suppressed so the re-auth gets its full round-trip.
+	reauthing      bool
+	reauthDeadline clock.Timestamp // when an unfinished re-auth tears the session down
 	// authed gates the data channel; written by the loop, read by the loop and
 	// by Authenticated() (hence atomic).
 	authed atomic.Bool
@@ -754,11 +778,10 @@ func (s *Session) loop() {
 	// Anchor the LQM reporting period at start-up so the first report covers a
 	// real interval rather than the whole epoch.
 	s.lqmLast = s.clk.Now()
-	// A Main-profile EAP client opens authentication immediately with an
-	// EAPOL-START; media is held (appIn is gated below) until it succeeds.
-	if s.eapClient != nil {
-		s.sendEAP(s.eapClient.Start(), s.clk.Now())
-	}
+	// A Main-profile EAP authenticatee opens authentication with an EAPOL-START.
+	// A caller knows its peer now, so it starts immediately; a listener authenticatee
+	// has no peer yet and defers until one is learned (maybeStartEAP from the loop).
+	s.maybeStartEAP(s.clk.Now())
 
 	for {
 		// Hold outbound media (appIn) until the data channel is authenticated;
@@ -798,57 +821,7 @@ func (s *Session) loop() {
 			s.afterInput(now, timer)
 		case d := <-s.mainIn:
 			now := s.clk.Now()
-			// One GRE socket carries both directions, so the peer's media and
-			// RTCP addresses are the one learned address.
-			s.peer.LearnMedia(d.src)
-			s.peer.LearnRTCP(d.src)
-			s.peer.Observe(now)
-			// Probe the GRE version with a dual-version keepalive burst the
-			// instant the peer is learned, so a v2-capable peer can upgrade.
-			if !s.greBurstSent && s.peer.RTCP.IsValid() {
-				s.greBurstSent = true
-				s.sendGREKeepaliveBurst()
-			}
-			// Apply the monotonic GRE-version upgrade from every datagram's
-			// header version, and learn capabilities/MAC from a v1 keepalive.
-			kind, ka, ver, cerr := s.main.peekControl(d.data)
-			s.upgradeGREVersion(ver)
-			if kind == controlKeepalive {
-				if cerr != nil {
-					s.logf("main: drop undecodable GRE keepalive: %v", cerr)
-				} else {
-					s.handleGREControl(ka)
-				}
-			} else if eapPayload, ok := s.main.peekEAPOL(d.data); ok {
-				// Authentication frame: route to the EAP state machine.
-				s.handleEAP(now, eapPayload)
-			} else if oob, proto, ok, oerr := s.main.peekOOB(d.data); ok {
-				// Tunnelled / out-of-band data: deliver via ReadOOB tagged with its
-				// protocol type, bypassing the media flow entirely.
-				if oerr != nil {
-					s.logf("main: drop undecodable OOB (%d bytes): %v", len(d.data), oerr)
-				} else {
-					s.deliverOOB(proto, oob)
-				}
-			} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
-				if isMedia {
-					s.feedMedia(now, 0, pkt)
-					if s.fecEnabled() {
-						// FEC over the decoded inner RTP payload (TR-06-2 §8.6);
-						// lastWireTS is the raw inner RTP timestamp.
-						s.fecRecvRTP(now, s.main.dec.lastWireTS, pkt)
-					}
-				} else {
-					s.feedFeedback(now, fbs)
-				}
-			} else {
-				// A decode failure on an otherwise-delivered datagram usually
-				// means a PSK secret or AES-key-size mismatch (decryption yields
-				// garbage), which would otherwise look like total packet loss.
-				// Surface it so it is diagnosable; logf is zero-cost when no
-				// logger is set.
-				s.logAt(LogWarning, CatCrypto, "main: drop undecodable datagram (%d bytes): %v", len(d.data), err)
-			}
+			s.handleMainDatagram(now, d)
 			s.afterInput(now, timer)
 		case d := <-s.advIn:
 			now := s.clk.Now()
@@ -895,7 +868,27 @@ func (s *Session) loop() {
 			s.afterInput(now, timer)
 		case <-ticker.C:
 			now := s.clk.Now()
-			if s.peer.Expired(now) {
+			// Liveness / teardown. A NAT-rebind or in-band EAP re-auth holds media on an
+			// as-yet-unproven tuple; while that re-auth window is open the ordinary
+			// Expired() teardown is SUPPRESSED so a genuine re-auth gets its full
+			// round-trip. The rebind only fires once the old tuple is already dormant
+			// (silent > 2x keepalive == the session timeout by default), so without this
+			// suppression Expired() would fire on the very next tick and tear the recovery
+			// down before the handshake could complete. When the window closes without a
+			// completed re-auth, the session IS torn down: a stalled or forged re-auth can
+			// never complete, and an unproven/forged tuple must not keep the session alive
+			// (a frozen-lastSeen heuristic does not hold once the migrated tuple's own
+			// datagrams refresh it) — a fresh reconnect re-establishes the session cleanly.
+			// The deadline is polled here at keepalive granularity; reauthTimeout is sized
+			// well above the keepalive interval so the slack is bounded.
+			if s.reauthing {
+				if now.After(s.reauthDeadline) {
+					s.reauthing = false
+					s.logAt(LogNote, CatCrypto, "nat-rebind: re-auth timed out; tearing down (awaiting a fresh connection)")
+					s.shutdown(s.cfg.ErrSessionTimeout)
+					return
+				}
+			} else if s.peer.Expired(now) {
 				s.shutdown(s.cfg.ErrSessionTimeout)
 				return
 			}
@@ -908,14 +901,20 @@ func (s *Session) loop() {
 			if s.bond != nil {
 				s.tickBond(now)
 				s.sendKeepalive(now)
-			} else if s.peer.RTCP.IsValid() && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
+			} else if s.peer.RTCP.IsValid() && !s.reauthing && (s.adv != nil || now.Sub(s.lastTx) >= ka) {
+				// Suppressed during a re-auth (like the GRE keepalive below): the peer
+				// tuple is unproven then, so a full RTCP compound (SR/RR + SDES + RTT echo)
+				// must not be reflected to it — only the EAPOL handshake is sent.
 				s.sendKeepalive(now)
 			}
 			// Main profile (non-bonded): also emit the periodic GRE keepalive (the
 			// node-MAC + capability beacon), at the negotiated GRE version. It is
 			// distinct from the RTCP keepalive above (libRIST runs both timers).
-			// Bonded sessions drive their own per-path keepalives.
-			if s.main != nil && s.bond == nil && s.peer.RTCP.IsValid() {
+			// Bonded sessions drive their own per-path keepalives. Suppressed during a
+			// NAT-rebind re-auth: the peer tuple is unproven then, and only the EAPOL
+			// handshake (not the periodic beacon) should be sent to it — so a forged
+			// trigger carrying a victim source cannot turn this into a reflection.
+			if s.main != nil && s.bond == nil && s.peer.RTCP.IsValid() && !s.reauthing {
 				s.sendGREKeepalive(s.greVersion)
 			}
 			// A receiver that opted into source adaptation emits a Link Quality
@@ -1546,11 +1545,16 @@ func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 	// are available.
 	wasAuthed := s.authed.Load()
 	s.installEAPKeying()
-	if role.Authenticated() {
-		// The authenticatee drives the post-SUCCESS PASSWORD_REQUEST once, after
-		// installing its keys (eap_request_passphrase(start=true) on SUCCESS).
+	switch {
+	case role.Authenticated():
+		// SUCCESS — the initial handshake, or a NAT-rebind / in-band re-auth just
+		// completed and re-proved the tuple. The authenticatee drives the post-SUCCESS
+		// PASSWORD_REQUEST once, after installing its keys (eap_request_passphrase on
+		// SUCCESS).
 		s.maybeSendPasswordRequest(now)
 		s.authed.Store(true)
+		s.everAuthed = true
+		s.reauthing = false // any re-auth is now proven and complete
 		// On the transition to authenticated under use_key_as_passphrase, send an
 		// immediate keepalive (a GRE MAC beacon and, on a receiver, the RTCP SDES
 		// handshake) so the peer gets fresh liveness — now keyed under K on a
@@ -1561,9 +1565,44 @@ func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 		if !wasAuthed && s.useKeyAsPassphrase {
 			s.sendPostAuthBeacon(now)
 		}
-	} else if role.Done() {
-		// A terminal state without success means authentication failed.
-		s.shutdown(s.cfg.ErrAuth)
+	case role.Done():
+		// A terminal state without success means authentication failed. An initial
+		// failure (never authenticated) tears the session down (ErrAuth). A failure AFTER
+		// a prior success is a re-authentication failure (e.g. a forged/replayed re-auth
+		// that could not complete the fresh handshake): HOLD media (authed false) and keep
+		// the re-auth window armed so the ticker abandons it at reauthDeadline — never
+		// deliver under the failed handshake, and never leave an unproven tuple holding
+		// the session open indefinitely.
+		if !s.everAuthed {
+			s.shutdown(s.cfg.ErrAuth)
+			return
+		}
+		s.authed.Store(false)
+		if !s.reauthing {
+			s.reauthing = true
+			s.reauthDeadline = now.Add(s.reauthTimeout())
+		}
+		s.logAt(LogNote, CatCrypto, "eap: re-auth failed; media held pending re-proof or timeout")
+	default:
+		// The role is mid-handshake (StateInProgress/Unauth). If it had authenticated
+		// before, an inbound EAPOL frame just regressed it OUT of SUCCESS — an in-band
+		// re-auth: the genuine peer re-proving after its own rebind/restart (it honors a
+		// peer-driven IDENTITY REQUEST / START, which is required for the rebind recovery
+		// to work), OR a forged EAPOL frame spoofed from the peer's tuple (EAPOL is never
+		// encrypted). Either way the tuple is no longer proven, so DROP authed and hold
+		// media until the fresh handshake re-proves identity. Arming the re-auth window
+		// bounds a stalled or forged re-auth (the ticker tears it down at reauthDeadline)
+		// instead of silently delivering under a desynced handshake — the same hold the
+		// gated NAT-rebind path uses. A forger cannot complete the SRP exchange, so it can
+		// at most force a bounded media gap, never receive media.
+		if wasAuthed && s.everAuthed {
+			s.authed.Store(false)
+			if !s.reauthing {
+				s.reauthing = true
+				s.reauthDeadline = now.Add(s.reauthTimeout())
+				s.logAt(LogNote, CatCrypto, "eap: re-auth in progress; media held pending re-proof")
+			}
+		}
 	}
 }
 
@@ -1649,6 +1688,189 @@ func (s *Session) maybeSendPasswordRequest(now clock.Timestamp) {
 	if f, ok := s.eapClient.PasswordRequest(); ok {
 		s.pwReqSent = true
 		s.sendEAP(f, now)
+	}
+}
+
+// maybeStartEAP emits the authenticatee's EAPOL-Start exactly once, as soon as the
+// peer's address is known. A caller authenticatee satisfies this at loop start; a
+// listener authenticatee only after it learns the caller from inbound traffic. A no-op
+// for a session with no EAP authenticatee, after the Start was already sent, or while
+// the peer is still unknown.
+func (s *Session) maybeStartEAP(now clock.Timestamp) {
+	if s.eapClient == nil || s.eapStartSent || !s.peer.Media.IsValid() {
+		return
+	}
+	s.sendEAP(s.eapClient.Start(), now)
+	s.eapStartSent = true
+}
+
+// handleMainDatagram processes one inbound Main-profile datagram. It first offers it to the
+// NAT source-port rebind recovery: on an authenticated SRP session a datagram from a source
+// other than the established peer is consumed there (re-associated under a fresh EAP-SRP
+// re-auth, or ignored) instead of through first-source learning. For the established peer it
+// learns the address, advances the GRE version, and dispatches keepalive / EAPOL / OOB /
+// media / feedback.
+func (s *Session) handleMainDatagram(now clock.Timestamp, d inbound) {
+	if s.maybeReassociate(now, d.src, d.data) {
+		return
+	}
+	// One GRE socket carries both directions, so the peer's media and
+	// RTCP addresses are the one learned address.
+	s.peer.LearnMedia(d.src)
+	s.peer.LearnRTCP(d.src)
+	s.peer.Observe(now)
+	// A listener authenticatee can only EAPOL-Start once it has learned the
+	// calling peer; a caller already started at loop entry (no-op here).
+	s.maybeStartEAP(now)
+	// Probe the GRE version with a dual-version keepalive burst the
+	// instant the peer is learned, so a v2-capable peer can upgrade.
+	if !s.greBurstSent && s.peer.RTCP.IsValid() {
+		s.greBurstSent = true
+		s.sendGREKeepaliveBurst()
+	}
+	// Apply the monotonic GRE-version upgrade from every datagram's
+	// header version, and learn capabilities/MAC from a v1 keepalive.
+	kind, ka, ver, cerr := s.main.peekControl(d.data)
+	s.upgradeGREVersion(ver)
+	if kind == controlKeepalive {
+		if cerr != nil {
+			s.logf("main: drop undecodable GRE keepalive: %v", cerr)
+		} else {
+			s.handleGREControl(ka)
+		}
+	} else if eapPayload, ok := s.main.peekEAPOL(d.data); ok {
+		// Authentication frame: route to the EAP state machine.
+		s.handleEAP(now, eapPayload)
+	} else if oob, proto, ok, oerr := s.main.peekOOB(d.data); ok {
+		// Tunnelled / out-of-band data: deliver via ReadOOB tagged with its
+		// protocol type, bypassing the media flow entirely.
+		if oerr != nil {
+			s.logf("main: drop undecodable OOB (%d bytes): %v", len(d.data), oerr)
+		} else {
+			s.deliverOOB(proto, oob)
+		}
+	} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
+		if isMedia {
+			s.feedMedia(now, 0, pkt)
+			if s.fecEnabled() {
+				// FEC over the decoded inner RTP payload (TR-06-2 §8.6);
+				// lastWireTS is the raw inner RTP timestamp.
+				s.fecRecvRTP(now, s.main.dec.lastWireTS, pkt)
+			}
+		} else {
+			s.feedFeedback(now, fbs)
+		}
+	} else {
+		// A decode failure on an otherwise-delivered datagram usually
+		// means a PSK secret or AES-key-size mismatch (decryption yields
+		// garbage), which would otherwise look like total packet loss.
+		// Surface it so it is diagnosable; logf is zero-cost when no
+		// logger is set.
+		s.logAt(LogWarning, CatCrypto, "main: drop undecodable datagram (%d bytes): %v", len(d.data), err)
+	}
+}
+
+// sameSource reports whether src is the established peer's tuple (for Main the media and
+// RTCP addresses are the one learned address).
+func (s *Session) sameSource(src netip.AddrPort) bool {
+	return addrPortEqual(src, s.peer.Media) || addrPortEqual(src, s.peer.RTCP)
+}
+
+// mainReassocTrigger reports whether data is a valid NAT-rebind re-association trigger from
+// a new source: an ENCRYPTED RTCP feedback datagram that decrypts under the per-peer session
+// key AND carries the established peer's CNAME. The decrypt-under-key is the unforgeable
+// proof a forger (no key) cannot produce, and it is required to be ENCRYPTED so a cleartext
+// sender (use_key_as_passphrase media) or a cleartext-RTCP forger cannot supply a matching
+// CNAME either; the CNAME match is libRIST's identity key. It does NOT advance the media
+// decoder (feedbackCNAME parses only the RTCP, leaving the sequence/timestamp reconstruction
+// untouched), so probing a datagram that is then dropped cannot corrupt media decode. EAPOL
+// (forgeable, never encrypted) and media (no SDES, may be cleartext) are NOT triggers. (A
+// replay carries the genuine CNAME, so this still does not prove liveness — the forced
+// re-auth that follows does; this gate only blocks the trivially-forged triggers.)
+//
+// Direction limit: because the trigger must be ENCRYPTED, it detects a peer rebind only when
+// that peer's RTCP is keyed. Under bare use_key_as_passphrase (Username, no Secret) only the
+// receiver->sender feedback is keyed, so a SENDER rebind toward a receiver carries cleartext
+// RTCP and is NOT detected here (it falls back to session-timeout + reconnect); both
+// directions are covered when SRP runs with an explicit Secret (a symmetric PSK keys both).
+func (s *Session) mainReassocTrigger(data []byte) bool {
+	if s.main == nil || s.peerCNAME == "" {
+		return false
+	}
+	cname, ok := s.main.feedbackCNAME(data)
+	return ok && cname == s.peerCNAME
+}
+
+// maybeReassociate recovers a NAT source-port rebind on an authenticated single-flow
+// EAP-SRP session. It returns true when it has consumed the datagram — by starting a
+// re-association OR by ignoring a datagram from a source other than the established peer —
+// so the caller skips the normal first-source-wins learning for it; false lets the normal
+// path run (non-SRP, still-forming, or the established peer).
+//
+// Security (mirrors libRIST issue #188 / faa39c4, SRP only): a tuple change is honored only
+// when an authenticated per-peer SRP session is in force, the established tuple is DORMANT
+// (silent > 2x the keepalive interval), and the datagram is a valid trigger (see
+// mainReassocTrigger: an ENCRYPTED RTCP feedback that decrypts under the session key and
+// carries the peer's CNAME — EAPOL and cleartext media are NOT triggers, so a forger with no
+// key cannot force a re-auth). Even then the new tuple is NOT trusted: the address migrates
+// and a fresh EAP-SRP RE-AUTH is forced with media held (authed dropped), so a replay or
+// forger that cannot complete the handshake never receives media. The held re-auth is bounded
+// by reauthDeadline (the ticker tears the session down if it does not complete), so an
+// unproven/forged tuple cannot pin the session open and a stalled re-auth cannot wedge it;
+// the genuine peer recovers either by completing the re-auth or via a fresh connection. Under
+// plaintext or a shared PSK (no per-peer SRP) the CNAME and source are forgeable, so a rebind
+// is left to the caller-side socket-rebind path.
+//
+// Scope: single-flow Main sessions only. A demultiplexing MultiReceiver keys flows by source
+// address, so a rebinding peer there surfaces as a NEW flow (a fresh Accept that re-runs the
+// handshake) rather than reaching this path — the old flow simply ages out on timeout.
+//
+// Cost: media is held for the re-auth round trip; a rebind that takes longer than the
+// recovery buffer leaves a real gap (the held media ages out of the ring), which is why the
+// buffer should exceed the expected re-auth time. This is the deliberate trade for not
+// delivering to an unproven tuple.
+func (s *Session) maybeReassociate(now clock.Timestamp, src netip.AddrPort, data []byte) bool {
+	if !s.srpAuthenticated() || !s.peer.RTCP.IsValid() || s.sameSource(src) {
+		return false
+	}
+	if s.reauthing || !s.peer.SilentFor(now, 2*s.cfg.KeepaliveInterval) || !s.mainReassocTrigger(data) {
+		return true // re-auth already in flight, the peer is still live, or not a valid trigger: ignore
+	}
+	s.peer.Rebind(src)
+	s.reauthing = true
+	s.reauthDeadline = now.Add(s.reauthTimeout())
+	s.authed.Store(false) // hold media until the migrated tuple re-proves identity
+	s.pwReqSent = false   // the post-SUCCESS PASSWORD exchange must re-run on the fresh handshake
+	if s.eapClient != nil {
+		s.eapClient.Restart()
+	}
+	if s.eapServer != nil {
+		s.eapServer.Restart()
+	}
+	s.startReauth(now)
+	s.logAt(LogNote, CatSession, "nat-rebind: peer moved to %v; forcing EAP-SRP re-auth", src)
+	return true
+}
+
+// reauthTimeout is the window a NAT-rebind / in-band re-auth is given to complete before the
+// session is torn down (so a stalled handshake — a lost frame, or a forger that never
+// completes — cannot wedge the session, and an unproven tuple cannot hold it open). It is the
+// larger of the recovery buffer (held media that outlives the buffer is lost anyway) and
+// 4 keepalive intervals (a floor comfortably above a handshake round-trip, so a genuine
+// re-auth is never cut off, and well above the keepalive-granularity poll that enforces it).
+func (s *Session) reauthTimeout() clock.Microseconds {
+	return max(s.cfg.Flow.RecoveryBufferMax, 4*s.cfg.KeepaliveInterval)
+}
+
+// startReauth re-opens the EAP-SRP handshake to the (migrated) peer: the authenticatee
+// re-emits its EAPOL-Start; the authenticator re-issues an IDENTITY REQUEST.
+func (s *Session) startReauth(now clock.Timestamp) {
+	switch {
+	case s.eapClient != nil:
+		s.eapStartSent = false
+		s.maybeStartEAP(now)
+	case s.eapServer != nil:
+		s.sendEAP(s.eapServer.Start(), now)
 	}
 }
 

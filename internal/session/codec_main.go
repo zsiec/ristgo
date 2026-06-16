@@ -143,6 +143,12 @@ type mainCodec struct {
 	ssrc  uint32
 	cname string
 
+	// lastRxCNAME is the peer's SDES CNAME most recently surfaced across the waist
+	// for NAT-rebind re-association. It is learned only from ENCRYPTED RTCP (see
+	// decodeFeedbackMain) and crosses the waist only when it changes, so the
+	// steady-state feedback path allocates no wire.PeerIdentity per datagram.
+	lastRxCNAME string
+
 	// bitmask selects the NACK wire encoding for outbound feedback: false for
 	// RIST range NACK (TR-06 default), true for RFC 4585 bitmask NACK.
 	bitmask bool
@@ -708,9 +714,36 @@ func (c *mainCodec) peekEAPOL(b []byte) (eap []byte, ok bool) {
 // packet is delivered, per the flow ownership note. Decoded Feedback values own
 // their slices (rtcp.ParseCompound does not alias, and NACK widening allocates).
 func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire.MediaPacket, fbs []wire.Feedback, err error) {
-	hdr, off, err := gre.Parse(b)
+	region, isRTCP, encrypted, err := c.mainRegion(b)
 	if err != nil {
 		return false, wire.MediaPacket{}, nil, err
+	}
+	if region == nil {
+		// A VSF control datagram (keepalive / buffer-negotiation): accepted with no
+		// media or feedback, served at the peer layer.
+		return false, wire.MediaPacket{}, nil, nil
+	}
+	if isRTCP {
+		fbs, err = c.decodeFeedbackMain(region, nackRef, encrypted)
+		return false, wire.MediaPacket{}, fbs, err
+	}
+	pkt, err = c.decodeMediaMain(region)
+	return true, pkt, nil, err
+}
+
+// mainRegion parses and (per the GRE K bit) decrypts a Main datagram, unwraps the VSF and
+// reduced framing, and demuxes the inner packet — returning the inner region, whether it is
+// RTCP feedback (vs RTP media), and whether it was encrypted. It performs NO media decoding:
+// it never advances the media decoder (c.dec), so the reconstructed sequence/timestamp state
+// is untouched and it is safe to call as a probe (feedbackCNAME). It DOES mutate the receive
+// Decryptor's per-packet key/nonce state, but harmlessly — every genuine decode re-derives
+// that state from its own GRE header, so a probe leaves nothing a later decode inherits.
+// A nil region with a nil error is a VSF control datagram (keepalive/buffer-negotiation)
+// that carries no media or RTCP.
+func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool, err error) {
+	hdr, off, err := gre.Parse(b)
+	if err != nil {
+		return nil, false, false, err
 	}
 	// Accept version-1 reduced framing and the version-2 VSF wrapper. The VSF
 	// proto sits in the region after the GRE sequence, so (when encrypted) it is
@@ -721,9 +754,9 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 	case gre.ProtoVSF:
 		isVSF = true
 	default:
-		return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: GRE proto 0x%04x, want reduced", hdr.ProtType)
+		return nil, false, false, fmt.Errorf("rist: main: GRE proto 0x%04x, want reduced", hdr.ProtType)
 	}
-	region := b[off:]
+	region = b[off:]
 
 	// Decrypt the reduced header + inner region when the per-packet GRE K bit is
 	// set. libRIST keys per-packet on the K bit (CHECK_BIT(gre->flags1,5)), NOT on
@@ -733,8 +766,9 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 	// the clear). So a cleartext datagram is decoded as cleartext even when a
 	// decryptor is configured.
 	if hdr.HasKey {
+		encrypted = true
 		if c.recvKey == nil {
-			return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: encrypted datagram but no decryptor configured")
+			return nil, false, false, fmt.Errorf("rist: main: encrypted datagram but no decryptor configured")
 		}
 		// Honor the GRE H bit: derive the decryption key at the size the sender
 		// signalled, so a peer configured with a different aes-type still
@@ -742,7 +776,7 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 		c.recvKey.SetKeyBits(hBitKeySize(hdr.KeySize256))
 		region, err = c.recvKey.Decrypt(hdr.Nonce, hdr.Seq, nil, region)
 		if err != nil {
-			return false, wire.MediaPacket{}, nil, err
+			return nil, false, false, err
 		}
 	}
 
@@ -754,17 +788,17 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 	if isVSF {
 		vsf, vn, verr := gre.ParseVSFProto(region)
 		if verr != nil {
-			return false, wire.MediaPacket{}, nil, verr
+			return nil, false, false, verr
 		}
 		if vsf.Subtype != gre.VSFSubtypeReduced {
-			return false, wire.MediaPacket{}, nil, nil
+			return nil, false, encrypted, nil
 		}
 		region = region[vn:]
 	}
 
 	// Strip the reduced-overhead header; the inner packet follows.
-	if _, n, err := gre.ParseReduced(region); err != nil {
-		return false, wire.MediaPacket{}, nil, err
+	if _, n, perr := gre.ParseReduced(region); perr != nil {
+		return nil, false, false, perr
 	} else {
 		region = region[n:]
 	}
@@ -773,15 +807,46 @@ func (c *mainCodec) decodeMain(b []byte, nackRef uint32) (isMedia bool, pkt wire
 	// the reduced-header port is not consulted). PT 200-205 (minus 128 => 72-77
 	// after masking the marker bit) is RTCP; everything else is RTP media.
 	if len(region) <= rtcpPTByteLow {
-		return false, wire.MediaPacket{}, nil, fmt.Errorf("rist: main: inner packet too short to demux")
+		return nil, false, false, fmt.Errorf("rist: main: inner packet too short to demux")
 	}
 	pt := region[rtcpPTByteLow] & 0x7f
-	if pt >= rtcpPTMin && pt <= rtcpPTMax {
-		fbs, err = c.decodeFeedbackMain(region, nackRef)
-		return false, wire.MediaPacket{}, fbs, err
+	return region, pt >= rtcpPTMin && pt <= rtcpPTMax, encrypted, nil
+}
+
+// feedbackCNAME returns the SDES CNAME of an ENCRYPTED RTCP feedback datagram. It decrypts
+// and parses only the RTCP, never advancing the media decoder (so it is a safe probe). It
+// returns ok=false for cleartext, media, non-feedback, or undecryptable datagrams: a forger
+// with no key cannot supply a CNAME, and a cleartext sender (use_key_as_passphrase media)
+// cannot either. Used to validate a NAT source-port rebind re-association trigger. It scans
+// the SDES directly rather than through decodeFeedbackMain so it (a) does not run the NACK
+// widening / feedback translation it has no use for, and (b) is independent of the
+// changed-CNAME suppression decodeFeedbackMain applies for the steady-state learn path —
+// a rebind trigger carries the SAME CNAME as the established peer, which that suppression
+// would otherwise hide.
+func (c *mainCodec) feedbackCNAME(b []byte) (cname string, ok bool) {
+	region, isRTCP, encrypted, err := c.mainRegion(b)
+	if err != nil || region == nil || !isRTCP || !encrypted {
+		return "", false
 	}
-	pkt, err = c.decodeMediaMain(region)
-	return true, pkt, nil, err
+	if cn := sdesCNAME(region); cn != "" {
+		return cn, true
+	}
+	return "", false
+}
+
+// sdesCNAME returns the first non-empty SDES CNAME in a compound RTCP region, or "" if the
+// region does not parse or carries no CNAME. It never panics on arbitrary input.
+func sdesCNAME(region []byte) string {
+	pkts, err := rtcp.ParseCompound(region)
+	if err != nil {
+		return ""
+	}
+	for _, p := range pkts {
+		if s, ok := p.(rtcp.SDES); ok && s.CNAME != "" {
+			return s.CNAME
+		}
+	}
+	return ""
 }
 
 // decodeMediaMain reconstructs a MediaPacket from an inner RTP packet. When the
@@ -867,8 +932,12 @@ func extWireBytes(profile uint16, payload []byte) []byte {
 // it (TR-06-2 §8.4). NACK sequences without a preceding EXTSEQ widen to at-most
 // nackRef (the host's send position), as in the Simple codec's decodeFeedback;
 // with an EXTSEQ in force the high bits are taken authoritatively from it.
-// SR/RR/SDES are dropped — the core has no use for them at this stage.
-func (c *mainCodec) decodeFeedbackMain(b []byte, nackRef uint32) ([]wire.Feedback, error) {
+// SR/RR are dropped — the core has no use for them at this stage. An SDES CNAME is
+// surfaced as wire.PeerIdentity for NAT-rebind re-association, but ONLY from an ENCRYPTED
+// datagram (encrypted == true) and only when it changes: a cleartext SDES is forgeable, and
+// re-emitting an unchanged CNAME on every feedback datagram would heap-allocate across the
+// waist on the steady-state RX path for nothing.
+func (c *mainCodec) decodeFeedbackMain(b []byte, nackRef uint32, encrypted bool) ([]wire.Feedback, error) {
 	pkts, err := rtcp.ParseCompound(b)
 	if err != nil {
 		return nil, err
@@ -898,6 +967,16 @@ func (c *mainCodec) decodeFeedbackMain(b []byte, nackRef uint32) ([]wire.Feedbac
 			// carried transparently over the GRE tunnel; cross the waist as
 			// wire.LinkQuality for the host's rate controller.
 			out = append(out, wire.LinkQuality{LQM: pk.LQM})
+		case rtcp.SDES:
+			// The peer's canonical name, for NAT source-port rebind re-association.
+			// Crosses the waist as wire.PeerIdentity ONLY from an encrypted datagram (a
+			// cleartext SDES is forgeable, so the trigger's identity key must not be
+			// learned from one) and only when it changes (so the steady-state feedback
+			// path allocates nothing). The host applies a further srpAuthenticated gate.
+			if encrypted && pk.CNAME != "" && pk.CNAME != c.lastRxCNAME {
+				c.lastRxCNAME = pk.CNAME
+				out = append(out, wire.PeerIdentity{CNAME: pk.CNAME})
+			}
 		}
 	}
 	return out, nil

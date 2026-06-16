@@ -70,6 +70,27 @@ func (p *Peer) Observe(now clock.Timestamp) {
 	p.seen = true
 }
 
+// Rebind replaces the peer's media and RTCP return addresses with addr. Unlike Learn*,
+// which lock the first address learned, this is the deliberate override used to migrate the
+// tuple during a NAT source-port rebind recovery (the caller MUST gate it on forcing a fresh
+// authentication; see the session's re-association path). It does NOT touch the liveness
+// clock — the migration alone is not evidence of liveness. The held re-auth that follows is
+// bounded by the session's reauthDeadline (a teardown), NOT by this liveness clock, because
+// once the migrated tuple's own datagrams arrive they refresh lastSeen via Observe and so
+// could otherwise extend the session timeout indefinitely on an unproven tuple.
+func (p *Peer) Rebind(addr netip.AddrPort) {
+	p.Media = addr
+	p.RTCP = addr
+}
+
+// SilentFor reports whether the peer was seen at least once and has now been silent for
+// longer than d. It is the "dormant candidate" test for NAT-rebind re-association: a tuple
+// is migrated to a new source only when the established one has gone quiet (libRIST
+// requires silence beyond 2x the keepalive interval before re-associating).
+func (p *Peer) SilentFor(now clock.Timestamp, d clock.Microseconds) bool {
+	return p.seen && now.Sub(p.lastSeen) > d
+}
+
 // Seen reports whether any traffic has ever arrived from the peer.
 func (p *Peer) Seen() bool { return p.seen }
 
@@ -77,6 +98,7 @@ func (p *Peer) Seen() bool { return p.seen }
 // longer than the session timeout — the condition for tearing the session
 // down (libRIST checks now - last_pkt_received > session_timeout). A peer
 // that has never been seen does not expire (the session is still forming).
+// It is the silence test with the configured session timeout as the threshold.
 func (p *Peer) Expired(now clock.Timestamp) bool {
-	return p.seen && now.Sub(p.lastSeen) > p.timeout
+	return p.SilentFor(now, p.timeout)
 }

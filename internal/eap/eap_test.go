@@ -243,6 +243,181 @@ type turnSide bool
 
 const serverTurn turnSide = true
 
+// driveExchange runs the SRP exchange from an opening frame (the server receives it
+// first) until both roles stop emitting, returning the transcript. Shared by the
+// success and re-auth tests.
+func driveExchange(t *testing.T, authee *Authenticatee, auth *Authenticator, open Frame) []string {
+	t.Helper()
+	transcript := []string{open.Kind.String()}
+	cur := open
+	turn := serverTurn
+	for steps := 0; steps < 12; steps++ {
+		var (
+			out  *Frame
+			rerr error
+		)
+		if turn == serverTurn {
+			out, rerr = auth.Recv(cur.AppendTo(nil))
+		} else {
+			out, rerr = authee.Recv(cur.AppendTo(nil))
+		}
+		if rerr != nil {
+			t.Fatalf("Recv at step %d (%s): %v", steps, cur.Kind, rerr)
+		}
+		if out == nil {
+			break
+		}
+		transcript = append(transcript, out.Kind.String())
+		cur = *out
+		turn = !turn
+	}
+	return transcript
+}
+
+// TestHandshakeReauth proves a session can RE-AUTHENTICATE after reaching SUCCESS: the
+// authenticatee Restart()s and re-opens with an EAPOL-START, the authenticator (already
+// SUCCESS) accepts it as a re-auth and re-runs the exchange, and both reach SUCCESS again
+// with a FRESH session key (fresh SRP nonces) — the replay-proof identity proof the
+// NAT-rebind re-association relies on. The keying generation advances so the host
+// re-derives the data-channel key.
+func TestHandshakeReauth(t *testing.T) {
+	const user, pass = "rist", "mainprofile"
+	salt := mustHex(t, "72F9D5383B7EB7599FB63028F47475B60A55F313D40E0BE023E026C97C0A2C32")
+	verifier := srp.MakeVerifier(srp.DefaultGroup(), user, pass, salt)
+
+	authee, err := NewAuthenticatee(user, pass)
+	if err != nil {
+		t.Fatalf("NewAuthenticatee: %v", err)
+	}
+	authee.UseKeyAsPassphrase(true)
+	auth, err := NewAuthenticator(StaticVerifier(user, verifier, salt))
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	auth.UseKeyAsPassphrase(true)
+
+	driveExchange(t, authee, auth, authee.Start())
+	if !authee.Authenticated() || !auth.Authenticated() {
+		t.Fatal("first handshake did not authenticate both roles")
+	}
+	k1 := append([]byte(nil), authee.SessionKey()...)
+	if len(k1) != 32 {
+		t.Fatalf("first session key length %d, want 32", len(k1))
+	}
+	txGen1, _ := auth.TxKeying()
+
+	// Re-authenticate: the authenticatee resets and re-opens; the authenticator accepts
+	// the post-SUCCESS START as a re-auth.
+	authee.Restart()
+	tr := driveExchange(t, authee, auth, authee.Start())
+	if !authee.Authenticated() || !auth.Authenticated() {
+		t.Fatalf("re-auth did not authenticate both roles; transcript=%v", tr)
+	}
+	k2 := authee.SessionKey()
+	if len(k2) != 32 || !bytes.Equal(k2, auth.SessionKey()) {
+		t.Fatalf("re-auth session keys differ or wrong length")
+	}
+	if bytes.Equal(k1, k2) {
+		t.Fatal("re-auth produced the same session key — fresh nonces should yield a fresh K")
+	}
+	// The authenticator's TX keying generation must advance so the host re-keys.
+	if txGen2, ok := auth.TxKeying(); !ok || txGen2.Gen <= txGen1.Gen {
+		t.Fatalf("authenticator TX keying gen did not advance: %d -> %d (ok=%v)", txGen1.Gen, txGen2.Gen, ok)
+	}
+}
+
+// TestAuthenticateeRejectsStaleReauthFrames proves the re-auth gate: an authenticatee in
+// SUCCESS ignores a CHALLENGE/SERVER_KEY/SERVER_VALIDATOR that arrives without a fresh
+// IDENTITY REQUEST (a replayed/forged frame must not knock a live session out of SUCCESS),
+// while a genuine IDENTITY REQUEST resets it cleanly for a re-auth.
+func TestAuthenticateeRejectsStaleReauthFrames(t *testing.T) {
+	const user, pass = "rist", "mainprofile"
+	salt := mustHex(t, "72F9D5383B7EB7599FB63028F47475B60A55F313D40E0BE023E026C97C0A2C32")
+	verifier := srp.MakeVerifier(srp.DefaultGroup(), user, pass, salt)
+	authee, _ := NewAuthenticatee(user, pass)
+	auth, _ := NewAuthenticator(StaticVerifier(user, verifier, salt))
+	driveExchange(t, authee, auth, authee.Start())
+	if !authee.Authenticated() {
+		t.Fatal("setup: authenticatee not authenticated")
+	}
+
+	// An injected CHALLENGE (with an in-window identifier) from SUCCESS must be ignored:
+	// no reply, and the session stays SUCCESS.
+	stale := Frame{Version: 3, Code: CodeRequest, Identifier: authee.id + 1, Kind: KindChallenge, Salt: salt}
+	out, err := authee.Recv(stale.AppendTo(nil))
+	if err != nil {
+		t.Fatalf("stale CHALLENGE returned error: %v", err)
+	}
+	if out != nil {
+		t.Fatalf("stale CHALLENGE was answered (kind=%v); it must be ignored", out.Kind)
+	}
+	if !authee.Authenticated() {
+		t.Fatal("stale CHALLENGE knocked the authenticatee out of SUCCESS")
+	}
+
+	// A genuine IDENTITY REQUEST is a re-auth: it resets the authenticatee (no longer
+	// SUCCESS) and is answered with an IDENTITY RESPONSE.
+	req := Frame{Version: 3, Code: CodeRequest, Identifier: 9, Kind: KindIdentityRequest}
+	out, err = authee.Recv(req.AppendTo(nil))
+	if err != nil {
+		t.Fatalf("re-auth IDENTITY REQUEST returned error: %v", err)
+	}
+	if out == nil || out.Kind != KindIdentityResponse {
+		t.Fatalf("re-auth IDENTITY REQUEST not answered with IDENTITY RESPONSE, got %v", out)
+	}
+	if authee.Authenticated() {
+		t.Fatal("authenticatee still reports SUCCESS mid-re-auth after an IDENTITY REQUEST")
+	}
+}
+
+// TestReplayedFailureCannotTearDownSuccess proves a replayed/forged EAP-FAILURE cannot knock
+// a live authenticated session out of SUCCESS — for EITHER role — even when it echoes the
+// last identifier (the value left in a.id after SUCCESS, which is observable on the wire).
+// EAPOL is never encrypted, so a FAILURE is trivially forgeable; honoring one in SUCCESS
+// would let an off-path attacker drop an established session with a single spoofed datagram.
+func TestReplayedFailureCannotTearDownSuccess(t *testing.T) {
+	const user, pass = "rist", "mainprofile"
+	salt := mustHex(t, "72F9D5383B7EB7599FB63028F47475B60A55F313D40E0BE023E026C97C0A2C32")
+	verifier := srp.MakeVerifier(srp.DefaultGroup(), user, pass, salt)
+	authee, _ := NewAuthenticatee(user, pass)
+	auth, _ := NewAuthenticator(StaticVerifier(user, verifier, salt))
+	driveExchange(t, authee, auth, authee.Start())
+	if !authee.Authenticated() || !auth.Authenticated() {
+		t.Fatal("setup: both roles must be authenticated")
+	}
+
+	// Authenticatee: a FAILURE echoing its last identifier must be ignored (no reply, stays
+	// SUCCESS). Try a.id and a.id±1 to cover the identifiers an observer could replay.
+	for _, id := range []uint8{authee.id, authee.id + 1, authee.id - 1} {
+		fail := Frame{Version: 3, Code: CodeFailure, Identifier: id, Kind: KindFailure}
+		out, err := authee.Recv(fail.AppendTo(nil))
+		if err != nil {
+			t.Fatalf("authenticatee FAILURE(id=%d) returned error: %v", id, err)
+		}
+		if out != nil {
+			t.Fatalf("authenticatee answered a FAILURE(id=%d): %v", id, out.Kind)
+		}
+		if !authee.Authenticated() {
+			t.Fatalf("authenticatee FAILURE(id=%d) knocked it out of SUCCESS", id)
+		}
+	}
+
+	// Authenticator: same — a forged FAILURE in SUCCESS must not reach StateFailed.
+	for _, id := range []uint8{auth.id, auth.id + 1, auth.id - 1} {
+		fail := Frame{Version: 3, Code: CodeFailure, Identifier: id, Kind: KindFailure}
+		out, err := auth.Recv(fail.AppendTo(nil))
+		if err != nil {
+			t.Fatalf("authenticator FAILURE(id=%d) returned error: %v", id, err)
+		}
+		if out != nil {
+			t.Fatalf("authenticator answered a FAILURE(id=%d): %v", id, out.Kind)
+		}
+		if !auth.Authenticated() {
+			t.Fatalf("authenticator FAILURE(id=%d) knocked it out of SUCCESS", id)
+		}
+	}
+}
+
 // TestHandshakeWrongPassword asserts that a client with the wrong password
 // drives the authenticator to FAILURE (emitting an EAP-FAILURE and
 // ErrAuthFailed), and that no session key is established.

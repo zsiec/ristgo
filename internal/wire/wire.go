@@ -250,10 +250,21 @@ type FlowAttribute struct {
 	JSON []byte
 }
 
+// PeerIdentity carries the peer's RTCP SDES CNAME across the waist. It is a host
+// concern (peer identification / NAT source-port rebind re-association), not flow
+// input: a codec emits it when it parses an inbound SDES, and the host intercepts it
+// (feedFeedback) to record the peer's CNAME — trusting it only behind an authenticated
+// per-peer EAP-SRP session, since the CNAME is forgeable under plaintext or a shared PSK.
+type PeerIdentity struct {
+	// CNAME is the canonical name string from the peer's SDES.
+	CNAME string
+}
+
 // Marker-method implementations sealing the Feedback variant set.
 func (NackRequest) isFeedback()     {}
 func (LinkQuality) isFeedback()     {}
 func (FlowAttribute) isFeedback()   {}
+func (PeerIdentity) isFeedback()    {}
 func (RttEchoRequest) isFeedback()  {}
 func (RttEchoResponse) isFeedback() {}
 func (SenderReport) isFeedback()    {}

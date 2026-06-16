@@ -225,9 +225,10 @@ func newAdvReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 // itself to addr, so a sender running in listener mode (see [NewListenerSender])
 // learns this receiver and begins streaming.
 //
-// DTLS and EAP-SRP authentication are not yet supported in caller-receive mode;
-// PSK (Secret) encryption on the Main and Advanced profiles is. See
-// [DialReceiver] for the context-aware constructor with functional options.
+// DTLS is not supported in caller-receive mode; PSK (Secret) encryption on the Main
+// and Advanced profiles, and EAP-SRP on the Main profile (the calling receiver is the
+// authenticator), are. See [DialReceiver] for the context-aware constructor with
+// functional options.
 func NewReceiverCaller(addr string, cfg Config) (*Receiver, error) {
 	addr, cfg, err := ParseURL(addr, cfg)
 	if err != nil {
@@ -236,8 +237,8 @@ func NewReceiverCaller(addr string, cfg Config) (*Receiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
-	if cfg.DTLS != nil || cfg.Username != "" {
-		return nil, fmt.Errorf("%w: DTLS and EAP-SRP are not yet supported in caller-receive mode", ErrInvalidConfig)
+	if cfg.DTLS != nil {
+		return nil, fmt.Errorf("%w: DTLS is not yet supported in caller-receive mode", ErrInvalidConfig)
 	}
 	switch cfg.Profile {
 	case ProfileSimple:
@@ -275,7 +276,8 @@ func newSimpleReceiverCaller(addr string, cfg Config) (*Receiver, error) {
 }
 
 // newMainReceiverCaller dials a Main-profile listener-sender over a single
-// ephemeral GRE socket.
+// ephemeral GRE socket. With EAP-SRP credentials the calling receiver is the
+// authenticator (buildMainFlowParams installs the EAP server).
 func newMainReceiverCaller(addr string, cfg Config) (*Receiver, error) {
 	host, port, err := resolveSinglePort(addr)
 	if err != nil {
@@ -285,7 +287,7 @@ func newMainReceiverCaller(addr string, cfg Config) (*Receiver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: resolve address: %w", ErrInvalidConfig, err)
 	}
-	mp, err := buildMainParams(cfg)
+	mp, err := buildMainFlowParams(cfg)
 	if err != nil {
 		return nil, err
 	}

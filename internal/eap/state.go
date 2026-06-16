@@ -204,6 +204,21 @@ func (a *Authenticatee) Start() Frame {
 	return startFrame()
 }
 
+// Restart resets the authenticatee to the unauthenticated state so a fresh handshake can
+// re-run (EAP re-authentication — e.g. after a NAT source-port rebind). Credentials and
+// the use_key_as_passphrase keying state (its Gen) are preserved, so a successful re-auth
+// ROLLS the data-channel keys rather than resetting them, and the host detects the new K
+// via the advanced Gen. The host re-emits the EAPOL-Start after calling this.
+func (a *Authenticatee) Restart() {
+	a.state = StateUnauth
+	a.id = 0 // the next IDENTITY REQUEST re-bootstraps it; a stale value would widen the gate
+	a.idValid = false
+	a.client = nil
+	a.salt = nil
+	a.session = nil
+	a.pwReqActive = false
+}
+
 // Recv processes one received EAPOL frame (raw wire bytes as delivered out of
 // the GRE EAPOL frame) and returns the frame to transmit in reply, if any. A
 // nil out frame with a nil error means the input was handled with nothing to
@@ -233,15 +248,34 @@ func negotiatedVersion(req Frame) uint8 {
 // handle drives the authenticatee state machine for a parsed frame.
 func (a *Authenticatee) handle(f Frame) (*Frame, error) {
 	if f.Kind == KindFailure {
-		// Drop a stale or spoofed FAILURE whose identifier does not match the
-		// in-flight request, so it cannot force-fail an active session. The
-		// identifier is adopted (below) only from a processed request, so a.id
-		// tracks the live exchange.
-		if a.state != StateUnauth && f.Identifier != a.id {
+		// Honor a FAILURE only while a handshake is actually in flight (StateInProgress)
+		// and only when its identifier matches the in-flight request. In StateSuccess a
+		// FAILURE is stale or forged: a live authenticated session is re-proven via a
+		// fresh IDENTITY REQUEST (the SUCCESS-state gate below), never torn down by an
+		// injected FAILURE — so a replayed FAILURE echoing the last identifier cannot
+		// knock us out of SUCCESS. (StateUnauth has no exchange to fail; StateFailed is
+		// already terminal.) The identifier is adopted (below) only from a processed
+		// request, so a.id tracks the live exchange.
+		if a.state != StateInProgress || f.Identifier != a.id {
 			return nil, nil
 		}
 		a.state = StateFailed
 		return nil, ErrAuthFailed
+	}
+	// Re-authentication gate: a re-auth MUST begin with a fresh IDENTITY REQUEST. Once
+	// SUCCESS has been reached, a CHALLENGE/SERVER_KEY/SERVER_VALIDATOR arriving with no
+	// intervening IDENTITY REQUEST is stale or forged — ignore it so a replayed/injected
+	// frame cannot knock a live session out of SUCCESS and restart its SRP state. A genuine
+	// IDENTITY REQUEST while in SUCCESS is the authenticator driving a re-auth: reset to a
+	// clean slate here so Done()/Authenticated() correctly report the re-auth as in progress
+	// (rather than answering from stale client/session state while still reporting SUCCESS).
+	if a.state == StateSuccess {
+		switch f.Kind {
+		case KindIdentityRequest:
+			a.Restart()
+		case KindChallenge, KindServerKey, KindServerValidator:
+			return nil, nil
+		}
 	}
 	// NOTE: the request identifier is adopted into a.id only inside the cases
 	// that legitimately process a request (below), NEVER in the prologue. Doing
@@ -462,6 +496,10 @@ type Authenticator struct {
 	username string
 	session  []byte
 	verified bool // M1 verified; terminal SUCCESS is deferred to the client's ack
+	// everAuthed records that this authenticator reached SUCCESS at least once. Once true,
+	// a spoofed EAPOL-LOGOFF can no longer tear the exchange down even while a re-auth is
+	// IN-PROGRESS (an established session is only re-proven, never reset, by the peer).
+	everAuthed bool
 
 	// keying carries the use_key_as_passphrase data-channel keying state. When
 	// enabled, the authenticator keys its TX from K in M2 (signalling it with the
@@ -572,6 +610,19 @@ func (a *Authenticator) Start() Frame {
 	}
 }
 
+// Restart resets the authenticator to the unauthenticated state for a fresh handshake
+// (EAP re-authentication). The verifier lookup, advertised version, and keying Gen are
+// preserved; the EAP identifier advances so the re-auth's requests are distinct on the
+// wire. A subsequent Start re-opens the exchange. A failed re-auth is non-fatal at the
+// host: the previously installed keys remain until a new SUCCESS rolls them.
+func (a *Authenticator) Restart() {
+	a.state = StateUnauth
+	a.server = nil
+	a.session = nil
+	a.verified = false
+	a.id++
+}
+
 // Recv processes one received EAPOL frame and returns the frame to transmit in
 // reply, if any. It never panics on arbitrary input. On a definitive failure
 // (unknown user or a failed client proof) it sets StateFailed; a failed proof
@@ -598,12 +649,22 @@ func (a *Authenticator) handle(f Frame) (*Frame, error) {
 	}
 	switch f.Kind {
 	case KindStart:
-		// A client EAPOL-START prompts an IDENTITY REQUEST
-		// (eap_process_eapol EAPOL_TYPE_START). Once the SRP exchange has begun
-		// (a.server set), ignore a further START so a spoofed mid-handshake START
-		// cannot reset the live exchange (libRIST's !last_pkt guard).
-		if a.server != nil {
+		// A client EAPOL-START prompts an IDENTITY REQUEST (eap_process_eapol
+		// EAPOL_TYPE_START). While a handshake is IN-PROGRESS, ignore a further START so a
+		// spoofed mid-handshake START cannot reset the live exchange (libRIST's !last_pkt
+		// guard). From a TERMINAL state — SUCCESS, or FAILED after a prior success (an
+		// abandoned/failed re-auth; an initial failure tears the session down at the host,
+		// so StateFailed here always follows a SUCCESS) — a START is a legitimate
+		// re-authentication request: re-run from a clean slate. A forger cannot complete
+		// the re-auth (it fails M1 verification), and a failed re-auth is non-fatal at the
+		// host, so neither a spoofed START nor a failed re-prove can tear an established
+		// session down. Accepting a START from FAILED is what lets the genuine peer recover
+		// after a transient re-auth failure.
+		if a.state == StateInProgress {
 			return nil, nil
+		}
+		if a.state != StateUnauth {
+			a.Restart()
 		}
 		out := a.Start()
 		return &out, nil
@@ -611,13 +672,13 @@ func (a *Authenticator) handle(f Frame) (*Frame, error) {
 	case KindLogoff:
 		// EAPOL-LOGOFF is unauthenticated and trivially spoofable, so an
 		// off-path attacker must not be able to use it to tear down an
-		// established session. Honor it only while the handshake is still open
-		// (UNAUTH / IN-PROGRESS); once we have reached a terminal state, refuse
-		// it with ErrUnexpected and leave the session untouched. This matches
-		// libRIST, which returns EAP_UNEXPECTEDREQUEST and does NOT reset when
-		// the authentication_state is at or beyond SUCCESS (re-auth runs from
-		// the host's periodic timer, never from a peer LOGOFF).
-		if a.state == StateSuccess || a.state == StateFailed {
+		// established session. Honor it only while the INITIAL handshake is still open and
+		// has never authenticated; once we have reached a terminal state OR have
+		// authenticated before (everAuthed — so a LOGOFF cannot abort an in-progress
+		// re-auth either), refuse it with ErrUnexpected and leave the session untouched.
+		// This matches libRIST, which returns EAP_UNEXPECTEDREQUEST and does NOT reset at
+		// or beyond SUCCESS (re-auth is host/peer driven, never torn down by a peer LOGOFF).
+		if a.state == StateSuccess || a.state == StateFailed || a.everAuthed {
 			return nil, ErrUnexpected
 		}
 		// Open handshake: LOGOFF tears it back down to the unauthenticated state
@@ -743,6 +804,7 @@ func (a *Authenticator) handle(f Frame) (*Frame, error) {
 		// (process_eap_response_srp_server_validator).
 		if a.verified {
 			a.state = StateSuccess
+			a.everAuthed = true
 			a.id++ // ctx->last_identifier++ on terminal SUCCESS
 		}
 		return nil, nil
@@ -779,6 +841,14 @@ func (a *Authenticator) handle(f Frame) (*Frame, error) {
 		return &ack, nil
 
 	case KindFailure:
+		// Honor a FAILURE only while a handshake is actually in flight. In SUCCESS it is
+		// stale or forged and must not tear a live session down — re-auth is driven by a
+		// START/IDENTITY exchange, never by an injected FAILURE. (The up-front identifier
+		// gate already drops a mismatched-identifier FAILURE; this also closes the
+		// matching-identifier FAILURE that a.id++-on-SUCCESS would otherwise admit.)
+		if a.state != StateInProgress {
+			return nil, nil
+		}
 		a.state = StateFailed
 		return nil, ErrAuthFailed
 

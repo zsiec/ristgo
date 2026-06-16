@@ -216,9 +216,9 @@ func TestReversedConstructorErrors(t *testing.T) {
 	dtls.Profile = ristgo.ProfileMain
 	dtls.DTLS = &ristgo.DTLSConfig{PSK: []byte("k")}
 
-	eap := ristgo.DefaultConfig()
-	eap.Profile = ristgo.ProfileMain
-	eap.Username, eap.Password = "u", "p"
+	// EAP-SRP is now supported in both reversed modes (listener-sender authenticatee,
+	// caller-receiver authenticator); see TestE2EMainEAPSRPListenerSender. Only DTLS and
+	// the Simple odd-port misuse remain constructor errors here.
 
 	oddSimple := ristgo.DefaultConfig() // Simple profile, odd port below
 
@@ -228,8 +228,6 @@ func TestReversedConstructorErrors(t *testing.T) {
 	}{
 		{"caller dtls", func() error { _, e := ristgo.NewReceiverCaller("127.0.0.1:5000", dtls); return e }},
 		{"listener dtls", func() error { _, e := ristgo.NewListenerSender("127.0.0.1:5000", dtls); return e }},
-		{"caller eap", func() error { _, e := ristgo.NewReceiverCaller("127.0.0.1:5000", eap); return e }},
-		{"listener eap", func() error { _, e := ristgo.NewListenerSender("127.0.0.1:5000", eap); return e }},
 		{"caller odd port", func() error { _, e := ristgo.NewReceiverCaller("127.0.0.1:5001", oddSimple); return e }},
 		{"listener odd port", func() error { _, e := ristgo.NewListenerSender("127.0.0.1:5001", oddSimple); return e }},
 	}
