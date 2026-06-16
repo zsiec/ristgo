@@ -293,9 +293,10 @@ func bondedSupported(cfg Config) error {
 	}
 	if cfg.FEC != nil {
 		// The bonded send path does not feed the FEC encoder, so FEC would silently
-		// do nothing over a bonded session. 2022-7 duplication already provides
-		// seamless multipath recovery; reject the combination rather than mislead.
-		return fmt.Errorf("%w: FEC is not supported with bonding (use 2022-7 duplication for multipath recovery)", ErrInvalidConfig)
+		// do nothing over a bonded session. This is an implementation limitation, not
+		// a spec restriction: SMPTE 2022-7 and ST 2022-1/5 FEC are orthogonal and may
+		// be combined. Reject the combination rather than silently drop FEC.
+		return fmt.Errorf("%w: FEC is not currently supported together with link bonding", ErrInvalidConfig)
 	}
 	return nil
 }
