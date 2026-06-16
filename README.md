@@ -225,6 +225,11 @@ high-bit-rate ST 2022-5 (SMPTE ST 2022-5:2013 §7.3, a 16-bit base and 10-bit ma
 dimensions, L×D ≤ 6000) for interop with ST 2022-5 / ST 2022-6 equipment.
 `Stats.FECRecovered` counts packets reconstructed by FEC.
 
+FEC is configured programmatically (`WithFEC` / `WithFEC2022_5`), not through the
+`rist://` URL. It cannot be combined with link bonding: SMPTE 2022-7 duplication
+already provides seamless multipath recovery, so that combination is rejected at
+configuration time.
+
 ### Source-adaptive bitrate (TR-06-4 Part 1)
 
 The receiver measures link quality and reports it to the sender, whose AIMD

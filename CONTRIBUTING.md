@@ -14,7 +14,7 @@ gofmt -l .                                  # must print nothing
 go vet ./...
 go test -race -count=1 -timeout 120s ./...
 go build ./...
-make check-deps                             # stdlib + x/crypto only
+make check-deps                             # stdlib + x/crypto + x/net only
 make check-flow-imports                     # internal/flow import gate
 ```
 
@@ -26,7 +26,7 @@ make build lint test check-deps check-flow-imports
 
 ## Ground rules
 
-- Dependencies: Go standard library + `golang.org/x/crypto` only.
+- Dependencies: Go standard library + `golang.org/x/crypto` + `golang.org/x/net` only.
 - `internal/flow` is sans-I/O and may import only
   `internal/{seq,clock,rtt,wire}` + std — CI enforces this.
 - Doc comments on every exported symbol; errors prefixed `"rist: "`;

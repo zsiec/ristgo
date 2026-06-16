@@ -337,9 +337,9 @@ type DTLSConfig struct {
 }
 
 // DefaultConfig returns a Config with default values matching libRIST's
-// RIST_DEFAULT_* macros, except Profile: libRIST
-// defaults to the Main profile, while ristgo defaults to ProfileSimple
-// until Main is implemented (see Config.Profile).
+// RIST_DEFAULT_* macros, except Profile: libRIST defaults to the Main profile,
+// while ristgo defaults to ProfileSimple as the simplest interoperable profile
+// (see Config.Profile).
 func DefaultConfig() Config {
 	return Config{
 		Profile:           ProfileSimple,

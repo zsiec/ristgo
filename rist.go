@@ -66,11 +66,12 @@
 //
 // Across every profile: NACK-based ARQ retransmission (range or bitmask), SMPTE
 // 2022-7 link bonding ([BondedSender]/[BondedReceiver]) for seamless multipath
-// reconstruction, source adaptation (VSF TR-06-4 Part 1) that feeds link quality
-// back to an encoder-rate callback, and IP multicast (group membership,
-// multicast TTL, egress interface, and source-specific filtering via
-// [Config.Interface], [Config.MulticastTTL], [Config.MulticastSource], and
-// [Config.MulticastLoopback]).
+// reconstruction, SMPTE ST 2022-1 and ST 2022-5 forward error correction
+// ([Config.FEC], [WithFEC]) that recovers losses with no NACK round trip, source
+// adaptation (VSF TR-06-4 Part 1) that feeds link quality back to an encoder-rate
+// callback, and IP multicast (group membership, multicast TTL, egress interface,
+// and source-specific filtering via [Config.Interface], [Config.MulticastTTL],
+// [Config.MulticastSource], and [Config.MulticastLoopback]).
 //
 // # Connection roles
 //
