@@ -74,3 +74,26 @@ func (r *fragReassembler) reset() {
 	r.active = false
 	r.count = 0
 }
+
+// fecCtrlReassembler reassembles a fragmented in-band FEC control message (the only
+// thing the Advanced profile fragments besides media). Unlike media fragments, which
+// the flow core delivers with a Discontinuity flag, FEC control fragments arrive raw,
+// before the flow, so this derives the discontinuity itself from a gap in the Advanced
+// control sequence number: the fragments of one FEC message are sent back-to-back, so
+// consecutive fragments carry consecutive sequence numbers, and a gap means a fragment
+// was lost. Passing that to the underlying reassembler aborts the partial run, so a
+// dropped middle/last fragment can no longer fold two FEC messages together (TR-06-3
+// §5.3.5 -> §5.2.3).
+type fecCtrlReassembler struct {
+	r       fragReassembler
+	lastSeq uint32
+	haveSeq bool
+}
+
+// push folds one FEC control fragment (carrying the Advanced control sequence seq and
+// its F/L role) into the run, returning the whole FEC message on the closing fragment.
+func (f *fecCtrlReassembler) push(seq uint32, role wire.FragRole, payload []byte) ([]byte, bool) {
+	discontinuity := f.haveSeq && seq != f.lastSeq+1
+	f.lastSeq, f.haveSeq = seq, true
+	return f.r.push(role, payload, discontinuity)
+}

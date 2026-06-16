@@ -43,6 +43,9 @@ func NewMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, wrapInvalid(err)
 	}
+	if err := multiReceiverFECSupported(cfg); err != nil {
+		return nil, err
+	}
 	switch cfg.Profile {
 	case ProfileSimple:
 		return newSimpleMultiReceiver(addr, cfg)
@@ -53,6 +56,18 @@ func NewMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
 	default:
 		return nil, fmt.Errorf("%w: multi-flow receive supports the Simple, Main, and Advanced profiles (cleartext)", ErrInvalidConfig)
 	}
+}
+
+// multiReceiverFECSupported rejects separate-port FEC on a demultiplexing receiver. The
+// column/row FEC arrives on the shared media port + 2/+4 with no SSRC/flow identity to
+// route it to the right flow's decoder, so the single-flow constructors' FEC sockets
+// cannot be replicated here; left accepted it would silently recover nothing. Advanced
+// in-band FEC rides the demultiplexed data port and is fine.
+func multiReceiverFECSupported(cfg Config) error {
+	if cfg.FEC != nil && cfg.FEC.carriage(cfg.Profile == ProfileAdvanced) == FECCarriageSeparatePorts {
+		return fmt.Errorf("%w: separate-port FEC is not supported on a demultiplexing MultiReceiver; use a single-flow Receiver for Simple/Main FEC, or Advanced in-band FEC", ErrInvalidConfig)
+	}
+	return nil
 }
 
 func newMainMultiReceiver(addr string, cfg Config) (*MultiReceiver, error) {
@@ -167,6 +182,9 @@ func NewMultiBondedReceiver(addrs []string, cfg Config) (*MultiReceiver, error) 
 		return nil, wrapInvalid(err)
 	}
 	if err := bondedSupported(cfg); err != nil {
+		return nil, err
+	}
+	if err := multiReceiverFECSupported(cfg); err != nil {
 		return nil, err
 	}
 	if len(addrs) == 0 {

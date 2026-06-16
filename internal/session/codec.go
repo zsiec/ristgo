@@ -75,9 +75,26 @@ func encodeMedia(dst []byte, pkt wire.MediaPacket) ([]byte, error) {
 // absorbs the absolute difference (absolute wall-clock sync via the RTCP SR is
 // deferred).
 type mediaDecoder struct {
-	started  bool
-	refSeq   uint32
-	refTicks int64
+	started bool
+	refSeq  uint32
+
+	// Source-time reconstruction is sequence-anchored (see sourceTicks): the 32-bit RTP
+	// timestamp's widening reference is extrapolated from the sequence by a flow-averaged
+	// tick rate — anchored at the first packet (tsBase*) and tracking the high-water front
+	// (tsRef*) — rather than resolved against the live arrival front. This keeps a given
+	// (seq, wireTS) mapping to the same source time on a packet's first arrival, a later
+	// retransmit, OR a FEC reconstruction, preserving the (Seq, SourceTime) dedup across
+	// the 32-bit timestamp wrap. It mirrors the Advanced profile's advSourceMicros.
+	tsStarted   bool
+	tsBaseSeq   uint32
+	tsBaseTicks int64
+	tsRefSeq    uint32
+	tsRefTicks  int64
+
+	// lastWireTS is the raw 32-bit RTP timestamp of the most recent decode — the value
+	// the separate-port FEC matrix is keyed on (it XORs the wire timestamps, not the
+	// reconstructed source time).
+	lastWireTS uint32
 }
 
 // decode parses one RTP packet and returns the normalized MediaPacket fed to
@@ -92,25 +109,60 @@ func (d *mediaDecoder) decode(b []byte) (wire.MediaPacket, error) {
 		return wire.MediaPacket{}, fmt.Errorf("rist: rtp version %d, want 2", p.Version)
 	}
 	var seq32 uint32
-	var ticks int64
 	if !d.started {
 		d.started = true
 		seq32 = uint32(p.SequenceNumber)
-		ticks = int64(p.Timestamp)
 	} else {
 		seq32 = widenSeq(p.SequenceNumber, d.refSeq)
-		ticks = widenTicks(p.Timestamp, d.refTicks)
 	}
 	d.refSeq = seq32
-	d.refTicks = ticks
-	src := uint64(clock.NTPTimeFromTimestamp(clock.Timestamp(microsFromRTPTicks(ticks))))
+	d.lastWireTS = p.Timestamp
 	return wire.MediaPacket{
 		Seq:        seq32,
-		SourceTime: src,
+		SourceTime: d.sourceTime(seq32, p.Timestamp),
 		SSRC:       rtp.NormalizeSSRC(p.SSRC),
 		Payload:    p.Payload,
 		Retransmit: rtp.IsRetransmit(p.SSRC),
 	}, nil
+}
+
+// sourceTime reconstructs the dedup-stable NTP-64 source time of a Simple- or
+// Main-profile media packet from its 32-bit sequence and 32-bit RTP timestamp.
+func (d *mediaDecoder) sourceTime(seq32, wireTS uint32) uint64 {
+	return uint64(clock.NTPTimeFromTimestamp(clock.Timestamp(microsFromRTPTicks(d.sourceTicks(seq32, wireTS)))))
+}
+
+// sourceTicks reconstructs the 64-bit RTP tick count, choosing the timestamp epoch from a
+// reference EXTRAPOLATED to the packet's sequence by the flow-averaged tick rate rather
+// than from the live arrival front. Anchored at the first packet (tsBase*) and tracking
+// the high-water front (tsRef*), it maps a given (seq, wireTS) to the same ticks whether
+// the packet arrives in order, as a retransmit, or is reconstructed by FEC — so the
+// (Seq, SourceTime) dedup holds across the 32-bit timestamp wrap. (A naive widen against
+// the live front resolves an out-of-order copy whose timestamp straddles the wrap, or sits
+// across a large gap, into a different epoch than the in-order copy.) Mirrors advSourceMicros.
+//
+// It advances the front only for a new high-water sequence, so a retransmit or FEC
+// recovery (always at or behind the front) reconstructs without mutating the reference.
+func (d *mediaDecoder) sourceTicks(seq32, wireTS uint32) int64 {
+	if !d.tsStarted {
+		d.tsStarted = true
+		d.tsBaseSeq, d.tsBaseTicks = seq32, int64(wireTS)
+		d.tsRefSeq, d.tsRefTicks = seq32, int64(wireTS)
+		return d.tsBaseTicks
+	}
+	ref := d.tsRefTicks
+	if span := int32(d.tsRefSeq - d.tsBaseSeq); span > 0 {
+		ticksPerSeq := (d.tsRefTicks - d.tsBaseTicks) / int64(span)
+		ref += int64(int32(seq32-d.tsRefSeq)) * ticksPerSeq
+	}
+	ticks := widenTicks(wireTS, ref)
+	if int32(seq32-d.tsRefSeq) > 0 { // a new high-water sequence advances the front
+		d.tsRefSeq, d.tsRefTicks = seq32, ticks
+	}
+	if ticks < 0 {
+		ticks = 0 // guard the rare early-stream negative (NTPTime clamps anyway)
+	}
+	return ticks
 }
 
 // widenSeq reconstructs a 32-bit sequence from a 16-bit wire value, choosing

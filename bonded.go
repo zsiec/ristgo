@@ -192,9 +192,10 @@ func newBondedReceiver(addrs []string, priorities []uint32, cfg Config) (*Bonded
 	return &BondedReceiver{sess: sess}, nil
 }
 
-// bindBondFECSockets binds a column (media port + 2) and row (media port + 4) FEC
-// socket for every bonded receiver path, storing them on the session config. On any
-// error it closes whatever it has already bound and leaves sc untouched.
+// bindBondFECSockets binds a column (media port + 2) and, for 2-D FEC, row (media
+// port + 4) FEC socket for every bonded receiver path, storing them on the session
+// config. Column-only FEC binds the column socket alone (it emits no row packets). On
+// any error it closes whatever it has already bound and leaves sc untouched.
 func bindBondFECSockets(sc *session.Config, addrs []string, cfg Config) error {
 	var bound []*net.UDPConn
 	for i, a := range addrs {
@@ -208,13 +209,16 @@ func bindBondFECSockets(sc *session.Config, addrs []string, cfg Config) error {
 			closeUDPConns(bound)
 			return fmt.Errorf("rist: bind column FEC port %d for bonded path %d: %w", port+2, i, err)
 		}
+		bound = append(bound, col)
+		if cfg.FEC.ColumnOnly {
+			continue // no row FEC on the +4 port for this path
+		}
 		row, err := socket.BindUDP(host, port+4)
 		if err != nil {
-			col.Close()
 			closeUDPConns(bound)
 			return fmt.Errorf("rist: bind row FEC port %d for bonded path %d: %w", port+4, i, err)
 		}
-		bound = append(bound, col, row)
+		bound = append(bound, row)
 	}
 	sc.FECSockets = bound
 	return nil

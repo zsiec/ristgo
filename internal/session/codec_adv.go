@@ -398,7 +398,8 @@ func (c *advCodec) advSourceMicros(seqNum uint32, wireTS uint32) int64 {
 // decodeControl decodes one Type=CONTROL payload's sub-header and body into the
 // normalized feedback the flow core consumes. NACK bitmask/range become a
 // NackRequest (native 32-bit sequences, no widening); RTT echo request/response
-// become the matching wire variants. Keepalive, flow attribute, and PSK
+// become the matching wire variants; a flow attribute becomes a
+// wire.FlowAttribute the host surfaces to the application. Keepalive and PSK
 // future-nonce announcements yield no feedback: peer liveness is tracked by the
 // host on every inbound datagram, and the decryptor follows nonce rotation from
 // each data packet's nonce field. An unknown control index is ignored.
@@ -443,7 +444,16 @@ func (c *advCodec) decodeControl(payload []byte) ([]wire.Feedback, error) {
 		}
 		copy(lq.LQM[:], body)
 		return []wire.Feedback{lq}, nil
-	case adv.CIKeepalive, adv.CIFlowAttr, adv.CIPSKNonce:
+	case adv.CIFlowAttr:
+		// Flow Attribute (TR-06-3 §5.3.7): an opaque UTF-8 JSON metadata body the
+		// sender announces periodically. Cross the waist as wire.FlowAttribute for
+		// the host to surface to the application; copy the body since it aliases the
+		// datagram buffer. An empty body yields no feedback (matches libRIST).
+		if len(body) == 0 {
+			return nil, nil
+		}
+		return []wire.Feedback{wire.FlowAttribute{JSON: append([]byte(nil), body...)}}, nil
+	case adv.CIKeepalive, adv.CIPSKNonce:
 		return nil, nil
 	default:
 		return nil, nil

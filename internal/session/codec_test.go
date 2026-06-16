@@ -89,6 +89,35 @@ func TestDecodeRetransmitDedupConsistent(t *testing.T) {
 	}
 }
 
+// TestSourceTimeWrapDedup proves the sequence-anchored source-time reconstruction maps a
+// given (seq, wireTS) to the same value whether it is decoded in order or later as a
+// retransmit / FEC recovery, even when the 32-bit RTP timestamp has wrapped and the
+// high-water front is more than 2^31 ticks ahead. A naive widen against the live front
+// resolves such an out-of-order copy into the wrong epoch, producing a different source
+// time than the in-order copy and breaking the flow's (Seq, SourceTime) dedup (F7). The
+// large per-packet step forces the >2^31-tick gap that distinguishes the two approaches.
+func TestSourceTimeWrapDedup(t *testing.T) {
+	const step = uint32(1) << 29 // high per-packet tick step: the front races >2^31 ahead, and wraps every 8 packets
+	var dec mediaDecoder
+
+	inOrder := make(map[uint32]uint64)
+	for i := uint32(0); i < 24; i++ {
+		inOrder[i] = dec.sourceTime(i, i*step) // uint32 multiply wraps the wire timestamp
+	}
+	// Retransmit / recover earlier sequences, far behind the front (seq 23). Each must
+	// reconstruct to the identical source time it had in order — including the ones whose
+	// timestamp sits in a wrapped epoch (8, 9, 16).
+	for _, s := range []uint32{0, 1, 2, 7, 8, 9, 15, 16} {
+		if got := dec.sourceTime(s, s*step); got != inOrder[s] {
+			t.Fatalf("out-of-order reconstruction of seq %d = %d, want %d (in order) — dedup would fail", s, got, inOrder[s])
+		}
+	}
+	// The replays must not have advanced the front (they are all behind it).
+	if dec.tsRefSeq != 23 {
+		t.Fatalf("out-of-order reconstruction advanced the front to seq %d, want it to stay at 23", dec.tsRefSeq)
+	}
+}
+
 func TestWidenSeq(t *testing.T) {
 	tests := []struct {
 		wire uint16

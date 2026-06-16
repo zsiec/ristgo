@@ -3,7 +3,6 @@ package session
 import (
 	"fmt"
 
-	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/gre"
 	"github.com/zsiec/ristgo/internal/npd"
@@ -824,27 +823,23 @@ func (c *mainCodec) decodeMediaMain(b []byte) (wire.MediaPacket, error) {
 		}
 	}
 
-	// Reconstruct the 32-bit sequence and NTP-64 source time, both by rollover
-	// counting anchored at the first packet (the Main wire carries only the
-	// 16-bit RTP sequence and the 32-bit RTP timestamp), so a retransmit and its
-	// original reconstruct identically within the recovery window.
+	// Reconstruct the 32-bit sequence (the Main wire carries only the 16-bit RTP
+	// sequence) and the NTP-64 source time. The source time is sequence-anchored
+	// (mediaDecoder.sourceTime) so a retransmit or FEC reconstruction maps to the same
+	// (Seq, SourceTime) as the original even across a 32-bit RTP timestamp wrap.
 	var seq32 uint32
-	var ticks int64
 	if !c.dec.started {
 		c.dec.started = true
 		seq32 = uint32(p.SequenceNumber)
-		ticks = int64(p.Timestamp)
 	} else {
 		seq32 = widenSeq(p.SequenceNumber, c.dec.refSeq)
-		ticks = widenTicks(p.Timestamp, c.dec.refTicks)
 	}
 	c.dec.refSeq = seq32
-	c.dec.refTicks = ticks
+	c.dec.lastWireTS = p.Timestamp
 
-	src := uint64(clock.NTPTimeFromTimestamp(clock.Timestamp(microsFromRTPTicks(ticks))))
 	return wire.MediaPacket{
 		Seq:        seq32,
-		SourceTime: src,
+		SourceTime: c.dec.sourceTime(seq32, p.Timestamp),
 		SSRC:       rtp.NormalizeSSRC(p.SSRC),
 		Payload:    payload,
 		Retransmit: rtp.IsRetransmit(p.SSRC),

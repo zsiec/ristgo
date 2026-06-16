@@ -138,6 +138,47 @@ func (s *Session) WriteOOB(proto uint16, p []byte) error {
 	}
 }
 
+// WriteFlowAttribute enqueues one Advanced Flow Attribute control message
+// (TR-06-3 §5.3.7) carrying the UTF-8 JSON body for transmission to the peer. It
+// is an Advanced-profile sender feature: the receiver surfaces the body to its
+// OnFlowAttr callback. Like WriteOOB it is fire-and-forget (no ARQ) and blocks
+// under back-pressure, honoring the write deadline (ErrTimeout) and close
+// (ErrClosed). It returns ErrFlowAttrUnsupported on a non-Advanced session.
+func (s *Session) WriteFlowAttribute(json []byte) error {
+	if s.flowAttrIn == nil {
+		return s.cfg.ErrFlowAttrUnsupported
+	}
+	cp := make([]byte, len(json))
+	copy(cp, json)
+	for {
+		select {
+		case <-s.done:
+			return s.closeReason()
+		default:
+		}
+		timer, expired := s.deadlineTimerFor(s.writeDeadline.Load())
+		if expired {
+			return s.cfg.ErrTimeout
+		}
+		var timeout <-chan time.Time
+		if timer != nil {
+			timeout = timer.C
+		}
+		select {
+		case s.flowAttrIn <- cp:
+			stopOptTimer(timer)
+			return nil
+		case <-s.done:
+			stopOptTimer(timer)
+			return s.closeReason()
+		case <-timeout:
+			return s.cfg.ErrTimeout
+		case <-s.writeWake:
+			stopOptTimer(timer)
+		}
+	}
+}
+
 // ReadOOB returns the next received out-of-band datagram and its GRE protocol type
 // (Main/Advanced only). Unlike Read it is datagram-oriented: each call returns
 // exactly one OOB payload, truncated to len(buf). It returns ErrOOBUnsupported on

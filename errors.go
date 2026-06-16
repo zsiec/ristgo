@@ -44,4 +44,9 @@ var (
 	// EAPOL, or the VSF wrapper); such a datagram would be misrouted by the peer's
 	// demux. Use [OOBProtocolIP] or any other non-reserved EtherType.
 	ErrOOBProtocol = errors.New("rist: OOB protocol type is reserved for RIST framing")
+
+	// ErrFlowAttrUnsupported is returned by [Sender.WriteFlowAttribute] on a
+	// non-Advanced sender. Flow attributes (TR-06-3 §5.3.7) are an Advanced-profile
+	// control message; the Simple and Main profiles have no such channel.
+	ErrFlowAttrUnsupported = errors.New("rist: flow attributes require the Advanced profile")
 )

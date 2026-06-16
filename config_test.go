@@ -513,6 +513,42 @@ func TestConfigValidate(t *testing.T) {
 			c.NullPacketDeletion = true
 		}, "rist: NullPacketDeletion requires ProfileMain"},
 
+		// FEC matrix bounds (FECConfig.validate) and carriage gating.
+		{"fec 2-D at L*D cap", func(c *Config) { c.FEC = &FECConfig{Columns: 10, Rows: 10} }, ""},
+		{"fec 2-D L min", func(c *Config) { c.FEC = &FECConfig{Columns: 4, Rows: 4} }, ""},
+		{"fec column-only L=1", func(c *Config) { c.FEC = &FECConfig{Columns: 1, Rows: 4, ColumnOnly: true} }, ""},
+		{"fec 2022-5 valid", func(c *Config) {
+			c.FEC = &FECConfig{Columns: 100, Rows: 50, Variant: FECVariant2022_5}
+		}, ""},
+		{"fec advanced in-band default", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.FEC = &FECConfig{Columns: 5, Rows: 5}
+		}, ""},
+		{"fec 2-D L below min", func(c *Config) { c.FEC = &FECConfig{Columns: 3, Rows: 4} },
+			"rist: FEC Columns (L) must be in [4,20] for ST 2022-1, got 3"},
+		{"fec column-only L below min", func(c *Config) { c.FEC = &FECConfig{Columns: 0, Rows: 4, ColumnOnly: true} },
+			"rist: FEC Columns (L) must be in [1,20] for ST 2022-1, got 0"},
+		{"fec L above max", func(c *Config) { c.FEC = &FECConfig{Columns: 21, Rows: 4} },
+			"rist: FEC Columns (L) must be in [4,20] for ST 2022-1, got 21"},
+		{"fec D below min", func(c *Config) { c.FEC = &FECConfig{Columns: 4, Rows: 3} },
+			"rist: FEC Rows (D) must be in [4,20] for ST 2022-1, got 3"},
+		{"fec D above max", func(c *Config) { c.FEC = &FECConfig{Columns: 4, Rows: 21} },
+			"rist: FEC Rows (D) must be in [4,20] for ST 2022-1, got 21"},
+		{"fec matrix over cap", func(c *Config) { c.FEC = &FECConfig{Columns: 20, Rows: 6} },
+			"rist: FEC matrix L*D = 120 exceeds the ST 2022-1 limit of 100"},
+		{"fec 2022-5 over cap", func(c *Config) {
+			c.FEC = &FECConfig{Columns: 100, Rows: 61, Variant: FECVariant2022_5}
+		}, "rist: FEC matrix L*D = 6100 exceeds the ST 2022-5 limit of 6000"},
+		{"fec unknown variant", func(c *Config) { c.FEC = &FECConfig{Columns: 4, Rows: 4, Variant: FECVariant(9)} },
+			"rist: FEC Variant 9 is not a known SMPTE FEC variant"},
+		{"fec in-band on simple rejected", func(c *Config) {
+			c.FEC = &FECConfig{Columns: 5, Rows: 5, Carriage: FECCarriageInBand}
+		}, "rist: in-band FEC carriage requires ProfileAdvanced"},
+		{"fec separate-ports on advanced rejected", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.FEC = &FECConfig{Columns: 5, Rows: 5, Carriage: FECCarriageSeparatePorts}
+		}, "rist: the Advanced profile carries FEC in-band; FECCarriageSeparatePorts is not supported on ProfileAdvanced"},
+
 		// Multicast: MulticastTTL range (0..255), MulticastLoopback always OK.
 		{"multicast ttl zero (OS default)", func(c *Config) { c.MulticastTTL = 0 }, ""},
 		{"multicast ttl mid", func(c *Config) { c.MulticastTTL = 32 }, ""},

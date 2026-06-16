@@ -122,6 +122,49 @@ func TestFragReassemblerBoundsRun(t *testing.T) {
 	}
 }
 
+// TestFECCtrlReassemblerDetectsGap proves the FEC-control reassembler aborts a partial
+// run when the Advanced control sequence number skips, so a dropped fragment cannot fold
+// two FEC messages together. The dangerous case (the previous discontinuity=false code
+// silently concatenated across the boundary) is: message A's closing fragment AND message
+// B's opening fragment both lost, so B's middle continues A's open run (F8).
+func TestFECCtrlReassemblerDetectsGap(t *testing.T) {
+	var f fecCtrlReassembler
+	// Message A: First(seq 10), Middle(11); its Last(12) is lost.
+	if _, ok := f.push(10, wire.FragFirst, []byte("A0")); ok {
+		t.Fatal("FragFirst should not complete")
+	}
+	if _, ok := f.push(11, wire.FragMiddle, []byte("A1")); ok {
+		t.Fatal("FragMiddle should not complete")
+	}
+	// Message B's First(13) is lost; its Middle(14) arrives. The sequence jumps 11 -> 14,
+	// so the gap aborts A's run rather than folding "A0A1" with B's tail.
+	if _, ok := f.push(14, wire.FragMiddle, []byte("B1")); ok {
+		t.Fatal("a gap before this middle must abort the run, not fold two messages")
+	}
+	// B's Last(15) finds no open run (A was aborted, B's First was lost) and is dropped.
+	if out, ok := f.push(15, wire.FragLast, []byte("B2")); ok {
+		t.Fatalf("FragLast on an aborted/never-opened run should drop, got %q", out)
+	}
+	// A clean, consecutive message still reassembles.
+	f.push(16, wire.FragFirst, []byte("C0"))
+	out, ok := f.push(17, wire.FragLast, []byte("C1"))
+	if !ok || string(out) != "C0C1" {
+		t.Fatalf("clean consecutive message delivered %q ok=%v, want \"C0C1\" true", out, ok)
+	}
+}
+
+// TestFECCtrlReassemblerLostMiddle proves a single lost middle fragment within one FEC
+// message is detected (the sequence skips), so the corrupt partial is dropped rather than
+// closed as a complete-but-wrong FEC body (F8).
+func TestFECCtrlReassemblerLostMiddle(t *testing.T) {
+	var f fecCtrlReassembler
+	f.push(20, wire.FragFirst, []byte("aa"))
+	// Middle at seq 21 is lost; the Last arrives at seq 22 (gap 20 -> 22).
+	if out, ok := f.push(22, wire.FragLast, []byte("cc")); ok {
+		t.Fatalf("a lost middle must abort the message, got %q", out)
+	}
+}
+
 // TestFragReassemblerNoAllocSteadyState verifies the reassembler reuses its
 // buffer: after a warm-up run sizes it, a same-shape run allocates nothing.
 func TestFragReassemblerNoAllocSteadyState(t *testing.T) {

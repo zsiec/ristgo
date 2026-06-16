@@ -508,20 +508,22 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 	// so MultiReceiver and other receivers reassemble correctly without it. Anyone
 	// making reassembly conditional on FragmentSize must revisit this omission.
 	return session.Config{
-		Flow:              fc,
-		SSRC:              ssrc,
-		FEC:               toSessionFEC(cfg.FEC, cfg.Profile == ProfileAdvanced),
-		CNAME:             cname,
-		Bitmask:           cfg.NACKType == NACKBitmask,
-		KeepaliveInterval: clock.FromDuration(cfg.KeepaliveInterval),
-		SessionTimeout:    clock.FromDuration(cfg.SessionTimeout),
-		Logf:              logf,
-		ErrClosed:         ErrClosed,
-		ErrTimeout:        ErrTimeout,
-		ErrSessionTimeout: ErrSessionTimeout,
-		ErrBufferOverflow: ErrBufferOverflow,
-		ErrAuth:           ErrAuth,
-		ErrOOBUnsupported: ErrOOBUnsupported,
+		Flow:                   fc,
+		SSRC:                   ssrc,
+		FEC:                    toSessionFEC(cfg.FEC, cfg.Profile == ProfileAdvanced),
+		CNAME:                  cname,
+		Bitmask:                cfg.NACKType == NACKBitmask,
+		KeepaliveInterval:      clock.FromDuration(cfg.KeepaliveInterval),
+		SessionTimeout:         clock.FromDuration(cfg.SessionTimeout),
+		Logf:                   logf,
+		ErrClosed:              ErrClosed,
+		ErrTimeout:             ErrTimeout,
+		ErrSessionTimeout:      ErrSessionTimeout,
+		ErrBufferOverflow:      ErrBufferOverflow,
+		ErrAuth:                ErrAuth,
+		ErrOOBUnsupported:      ErrOOBUnsupported,
+		ErrFlowAttrUnsupported: ErrFlowAttrUnsupported,
+		OnFlowAttr:             cfg.OnFlowAttr,
 	}
 }
 

@@ -111,7 +111,7 @@ func newSimpleReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) 
 	// Separate-port SMPTE 2022-1 FEC binds dedicated column/row sockets next to the
 	// media port (the session owns and closes them).
 	if cfg.FEC != nil && cfg.FEC.carriage(false) == FECCarriageSeparatePorts {
-		if err := bindFECSockets(&sc, host, conn.MediaPort()); err != nil {
+		if err := bindFECSockets(&sc, host, conn.MediaPort(), cfg.FEC.ColumnOnly); err != nil {
 			conn.Close()
 			return nil, err
 		}
@@ -120,12 +120,19 @@ func newSimpleReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) 
 	return &Receiver{sess: sess}, nil
 }
 
-// bindFECSockets binds the column (mediaPort+2) and row (mediaPort+4) FEC sockets
-// for the separate-port carriage and stores them on the session config.
-func bindFECSockets(sc *session.Config, host string, mediaPort int) error {
+// bindFECSockets binds the column (mediaPort+2) and, for 2-D FEC, row (mediaPort+4)
+// FEC sockets for the separate-port carriage and stores them on the session config.
+// Column-only FEC emits no row packets, so it binds only the column socket: binding +4
+// would spawn an idle reader and could fail receiver construction if another stream
+// already holds that port, for a feature the config turned off.
+func bindFECSockets(sc *session.Config, host string, mediaPort int, columnOnly bool) error {
 	col, err := socket.BindUDP(host, mediaPort+2)
 	if err != nil {
 		return fmt.Errorf("rist: bind column FEC port %d: %w", mediaPort+2, err)
+	}
+	if columnOnly {
+		sc.FECColumn = col
+		return nil
 	}
 	row, err := socket.BindUDP(host, mediaPort+4)
 	if err != nil {
@@ -172,7 +179,7 @@ func newMainReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	// Main-profile FEC (over the inner RTP payload) uses the separate-port carriage,
 	// like Simple: bind the column/row FEC sockets next to the media port.
 	if cfg.FEC != nil && cfg.FEC.carriage(false) == FECCarriageSeparatePorts {
-		if err := bindFECSockets(&sc, host, conn.MediaPort()); err != nil {
+		if err := bindFECSockets(&sc, host, conn.MediaPort(), cfg.FEC.ColumnOnly); err != nil {
 			conn.Close()
 			return nil, err
 		}

@@ -3,6 +3,7 @@ package ristgo_test
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"runtime"
 	"testing"
@@ -10,6 +11,28 @@ import (
 
 	ristgo "github.com/zsiec/ristgo"
 )
+
+// TestMultiReceiverFECRejected verifies a demultiplexing MultiReceiver rejects
+// separate-port FEC (Simple/Main) rather than silently binding no FEC sockets and
+// recovering nothing. The rejection fires before any socket is bound (F4).
+func TestMultiReceiverFECRejected(t *testing.T) {
+	cfg := fastConfig() // Simple profile -> FEC resolves to the separate-port carriage
+	cfg.FEC = &ristgo.FECConfig{Columns: 5, Rows: 5}
+
+	if rx, err := ristgo.NewMultiReceiver("127.0.0.1:0", cfg); err == nil {
+		rx.Close()
+		t.Fatal("NewMultiReceiver + separate-port FEC should be rejected")
+	} else if !errors.Is(err, ristgo.ErrInvalidConfig) {
+		t.Fatalf("NewMultiReceiver error = %v, want ErrInvalidConfig", err)
+	}
+
+	if rx, err := ristgo.NewMultiBondedReceiver([]string{"127.0.0.1:0"}, cfg); err == nil {
+		rx.Close()
+		t.Fatal("NewMultiBondedReceiver + separate-port FEC should be rejected")
+	} else if !errors.Is(err, ristgo.ErrInvalidConfig) {
+		t.Fatalf("NewMultiBondedReceiver error = %v, want ErrInvalidConfig", err)
+	}
+}
 
 // TestMultiReceiverCloseNoLeak opens two flows on a MultiReceiver, then closes
 // the whole receiver and verifies every goroutine it spawned returns to the

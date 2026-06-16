@@ -74,6 +74,10 @@ type Config struct {
 	// ErrOOBUnsupported is returned by WriteOOB/ReadOOB when the session has no
 	// out-of-band channel (the Simple profile). Supplied by the public layer.
 	ErrOOBUnsupported error
+	// ErrFlowAttrUnsupported is returned by WriteFlowAttribute when the session is
+	// not Advanced (flow attributes are an Advanced-profile control message).
+	// Supplied by the public layer.
+	ErrFlowAttrUnsupported error
 
 	// Main, when non-nil, selects the Main profile (VSF TR-06-2): the flow is
 	// tunnelled over a single GRE port instead of the Simple even/odd RTP/RTCP
@@ -94,6 +98,12 @@ type Config struct {
 	AdaptLQM       bool
 	RateController *adapt.Controller
 	OnRateAdapt    func(kbps int)
+
+	// OnFlowAttr, set on an Advanced receiver, is called with the JSON body of each
+	// inbound Flow Attribute control message (TR-06-3 §5.3.7). The slice is valid
+	// only for the duration of the call (it aliases codec scratch); the callback
+	// runs on the event loop, so it must not block. nil disables the channel.
+	OnFlowAttr func(json []byte)
 
 	// FragmentSize, when > 0, makes the sender split an application payload
 	// larger than this many bytes across consecutive sequences, each an
@@ -275,7 +285,6 @@ type Session struct {
 	// constructed from the first packet's sequence. See fec.go.
 	fecEnc       *fec.Encoder
 	fecDec       *fec.Decoder
-	fecMediaSSRC uint32        // SSRC stamped on recovered packets (learned from received media)
 	fecBuf       []byte        // scratch for framing FEC packets
 	fecRecovered atomic.Uint64 // packets reconstructed by FEC
 	// Separate-port FEC carriage: fecCol/fecRow are the receiver's bound column/row
@@ -285,7 +294,7 @@ type Session struct {
 	fecSockets           []*net.UDPConn // bonded receiver's per-path FEC sockets
 	fecIn                chan []byte
 	fecColSeq, fecRowSeq uint16
-	fecCtrlReasm         fragReassembler // reassembles over-MTU in-band FEC control messages
+	fecCtrlReasm         fecCtrlReassembler // reassembles over-MTU in-band FEC control messages
 
 	// advGRE is the Main-profile GRE control substrate used in Advanced mode.
 	// libRIST's Advanced profile begins with the Main-profile GRE handshake —
@@ -379,6 +388,12 @@ type Session struct {
 	// ARQ/reorder/dedup), like EAPOL — it is purely a host concern.
 	oobIn  chan oobData
 	oobOut chan oobData
+
+	// flowAttrIn carries application WriteFlowAttribute JSON bodies to the loop,
+	// which emits each as an Advanced Flow Attribute control message (TR-06-3
+	// §5.3.7). Advanced senders only; nil otherwise. Like OOB it bypasses the flow
+	// core (pure host concern, no ARQ).
+	flowAttrIn chan []byte
 
 	// delivery to Read
 	delivery chan []byte
@@ -594,6 +609,11 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		s.oobIn = make(chan oobData, 16)
 		s.oobOut = make(chan oobData, 16)
 	}
+	if cfg.Adv != nil {
+		// Flow attributes are an Advanced-profile control message; the send channel
+		// exists only there (the receive side is the OnFlowAttr callback).
+		s.flowAttrIn = make(chan []byte, 16)
+	}
 	if cfg.Main != nil {
 		mp := cfg.Main
 		s.main = newMainCodec(mp.SendKey, mp.RecvKey, mp.KeySize256, mp.VirtSrcPort, mp.VirtDstPort, mp.NPD, cfg.SSRC, cfg.CNAME, cfg.Bitmask)
@@ -643,9 +663,15 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 func (s *Session) start() {
 	s.wg.Add(1)
 	go s.loop()
-	if s.fecCol != nil { // separate-port FEC: read the column and row FEC sockets
-		s.wg.Add(2)
+	// Separate-port FEC: read whichever of the column/row FEC sockets is bound. They are
+	// guarded independently because column-only FEC binds the column socket alone (no +4
+	// row port), so fecRow can be nil; reading a nil socket would panic the goroutine.
+	if s.fecCol != nil {
+		s.wg.Add(1)
 		go s.readFEC(s.fecCol)
+	}
+	if s.fecRow != nil {
+		s.wg.Add(1)
 		go s.readFEC(s.fecRow)
 	}
 	for _, c := range s.fecSockets { // bonded separate-port FEC: one reader per path socket
@@ -752,9 +778,8 @@ func (s *Session) loop() {
 			if pkt, err := s.mdec.decode(m.data); err == nil {
 				s.feedMedia(now, 0, pkt)
 				if s.fecEnabled() {
-					// uint32(refTicks) is the raw on-the-wire RTP timestamp (widening
-					// only touches the high bits), the value the FEC XOR is keyed on.
-					s.fecRecvRTP(now, uint32(s.mdec.refTicks), pkt)
+					// lastWireTS is the raw on-the-wire RTP timestamp, the value the FEC XOR is keyed on.
+					s.fecRecvRTP(now, s.mdec.lastWireTS, pkt)
 				}
 			}
 			s.afterInput(now, timer)
@@ -810,8 +835,8 @@ func (s *Session) loop() {
 					s.feedMedia(now, 0, pkt)
 					if s.fecEnabled() {
 						// FEC over the decoded inner RTP payload (TR-06-2 §8.6);
-						// uint32(refTicks) is the raw inner RTP timestamp.
-						s.fecRecvRTP(now, uint32(s.main.dec.refTicks), pkt)
+						// lastWireTS is the raw inner RTP timestamp.
+						s.fecRecvRTP(now, s.main.dec.lastWireTS, pkt)
 					}
 				} else {
 					s.feedFeedback(now, fbs)
@@ -859,6 +884,10 @@ func (s *Session) loop() {
 		case od := <-s.oobIn:
 			now := s.clk.Now()
 			s.sendOOB(now, od)
+			s.afterInput(now, timer)
+		case fa := <-s.flowAttrIn:
+			now := s.clk.Now()
+			s.sendFlowAttr(now, fa)
 			s.afterInput(now, timer)
 		case <-timer.C:
 			now := s.clk.Now()
@@ -1194,7 +1223,7 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 				// reassembled before its FEC body is decoded.
 				if s.fecEnabled() && p.EncType == adv.TypeControl {
 					if !p.FirstFrag || !p.LastFrag {
-						full, ok := s.fecCtrlReasm.push(fecFragRole(p.FirstFrag, p.LastFrag), p.Payload, false)
+						full, ok := s.fecCtrlReasm.push(p.Seq, fecFragRole(p.FirstFrag, p.LastFrag), p.Payload)
 						if ok {
 							if ci, body, cerr := adv.ParseControl(full); cerr == nil && s.fecControlIndex(ci) {
 								s.fecOnRecvFEC(now, body)
@@ -1313,6 +1342,31 @@ func (s *Session) sendOOB(now clock.Timestamp, od oobData) {
 	}
 	if err := s.conn.WriteMedia(b, s.peer.Media); err != nil {
 		s.logf("oob: write: %v", err)
+		return
+	}
+	s.lastTx = now
+}
+
+// sendFlowAttr emits one Advanced Flow Attribute control message (CI 0x8001,
+// TR-06-3 §5.3.7) carrying the application's JSON body to the peer. Like the
+// Advanced keepalive/feedback it rides the control target (peer.RTCP); it is
+// dropped, with a log, before the peer's return address is known. Advanced only —
+// the loop only selects on flowAttrIn for an Advanced session, where s.adv is set.
+func (s *Session) sendFlowAttr(now clock.Timestamp, json []byte) {
+	if s.adv == nil {
+		return
+	}
+	if !s.peer.RTCP.IsValid() {
+		s.logf("flowattr: peer not learned yet, dropping %d-byte attribute", len(json))
+		return
+	}
+	dg, err := s.adv.frameControl(nil, adv.BuildFlowAttr(nil, json), advCtrlTS(now))
+	if err != nil {
+		s.logf("flowattr: encode: %v", err)
+		return
+	}
+	if err := s.conn.WriteMedia(dg, s.peer.RTCP); err != nil {
+		s.logf("flowattr: write: %v", err)
 		return
 	}
 	s.lastTx = now

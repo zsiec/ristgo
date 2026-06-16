@@ -237,9 +237,23 @@ type LinkQuality struct {
 	LQM [44]byte
 }
 
+// FlowAttribute carries an Advanced-profile Flow Attribute message (TR-06-3
+// §5.3.7, Control Index 0x8001) from the sender to the receiver: an opaque UTF-8
+// JSON object of session/flow metadata. Like LinkQuality it is a host concern,
+// not flow input — the Advanced codec decodes a CIFlowAttr control message into
+// this variant and the host intercepts it (feedFeedback) to surface the JSON to
+// the application's OnFlowAttr callback rather than feeding it to the flow core.
+// It is Advanced-only; the Simple and Main profiles have no such message.
+type FlowAttribute struct {
+	// JSON is the flow-attribute body exactly as received, a UTF-8 JSON object.
+	// The codec copies it out of the datagram, so the receiver owns it.
+	JSON []byte
+}
+
 // Marker-method implementations sealing the Feedback variant set.
 func (NackRequest) isFeedback()     {}
 func (LinkQuality) isFeedback()     {}
+func (FlowAttribute) isFeedback()   {}
 func (RttEchoRequest) isFeedback()  {}
 func (RttEchoResponse) isFeedback() {}
 func (SenderReport) isFeedback()    {}

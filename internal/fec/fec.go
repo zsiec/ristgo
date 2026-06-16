@@ -39,6 +39,7 @@ type Recovered struct {
 	Seq         uint32
 	Timestamp   uint32
 	PayloadType uint8
+	SSRC        uint32 // SSRC of the group the loss belonged to (its members all share it)
 	Payload     []byte
 }
 
@@ -203,6 +204,7 @@ type Decoder struct {
 	cfg         Config
 	payloadSize int
 	window      int
+	maxFECs     int // cap on stored FEC packets (FEC-flood DoS guard)
 
 	media   map[uint32]storedMedia // received and recovered media in the window
 	fecs    []storedFEC            // FEC packets in the window not yet fully resolved
@@ -216,6 +218,7 @@ type Decoder struct {
 type storedMedia struct {
 	ts      uint32
 	pt      uint8
+	ssrc    uint32
 	payload []byte
 }
 
@@ -238,20 +241,25 @@ func NewDecoder(cfg Config, payloadSize int, isn uint32) *Decoder {
 		cfg:         cfg,
 		payloadSize: payloadSize,
 		window:      cfg.matrixSize()*3 + cfg.Cols + 8, // a few matrices, enough for column FEC
-		media:       make(map[uint32]storedMedia, cfg.matrixSize()*2),
-		lastSeq:     isn,
+		// Bound the stored FEC set to a few matrices' worth of column + row packets, so
+		// a flood of forged/duplicate FEC packets whose bases hug the window front (and
+		// so never age out via evict) cannot grow memory/CPU without limit.
+		maxFECs: (cfg.Cols+cfg.Rows)*4 + 16,
+		media:   make(map[uint32]storedMedia, cfg.matrixSize()*2),
+		lastSeq: isn,
 	}
 }
 
 // PushMedia stores one received media packet and returns any packets its arrival
-// allowed FEC to recover.
-func (d *Decoder) PushMedia(s, ts uint32, pt uint8, payload []byte) []Recovered {
+// allowed FEC to recover. ssrc is stamped onto any recovery from a group this packet
+// belongs to (a FEC matrix is per-source, so its members share one SSRC).
+func (d *Decoder) PushMedia(s, ts uint32, pt uint8, ssrc uint32, payload []byte) []Recovered {
 	d.out = d.out[:0]
 	d.advance(s)
 	if _, ok := d.media[s]; ok {
 		return nil // duplicate (ARQ/2022-7 already delivered it)
 	}
-	d.store(s, ts, pt, payload)
+	d.store(s, ts, pt, ssrc, payload)
 	d.recoverAll()
 	d.evict()
 	return d.out
@@ -286,6 +294,33 @@ func (d *Decoder) PushFEC(fec []byte) []Recovered {
 	if stride <= 0 || count <= 1 || count > na10Max {
 		return nil // malformed geometry; ignore
 	}
+	// Constrain the recovery group to the configured matrix: a legitimate ST 2022-x FEC
+	// packet is a column (Offset=L, NA=D) or a 2-D row (Offset=1, NA=L). Trusting the
+	// packet's own stride/count would let a forged or corrupt header define an arbitrary
+	// group spanning sequences the sender has not transmitted, fabricating a media packet
+	// out of attacker/corruption-controlled bytes (the bases may still stagger within the
+	// matrix, which the staggered-column interop relies on — only stride and count are
+	// fixed by L and D).
+	if !d.geometryOK(stride, count) {
+		return nil
+	}
+	// Dedup by (base, stride, count): a bonded sender duplicates every FEC packet to each
+	// path and a flood/forgery repeats it; an identical group carries an identical XOR
+	// payload, so one copy suffices and the rest would only cost memory and rescans.
+	for i := range d.fecs {
+		if d.fecs[i].base == base && d.fecs[i].stride == stride && d.fecs[i].count == count {
+			return nil
+		}
+	}
+	// Cap the stored FEC set (FEC-flood DoS guard): evict aged groups first, then drop the
+	// oldest stored group if still over the bound (it is closest to the eviction floor).
+	if len(d.fecs) >= d.maxFECs {
+		d.evict()
+		if len(d.fecs) >= d.maxFECs {
+			copy(d.fecs, d.fecs[1:])
+			d.fecs = d.fecs[:len(d.fecs)-1]
+		}
+	}
 	d.fecs = append(d.fecs, storedFEC{
 		base:      base,
 		stride:    stride,
@@ -300,8 +335,21 @@ func (d *Decoder) PushFEC(fec []byte) []Recovered {
 	return d.out
 }
 
-func (d *Decoder) store(s, ts uint32, pt uint8, payload []byte) {
-	d.media[s] = storedMedia{ts: ts, pt: pt, payload: append([]byte(nil), payload...)}
+// geometryOK reports whether a FEC packet's (stride, count) matches the configured
+// matrix: a column is (Offset=Cols, NA=Rows); a 2-D row is (Offset=1, NA=Cols). The
+// bases may stagger (non-block-aligned), but stride and count are fixed by L and D.
+func (d *Decoder) geometryOK(stride, count int) bool {
+	if stride == d.cfg.Cols && count == d.cfg.Rows {
+		return true // column FEC
+	}
+	if !d.cfg.ColumnOnly && stride == 1 && count == d.cfg.Cols {
+		return true // 2-D row FEC
+	}
+	return false
+}
+
+func (d *Decoder) store(s, ts uint32, pt uint8, ssrc uint32, payload []byte) {
+	d.media[s] = storedMedia{ts: ts, pt: pt, ssrc: ssrc, payload: append([]byte(nil), payload...)}
 }
 
 func (d *Decoder) advance(s uint32) {
@@ -362,6 +410,15 @@ func (d *Decoder) tryRecover(sf *storedFEC) bool {
 		sf.done = true
 		return false
 	}
+	// Refuse to recover a member the sender cannot yet have transmitted. A legitimate FEC
+	// group is emitted only after all its members were sent, so every real member is
+	// <= lastSeq (the highest sequence seen). If the newest member is still ahead of the
+	// window front, the "missing" member is a not-yet-sent (future) sequence, not a loss,
+	// and fabricating it would preempt the real packet when it arrives. Leave the group
+	// active (no done) so it can recover once a later media packet advances lastSeq past it.
+	if newest := seqAdd(sf.base, (sf.count-1)*sf.stride); seqDiff(d.lastSeq, newest) > 0 {
+		return false
+	}
 	var missing uint32
 	missingCount := 0
 	for i := 0; i < sf.count; i++ {
@@ -381,6 +438,7 @@ func (d *Decoder) tryRecover(sf *storedFEC) bool {
 	length := sf.lengthRec
 	pt := sf.ptRec
 	ts := sf.tsRec
+	var ssrc uint32 // the group's SSRC, taken from any present member (all members share it)
 	payload := make([]byte, d.payloadSize)
 	copy(payload, sf.payload)
 	for i := 0; i < sf.count; i++ {
@@ -388,6 +446,7 @@ func (d *Decoder) tryRecover(sf *storedFEC) bool {
 		if !ok {
 			continue
 		}
+		ssrc = m.ssrc
 		length ^= uint16(len(m.payload))
 		pt ^= m.pt & 0x7f
 		ts ^= m.ts
@@ -396,11 +455,12 @@ func (d *Decoder) tryRecover(sf *storedFEC) bool {
 		}
 	}
 	if int(length) > d.payloadSize {
-		return false // implausible recovered length: leave the loss to ARQ
+		sf.done = true // implausible recovered length: this group can never recover, stop rescanning it
+		return false
 	}
-	rp := Recovered{Seq: missing, Timestamp: ts, PayloadType: pt, Payload: append([]byte(nil), payload[:length]...)}
+	rp := Recovered{Seq: missing, Timestamp: ts, PayloadType: pt, SSRC: ssrc, Payload: append([]byte(nil), payload[:length]...)}
 	d.out = append(d.out, rp)
-	d.media[missing] = storedMedia{ts: ts, pt: pt, payload: rp.Payload}
+	d.media[missing] = storedMedia{ts: ts, pt: pt, ssrc: ssrc, payload: rp.Payload}
 	sf.done = true
 	return true
 }

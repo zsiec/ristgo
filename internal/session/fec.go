@@ -38,10 +38,28 @@ type FECParams struct {
 	Variant       fec.Variant // ST 2022-1 (default) or ST 2022-5
 }
 
-// fecPayloadSize bounds the protected payload the FEC matrix accumulates; it must
-// be at least the largest media payload (recovered payloads are truncated to the
-// recovered length, which is <= this).
-const fecPayloadSize = 1500
+// fecRTPPayloadSize bounds the protected payload the FEC matrix accumulates for the
+// Simple- and Main-profile separate-port carriage, which protects only the inner RTP
+// payload (<= the max media payload). It is comfortably above MaxMediaPayload so the
+// XOR and the recovered-length check never truncate, while keeping the separate-port
+// FEC RTP packet (always this size) small.
+const fecRTPPayloadSize = 1500
+
+// fecPayloadSize returns the FEC matrix payload size for this session's profile. The
+// Advanced profile protects the FULL wire datagram (post-compression and -encryption),
+// so the buffer must admit the largest datagram the receive path can feed — a max
+// media payload plus the Advanced fixed header can exceed fecRTPPayloadSize, and a
+// too-small buffer would silently drop the tail bytes from the XOR and then reject the
+// over-length recovery, leaving every near-MTU packet unrecoverable. The in-band
+// carriage already fragments an over-MTU FEC control message, so sizing this to the
+// receive buffer is safe. The Simple/Main separate-port carriage protects only the
+// inner RTP payload, which fits fecRTPPayloadSize.
+func (s *Session) fecPayloadSize() int {
+	if s.adv != nil {
+		return maxDatagram
+	}
+	return fecRTPPayloadSize
+}
 
 // fecPT is the RTP payload type fed to the FEC for its recovery field; ristgo does
 // not use it for delivery, so a constant on both ends keeps the XOR consistent.
@@ -67,17 +85,20 @@ func (s *Session) fecConfig() fec.Config {
 }
 
 // fecSourceRTP reconstructs the normalized source time of a Simple- or Main-profile
-// recovered packet from its recovered RTP timestamp, matching what the codec would
-// produce for the real packet (so the flow's (Seq, SourceTime) dedup absorbs a
-// duplicate). Both profiles map the RTP timestamp the same way; the Advanced profile
-// re-decodes the recovered datagram instead and needs no equivalent.
-func (s *Session) fecSourceRTP(wireTS uint32) uint64 {
-	ref := s.mdec.refTicks
+// recovered packet from its recovered sequence and RTP timestamp, through the same
+// sequence-anchored mediaDecoder.sourceTime the real packet's in-order decode uses. Since
+// that mapping is stable in (seq, wireTS) — independent of when it is computed — a recovery
+// and a later 2022-7 duplicate or ARQ retransmit of the same sequence reconstruct to the
+// identical (Seq, SourceTime), so the flow's dedup absorbs the duplicate even across a
+// 32-bit RTP timestamp wrap. The recovered seq is at or behind the front, so this read
+// does not advance the decoder's reference. The Advanced profile re-decodes the recovered
+// datagram instead and needs no equivalent.
+func (s *Session) fecSourceRTP(seq, wireTS uint32) uint64 {
+	dec := &s.mdec
 	if s.main != nil {
-		ref = s.main.dec.refTicks
+		dec = &s.main.dec
 	}
-	ticks := widenTicks(wireTS, ref) // widen against the decoder's reference
-	return uint64(clock.NTPTimeFromTimestamp(clock.Timestamp(microsFromRTPTicks(ticks))))
+	return dec.sourceTime(seq, wireTS)
 }
 
 // fecOnSend clips one original (non-retransmit) media unit into the FEC matrix and
@@ -94,7 +115,7 @@ func (s *Session) fecOnSend(now clock.Timestamp, pkt wire.MediaPacket, datagram 
 		return // FEC protects original transmissions, fed in sequence order
 	}
 	if s.fecEnc == nil {
-		s.fecEnc = fec.NewEncoder(s.fecConfig(), fecPayloadSize, pkt.Seq)
+		s.fecEnc = fec.NewEncoder(s.fecConfig(), s.fecPayloadSize(), pkt.Seq)
 	}
 	var fps []fec.Packet
 	if s.adv != nil {
@@ -234,10 +255,9 @@ func (s *Session) fecControlIndex(ci uint16) bool {
 // payload and raw on-the-wire timestamp) into the decoder and delivers any it recovers.
 func (s *Session) fecRecvRTP(now clock.Timestamp, wireTS uint32, pkt wire.MediaPacket) {
 	if s.fecDec == nil {
-		s.fecDec = fec.NewDecoder(s.fecConfig(), fecPayloadSize, pkt.Seq)
+		s.fecDec = fec.NewDecoder(s.fecConfig(), s.fecPayloadSize(), pkt.Seq)
 	}
-	s.fecMediaSSRC = pkt.SSRC
-	for _, r := range s.fecDec.PushMedia(pkt.Seq, wireTS, fecPT, pkt.Payload) {
+	for _, r := range s.fecDec.PushMedia(pkt.Seq, wireTS, fecPT, pkt.SSRC, pkt.Payload) {
 		s.fecHandleRecovered(now, r)
 	}
 }
@@ -246,9 +266,11 @@ func (s *Session) fecRecvRTP(now clock.Timestamp, wireTS uint32, pkt wire.MediaP
 // the decoder, keyed by its decoded sequence, and delivers any it recovers.
 func (s *Session) fecRecvAdv(now clock.Timestamp, seq uint32, datagram []byte) {
 	if s.fecDec == nil {
-		s.fecDec = fec.NewDecoder(s.fecConfig(), fecPayloadSize, seq)
+		s.fecDec = fec.NewDecoder(s.fecConfig(), s.fecPayloadSize(), seq)
 	}
-	for _, r := range s.fecDec.PushMedia(seq, 0, 0, datagram) {
+	// SSRC is unused here: an Advanced recovery is the full datagram, re-decoded through
+	// the normal path, which reads the SSRC from the recovered bytes themselves.
+	for _, r := range s.fecDec.PushMedia(seq, 0, 0, 0, datagram) {
 		s.fecHandleRecovered(now, r)
 	}
 }
@@ -278,9 +300,13 @@ func (s *Session) fecHandleRecovered(now clock.Timestamp, r fec.Recovered) {
 	}
 	s.feedMedia(now, 0, wire.MediaPacket{
 		Seq:        r.Seq,
-		SourceTime: s.fecSourceRTP(r.Timestamp),
-		SSRC:       s.fecMediaSSRC,
-		Payload:    r.Payload,
+		SourceTime: s.fecSourceRTP(r.Seq, r.Timestamp),
+		// Stamp the recovery with its own group's SSRC (carried through the decoder),
+		// not the last-seen stream SSRC: a recovery for a packet from a prior SSRC
+		// (a mid-stream SSRC change, or a bonded 2022-7 merge whose paths momentarily
+		// normalize to different SSRCs) keeps the correct label.
+		SSRC:    r.SSRC,
+		Payload: r.Payload,
 	})
 }
 

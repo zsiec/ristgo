@@ -392,6 +392,17 @@ func (s *Sender) WriteOOB(p []byte) error { return writeOOBTyped(s.sess, OOBProt
 // drops it). It returns [ErrOOBProtocol] if proto is reserved for RIST framing.
 func (s *Sender) WriteOOBTyped(proto uint16, p []byte) error { return writeOOBTyped(s.sess, proto, p) }
 
+// WriteFlowAttribute sends an Advanced-profile Flow Attribute message (TR-06-3
+// §5.3.7) carrying the UTF-8 JSON body to the receiver, which surfaces it to its
+// [Config.OnFlowAttr] callback. It is opaque session/flow metadata sent
+// fire-and-forget (no ARQ) — call it periodically if the application wants the
+// receiver to stay current, the way libRIST emits one roughly every second. It
+// returns [ErrFlowAttrUnsupported] on a Simple- or Main-profile sender, and blocks
+// under back-pressure honoring the write deadline ([ErrTimeout]) and close
+// ([ErrClosed]). The body is dropped, with a log, until the peer's address is
+// learned (so send after the stream is flowing).
+func (s *Sender) WriteFlowAttribute(json []byte) error { return s.sess.WriteFlowAttribute(json) }
+
 // ReadOOB returns the next out-of-band datagram received from the peer,
 // truncated to len(buf) (OOB is datagram-oriented, not a stream). It blocks
 // until one arrives, the deadline passes (ErrTimeout), or the sender closes

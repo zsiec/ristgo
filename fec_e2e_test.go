@@ -799,3 +799,39 @@ func runAdvInbandFEC(t *testing.T, fecCfg *ristgo.FECConfig) {
 	}
 	t.Logf("FEC e2e: dropped=%d fecRecovered=%d arqRecovered=%d", proxy.Dropped(), st.FECRecovered, st.Recovered)
 }
+
+// TestE2EFECColumnOnlyPortBinding verifies column-only FEC binds only the column
+// (media+2) socket, not the unused row (media+4) port: a column-only receiver
+// constructs even when media+4 is already in use and starts without panicking on a nil
+// row reader, while a 2-D receiver still needs media+4 (F12, F13).
+func TestE2EFECColumnOnlyPortBinding(t *testing.T) {
+	port := freeEvenPort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	// Occupy the row FEC port (media+4) so any attempt to bind it fails.
+	rowPort, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port + 4})
+	if err != nil {
+		t.Skipf("could not occupy row FEC port %d: %v", port+4, err)
+	}
+	defer rowPort.Close()
+
+	// Column-only FEC must NOT need media+4: construction succeeds and Close is clean,
+	// exercising start() with a nil row reader (no panic).
+	colCfg := fastConfig()
+	colCfg.FEC = &ristgo.FECConfig{Columns: 5, Rows: 5, ColumnOnly: true}
+	rx, err := ristgo.NewReceiver(addr, colCfg)
+	if err != nil {
+		t.Fatalf("column-only FEC receiver should not need the row port, but failed: %v", err)
+	}
+	if err := rx.Close(); err != nil {
+		t.Fatalf("column-only FEC receiver Close: %v", err)
+	}
+
+	// A 2-D FEC receiver DOES need media+4, which is taken, so it must fail to construct.
+	twoDCfg := fastConfig()
+	twoDCfg.FEC = &ristgo.FECConfig{Columns: 5, Rows: 5}
+	if rx, err := ristgo.NewReceiver(addr, twoDCfg); err == nil {
+		rx.Close()
+		t.Fatal("2-D FEC receiver should fail when the row FEC port is occupied")
+	}
+}

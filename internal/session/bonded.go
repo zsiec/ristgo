@@ -60,6 +60,14 @@ type weightSet struct {
 type bondState struct {
 	group *bonding.Group
 
+	// lastWeighted is the weighted load-share path the most recent media datagram was
+	// routed to (lastWeightedOK reports whether one was elected). FEC fans out to this
+	// same path rather than re-electing one: SelectWeighted spends a rotation credit per
+	// call, so electing again for each FEC packet would double-spend the credit and skew
+	// the per-path media distribution away from the configured weights.
+	lastWeighted   uint8
+	lastWeightedOK bool
+
 	// conns is one socket per path on a receiver, or the single send socket
 	// (conns[0]) on a sender.
 	conns []*socket.Conn
@@ -75,8 +83,9 @@ type bondState struct {
 	// fecReasm reassembles over-MTU in-band FEC control messages per path: a bonded
 	// sender fans each FEC fragment to every path, so the receiver must reassemble
 	// each path's fragment run independently (a single shared reassembler would
-	// interleave fragments arriving on different paths). nil unless FEC is enabled.
-	fecReasm []fragReassembler
+	// interleave fragments arriving on different paths). Each tracks its own control
+	// sequence so a dropped fragment is detected per path. nil unless FEC is enabled.
+	fecReasm []fecCtrlReassembler
 }
 
 // NewBondedReceiver builds a Simple-profile bonded receiver: one socket per
@@ -88,7 +97,7 @@ func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *
 	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
 	bs := &bondState{group: group, conns: conns, peers: make([]*peer.Peer, len(conns))}
 	if cfg.FEC != nil {
-		bs.fecReasm = make([]fragReassembler, len(conns))
+		bs.fecReasm = make([]fecCtrlReassembler, len(conns))
 	}
 	for i := range conns {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
@@ -112,7 +121,7 @@ func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bond
 	s.flow = flow.New(flow.RoleSender, cfg.Flow)
 	bs := &bondState{group: group, conns: []*socket.Conn{conn}, remotes: remotes, peers: make([]*peer.Peer, len(remotes))}
 	if cfg.FEC != nil {
-		bs.fecReasm = make([]fragReassembler, len(remotes))
+		bs.fecReasm = make([]fecCtrlReassembler, len(remotes))
 	}
 	for i := range remotes {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
@@ -238,6 +247,13 @@ func (s *Session) bondObserveRTT(now clock.Timestamp, idx uint8, fbs []wire.Feed
 			sent := clock.NTPTime(resp.Timestamp).Timestamp()
 			s.bond.group.ObserveRTT(idx, now.Sub(sent)-clock.Microseconds(resp.ProcessingDelay))
 		}
+		// A Flow Attribute is a host-level metadata signal, not flow input — surface
+		// it to the application instead of feeding the flow core, matching the
+		// interception feedFeedback does on the non-bonded path.
+		if fa, ok := fb.(wire.FlowAttribute); ok {
+			s.handleFlowAttr(fa.JSON)
+			continue
+		}
 		s.flow.FeedFeedback(now, fb)
 	}
 }
@@ -258,7 +274,7 @@ func (s *Session) handleBondSimple(now clock.Timestamp, idx uint8, p *peer.Peer,
 	if pkt, err := s.mdec.decode(bi.data); err == nil {
 		s.feedMedia(now, idx, pkt)
 		if s.fecEnabled() {
-			s.fecRecvRTP(now, uint32(s.mdec.refTicks), pkt)
+			s.fecRecvRTP(now, s.mdec.lastWireTS, pkt)
 		}
 	}
 }
@@ -282,7 +298,7 @@ func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, b
 	if isMedia {
 		s.feedMedia(now, idx, pkt)
 		if s.fecEnabled() {
-			s.fecRecvRTP(now, uint32(s.main.dec.refTicks), pkt)
+			s.fecRecvRTP(now, s.main.dec.lastWireTS, pkt)
 		}
 		return
 	}
@@ -408,8 +424,11 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	// Weighted load-share paths (Weight > 0): route this datagram to one elected
 	// path, splitting the stream across them in proportion to their weights
 	// (libRIST weighted send). These paths are disjoint from the duplicate paths
-	// above, so no path is sent the same datagram twice.
-	if idx, ok := s.bond.group.SelectWeighted(now); ok && int(idx) < len(s.bond.remotes) {
+	// above, so no path is sent the same datagram twice. Record the election so the
+	// FEC fan-out reuses it instead of spending another rotation credit (see fanBondPaths).
+	idx, ok := s.bond.group.SelectWeighted(now)
+	s.bond.lastWeighted, s.bond.lastWeightedOK = idx, ok && int(idx) < len(s.bond.remotes)
+	if s.bond.lastWeightedOK {
 		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[idx][0]); err != nil {
 			s.logf("bond: write media weighted path %d: %v", idx, err)
 		}
@@ -494,9 +513,11 @@ func (s *Session) sendBondFECSeparate(now clock.Timestamp, fp fec.Packet) {
 	})
 }
 
-// fanBondPaths invokes write with the media address of each path a media datagram
-// would currently be sent to: every sendable 2022-7 duplicate path plus the elected
-// weighted load-share path.
+// fanBondPaths invokes write with the media address of each path the FEC for the most
+// recent media datagram is sent to: every sendable 2022-7 duplicate path plus the
+// weighted load-share path that media datagram was routed to. It reuses the recorded
+// election (lastWeighted) rather than calling SelectWeighted, which would spend a second
+// rotation credit per FEC packet and skew the weighted media distribution.
 func (s *Session) fanBondPaths(now clock.Timestamp, write func(media netip.AddrPort)) {
 	for i := range s.bond.remotes {
 		if !s.bond.group.ShouldDuplicate(uint8(i), now) {
@@ -504,8 +525,8 @@ func (s *Session) fanBondPaths(now clock.Timestamp, write func(media netip.AddrP
 		}
 		write(s.bond.remotes[i][0])
 	}
-	if idx, ok := s.bond.group.SelectWeighted(now); ok && int(idx) < len(s.bond.remotes) {
-		write(s.bond.remotes[idx][0])
+	if s.bond.lastWeightedOK && int(s.bond.lastWeighted) < len(s.bond.remotes) {
+		write(s.bond.remotes[s.bond.lastWeighted][0])
 	}
 }
 
@@ -518,7 +539,7 @@ func (s *Session) handleBondFECControl(now clock.Timestamp, idx uint8, pr adv.Pa
 		return
 	}
 	if !pr.FirstFrag || !pr.LastFrag {
-		full, ok := s.bond.fecReasm[idx].push(fecFragRole(pr.FirstFrag, pr.LastFrag), pr.Payload, false)
+		full, ok := s.bond.fecReasm[idx].push(pr.Seq, fecFragRole(pr.FirstFrag, pr.LastFrag), pr.Payload)
 		if !ok {
 			return
 		}
@@ -676,6 +697,14 @@ func (s *Session) writeBondFeedback(conn *socket.Conn, greCodec *mainCodec, simp
 // otherwise only the selected path's RTT is ever measured and the NACK-peer
 // RTT tie-break has no data. NACK groups still route to the single selected path
 // via sendBondFeedback.
+//
+// A bonded Main session does NOT emit the GRE capability keepalive beacon (the MAC +
+// capability-flags message sendGREKeepalive sends on the non-bonded Main path), so it
+// never advertises the SMPTE-2022 FEC capability (the P flag). This is intentional: the
+// bonded keepalive is an RTCP RR + RTT-echo compound tunnelled over GRE, not the
+// capability beacon, and the P flag is purely informational — a ristgo receiver decodes
+// FEC regardless of it, so the only effect is that a peer inspecting the beacon is not
+// told FEC is in use on a bonded Main link.
 func (s *Session) sendBondKeepalive(now clock.Timestamp) {
 	echo := []wire.Feedback{wire.RttEchoRequest{Timestamp: uint64(clock.NTPTimeFromTimestamp(now))}}
 	if s.sender {

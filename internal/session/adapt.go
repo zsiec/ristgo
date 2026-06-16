@@ -69,14 +69,22 @@ func (s *Session) computeLQM(now clock.Timestamp) adapt.LQM {
 	// counts them in Received but not in Recovered (which is ARQ-only). TR-06-4 §5.1
 	// requires the LQM's recovered count to include packets recovered "through
 	// retransmission OR FEC", so move this period's FEC recoveries from
-	// SourceReceived into Recovered.
+	// SourceReceived into Recovered. A FEC recovery that arrived too late, or that
+	// duplicated an already-delivered copy, was counted in fecRecovered but never landed
+	// in flow.Received, so fecDelta can exceed srcReceived; move only the portion that
+	// actually landed in flow.Received, keeping the two fields consistent. Adding the full
+	// fecDelta to Recovered while leaving srcReceived unreduced (the previous behavior when
+	// fecDelta > srcReceived) over-reported recovery and fed the rate controller inflated
+	// numbers.
 	fecNow := s.fecRecovered.Load()
 	fecDelta := uint32(fecNow - s.lqmPrevFEC)
 	s.lqmPrevFEC = fecNow
 	srcReceived := uint32(st.Received - prev.Received)
-	if fecDelta <= srcReceived {
-		srcReceived -= fecDelta
+	movedFEC := fecDelta
+	if movedFEC > srcReceived {
+		movedFEC = srcReceived
 	}
+	srcReceived -= movedFEC
 
 	s.lqmSeq++
 	return adapt.LQM{
@@ -89,7 +97,7 @@ func (s *Session) computeLQM(now clock.Timestamp) adapt.LQM {
 		// period (the flow's dedicated counter, distinct from Recovered, which
 		// counts gaps filled by ARQ). TR-06-4 §5.1 treats these as two fields.
 		RetransmittedReceived: uint32(st.RetransmittedReceived - prev.RetransmittedReceived),
-		Recovered:             uint32(st.Recovered-prev.Recovered) + fecDelta,
+		Recovered:             uint32(st.Recovered-prev.Recovered) + movedFEC,
 		Unrecovered:           uint32(st.Lost - prev.Lost),
 		// Late counts original packets that arrived too late, excluding
 		// retransmitted packets received late (§5.1): subtract the too-late
@@ -216,11 +224,25 @@ func (s *Session) writeBondLQM(b []byte, mediaSock bool, now clock.Timestamp) {
 // handling is profile-agnostic.
 func (s *Session) feedFeedback(now clock.Timestamp, fbs []wire.Feedback) {
 	for _, fb := range fbs {
-		if lq, ok := fb.(wire.LinkQuality); ok {
-			s.handleLQM(lq.LQM)
-			continue
+		switch v := fb.(type) {
+		case wire.LinkQuality:
+			s.handleLQM(v.LQM)
+		case wire.FlowAttribute:
+			s.handleFlowAttr(v.JSON)
+		default:
+			s.flow.FeedFeedback(now, fb)
 		}
-		s.flow.FeedFeedback(now, fb)
+	}
+}
+
+// handleFlowAttr surfaces one inbound Advanced Flow Attribute (TR-06-3 §5.3.7) to
+// the application's OnFlowAttr callback. Like handleLQM it is a host-level signal,
+// not flow input; a no-op unless a callback is configured. The JSON slice is owned
+// by the codec for the duration of the call, matching libRIST's "valid only for
+// the callback" contract — the callback must copy it to retain it.
+func (s *Session) handleFlowAttr(json []byte) {
+	if s.cfg.OnFlowAttr != nil {
+		s.cfg.OnFlowAttr(json)
 	}
 }
 

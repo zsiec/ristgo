@@ -271,6 +271,14 @@ type Config struct {
 	// it must not block. Supported on all three profiles (see SourceAdaptation).
 	OnRateAdapt func(targetKbps int)
 
+	// OnFlowAttr, set on a Receiver, is called with the JSON body of each inbound
+	// Advanced Flow Attribute message (TR-06-3 §5.3.7): opaque UTF-8 session/flow
+	// metadata a sender announces, the counterpart to [Sender.WriteFlowAttribute].
+	// The byte slice is valid only for the duration of the call (copy it to
+	// retain), and the callback runs on the session's event loop, so it must not
+	// block. nil (the default) drops inbound flow attributes. Advanced profile only.
+	OnFlowAttr func(json []byte)
+
 	// Interface is the name of the network interface used for multicast
 	// (libRIST "miface"): a sender's outbound multicast egress interface and a
 	// receiver's group-membership interface. Empty (the default) lets the OS
@@ -399,6 +407,9 @@ func (cfg *Config) validate() error {
 	if cfg.Compression && cfg.Profile != ProfileAdvanced {
 		return errors.New("rist: Compression requires ProfileAdvanced")
 	}
+	if cfg.OnFlowAttr != nil && cfg.Profile != ProfileAdvanced {
+		return errors.New("rist: OnFlowAttr (flow attributes) requires ProfileAdvanced")
+	}
 	if cfg.FragmentSize != 0 {
 		if cfg.Profile != ProfileAdvanced {
 			return errors.New("rist: FragmentSize (payload fragmentation) requires ProfileAdvanced")
@@ -414,6 +425,14 @@ func (cfg *Config) validate() error {
 		carriage := cfg.FEC.carriage(cfg.Profile == ProfileAdvanced)
 		if carriage == FECCarriageInBand && cfg.Profile != ProfileAdvanced {
 			return errors.New("rist: in-band FEC carriage requires ProfileAdvanced")
+		}
+		// The Advanced profile protects the full encrypted datagram and carries FEC
+		// in-band; the separate-port carriage (standard ST 2022-x RTP on media+2/+4) is
+		// the Simple/Main interop form and is not wired on Advanced, so reject it rather
+		// than accept a config whose FEC sockets are never bound and silently recover
+		// nothing.
+		if carriage == FECCarriageSeparatePorts && cfg.Profile == ProfileAdvanced {
+			return errors.New("rist: the Advanced profile carries FEC in-band; FECCarriageSeparatePorts is not supported on ProfileAdvanced")
 		}
 	}
 
