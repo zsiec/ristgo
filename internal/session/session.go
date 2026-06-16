@@ -743,7 +743,7 @@ func (s *Session) loop() {
 				if s.fecEnabled() {
 					// uint32(refTicks) is the raw on-the-wire RTP timestamp (widening
 					// only touches the high bits), the value the FEC XOR is keyed on.
-					s.fecRecvSimple(now, uint32(s.mdec.refTicks), pkt)
+					s.fecRecvRTP(now, uint32(s.mdec.refTicks), pkt)
 				}
 			}
 			s.afterInput(now, timer)
@@ -797,6 +797,11 @@ func (s *Session) loop() {
 			} else if isMedia, pkt, fbs, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
 				if isMedia {
 					s.feedMedia(now, 0, pkt)
+					if s.fecEnabled() {
+						// FEC over the decoded inner RTP payload (TR-06-2 §8.6);
+						// uint32(refTicks) is the raw inner RTP timestamp.
+						s.fecRecvRTP(now, uint32(s.main.dec.refTicks), pkt)
+					}
 				} else {
 					s.feedFeedback(now, fbs)
 				}

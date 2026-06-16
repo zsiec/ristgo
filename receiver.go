@@ -169,6 +169,14 @@ func newMainReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	sc.Main = mp
 	sc.AdaptLQM = cfg.SourceAdaptation
 	sc.OneWay = oneWay
+	// Main-profile FEC (over the inner RTP payload) uses the separate-port carriage,
+	// like Simple: bind the column/row FEC sockets next to the media port.
+	if cfg.FEC != nil && cfg.FEC.carriage(false) == FECCarriageSeparatePorts {
+		if err := bindFECSockets(&sc, host, conn.MediaPort()); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
 	sess := session.NewMainReceiver(conn, sc)
 	return &Receiver{sess: sess}, nil
 }

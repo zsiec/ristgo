@@ -300,6 +300,199 @@ func distinctEvenPort(t *testing.T, avoid ...int) int {
 	}
 }
 
+// mainFECProxy relays a Main-profile session: the single media+RTCP port
+// bidirectionally (dropping media after a warmup) and the two separate FEC ports
+// (media+2 column, media+4 row) reliably forward — so FEC, on its own ports, can
+// recover the media drops.
+type mainFECProxy struct {
+	inMedia, inCol, inRow *net.UDPConn
+	out                   *net.UDPConn
+	recvMedia             int
+	loss                  float64
+	warmup                int
+	rng                   *mrand.Rand
+	mu                    sync.Mutex
+	senderAddr            *net.UDPAddr
+	seen                  int
+	dropped               atomic.Uint64
+	wg                    sync.WaitGroup
+}
+
+func startMainFECProxy(t *testing.T, proxyMedia, recvMedia int, loss float64, warmup int, seed uint64) *mainFECProxy {
+	t.Helper()
+	bind := func(port int) *net.UDPConn {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		if err != nil {
+			t.Fatalf("main fec proxy bind %d: %v", port, err)
+		}
+		return c
+	}
+	out, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("main fec proxy out: %v", err)
+	}
+	p := &mainFECProxy{
+		inMedia: bind(proxyMedia), inCol: bind(proxyMedia + 2), inRow: bind(proxyMedia + 4),
+		out:       out,
+		recvMedia: recvMedia, loss: loss, warmup: warmup,
+		rng: mrand.New(mrand.NewPCG(seed, seed^0x9e3779b9)),
+	}
+	p.wg.Add(4)
+	go p.forwardMedia()
+	go p.backward()
+	go p.forward(p.inCol, recvMedia+2)
+	go p.forward(p.inRow, recvMedia+4)
+	return p
+}
+
+func (p *mainFECProxy) forwardMedia() {
+	defer p.wg.Done()
+	buf := make([]byte, 2048)
+	for {
+		n, src, err := p.inMedia.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		p.mu.Lock()
+		p.senderAddr = src
+		large := n >= 256
+		if large {
+			p.seen++
+		}
+		drop := large && p.seen > p.warmup && p.rng.Float64() < p.loss
+		p.mu.Unlock()
+		if drop {
+			p.dropped.Add(1)
+			continue
+		}
+		p.out.WriteToUDP(buf[:n], &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p.recvMedia})
+	}
+}
+
+func (p *mainFECProxy) backward() {
+	defer p.wg.Done()
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := p.out.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		p.mu.Lock()
+		dst := p.senderAddr
+		p.mu.Unlock()
+		if dst != nil {
+			p.inMedia.WriteToUDP(buf[:n], dst)
+		}
+	}
+}
+
+func (p *mainFECProxy) forward(in *net.UDPConn, dstPort int) {
+	defer p.wg.Done()
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := in.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		p.out.WriteToUDP(buf[:n], &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: dstPort})
+	}
+}
+
+func (p *mainFECProxy) Dropped() uint64 { return p.dropped.Load() }
+func (p *mainFECProxy) Close() {
+	p.inMedia.Close()
+	p.inCol.Close()
+	p.inRow.Close()
+	p.out.Close()
+	p.wg.Wait()
+}
+
+// TestE2EFECMainProfile proves FEC on the Main profile (TR-06-2 §8.4): FEC over the
+// decoded inner RTP payload, carried on separate UDP ports (the standard ST 2022-1
+// carriage). A PSK-encrypted GRE-tunnelled stream drops media on its port while the
+// FEC ports stay clean; FEC recovers the drops and the stream is bit-exact.
+func TestE2EFECMainProfile(t *testing.T) {
+	const totalBytes = 192 * 1024
+	const chunk = 1316
+
+	ports := distinctMainPorts(t, 2)
+	recvMedia, proxyMedia := ports[0], ports[1]
+
+	cfg := mainConfig("ristgo-fec-main", 256)
+	cfg.BufferMin = 600 * time.Millisecond
+	cfg.BufferMax = 600 * time.Millisecond
+	cfg.FEC = &ristgo.FECConfig{Columns: 6, Rows: 6}
+
+	rx, err := ristgo.NewReceiver(fmt.Sprintf("127.0.0.1:%d", recvMedia), cfg)
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+	defer rx.Close()
+
+	proxy := startMainFECProxy(t, proxyMedia, recvMedia, 0.06, 36, 0xFEC7)
+	defer proxy.Close()
+
+	tx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", proxyMedia), cfg)
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer tx.Close()
+
+	data := advPayload(t, totalBytes, false)
+	want := sha256.Sum256(data)
+
+	go func() {
+		tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+		for off := 0; off < len(data); off += chunk {
+			end := off + chunk
+			if end > len(data) {
+				end = len(data)
+			}
+			if _, werr := tx.Write(data[off:end]); werr != nil {
+				return
+			}
+			if (off/chunk)%4 == 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		flush := make([]byte, chunk)
+		for i := 0; i < 40; i++ {
+			tx.Write(flush)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+	got := make([]byte, 0, totalBytes)
+	buf := make([]byte, 4096)
+	h := sha256.New()
+	for len(got) < totalBytes {
+		n, rerr := rx.Read(buf)
+		if n > 0 {
+			take := n
+			if len(got)+take > totalBytes {
+				take = totalBytes - len(got)
+			}
+			h.Write(buf[:take])
+			got = append(got, buf[:take]...)
+		}
+		if rerr != nil {
+			st := rx.Stats()
+			t.Fatalf("Read ended early at %d/%d: %v (dropped=%d fecRecovered=%d)", len(got), totalBytes, rerr, proxy.Dropped(), st.FECRecovered)
+		}
+	}
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	st := rx.Stats()
+	if sum != want {
+		t.Fatalf("Main FEC hash mismatch (dropped=%d fecRecovered=%d)", proxy.Dropped(), st.FECRecovered)
+	}
+	if st.FECRecovered == 0 {
+		t.Fatalf("no FEC recovery on Main (dropped=%d); wiring not exercised", proxy.Dropped())
+	}
+	t.Logf("Main FEC e2e: dropped=%d fecRecovered=%d", proxy.Dropped(), st.FECRecovered)
+}
+
 // TestE2EFECLargePayloadFragmentsControl forces the over-MTU FEC control-message
 // path: with ~1450-byte payloads the Advanced full-datagram FEC packet exceeds one
 // MTU, so each FEC control message is fragmented across two control packets and the

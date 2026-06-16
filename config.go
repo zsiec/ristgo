@@ -231,8 +231,10 @@ type Config struct {
 	// FEC, when non-nil, enables SMPTE ST 2022-1 forward error correction
 	// (TR-06-3 §5.3.5): the sender emits row/column FEC packets and the receiver
 	// recovers single losses per row/column with no NACK round trip, complementing
-	// ARQ. Advanced profile only in this release (the FEC rides the data port as
-	// Advanced control messages). See [FECConfig].
+	// ARQ. Supported on every profile: the Advanced profile carries FEC in-band as
+	// control messages over the full encrypted datagram, while the Simple and Main
+	// profiles carry standard ST 2022-1 FEC over the RTP payload on separate UDP
+	// ports. See [FECConfig].
 	FEC *FECConfig
 
 	// Weight is the load-balancing weight applied uniformly to every path of a
@@ -400,11 +402,8 @@ func (cfg *Config) validate() error {
 			return err
 		}
 		carriage := cfg.FEC.carriage(cfg.Profile == ProfileAdvanced)
-		switch {
-		case carriage == FECCarriageInBand && cfg.Profile != ProfileAdvanced:
+		if carriage == FECCarriageInBand && cfg.Profile != ProfileAdvanced {
 			return errors.New("rist: in-band FEC carriage requires ProfileAdvanced")
-		case carriage == FECCarriageSeparatePorts && cfg.Profile == ProfileMain:
-			return errors.New("rist: separate-port FEC carriage is not supported on ProfileMain in this release")
 		}
 	}
 

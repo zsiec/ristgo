@@ -60,13 +60,17 @@ func (s *Session) fecConfig() fec.Config {
 	return fec.Config{Cols: s.cfg.FEC.Cols, Rows: s.cfg.FEC.Rows, ColumnOnly: s.cfg.FEC.ColumnOnly}
 }
 
-// fecSourceSimple reconstructs the normalized source time of a Simple-profile
-// recovered packet from its sequence and recovered RTP timestamp, matching what the
-// codec would produce for the real packet (so the flow's (Seq, SourceTime) dedup
-// absorbs a duplicate). The Advanced profile re-decodes the recovered datagram
-// instead, so it needs no equivalent.
-func (s *Session) fecSourceSimple(wireTS uint32) uint64 {
-	ticks := widenTicks(wireTS, s.mdec.refTicks) // widen against the decoder's reference
+// fecSourceRTP reconstructs the normalized source time of a Simple- or Main-profile
+// recovered packet from its recovered RTP timestamp, matching what the codec would
+// produce for the real packet (so the flow's (Seq, SourceTime) dedup absorbs a
+// duplicate). Both profiles map the RTP timestamp the same way; the Advanced profile
+// re-decodes the recovered datagram instead and needs no equivalent.
+func (s *Session) fecSourceRTP(wireTS uint32) uint64 {
+	ref := s.mdec.refTicks
+	if s.main != nil {
+		ref = s.main.dec.refTicks
+	}
+	ticks := widenTicks(wireTS, ref) // widen against the decoder's reference
 	return uint64(clock.NTPTimeFromTimestamp(clock.Timestamp(microsFromRTPTicks(ticks))))
 }
 
@@ -186,19 +190,24 @@ func fecFragRole(first, last bool) wire.FragRole {
 	}
 }
 
-// fecIsControlIndex reports whether ci is one of the SMPTE 2022 FEC control indices.
+// fecIsControlIndex reports whether ci is a FEC control index ristgo can decode.
+// Only the ST 2022-1 indices are recognized: TR-06-3 §5.3.5 defers the ST 2022-5
+// FEC packet to the header in SMPTE ST 2022-5:2013 §7.3, which is a different layout
+// that ristgo does not implement, so a received ST 2022-5 FEC message (CI 0x0020/
+// 0x0021) is left to the unsupported-control-message path rather than misparsed as
+// ST 2022-1.
 func fecIsControlIndex(ci uint16) bool {
 	switch ci {
-	case adv.CIFEC20221Row, adv.CIFEC20221Col, adv.CIFEC20225Row, adv.CIFEC20225Col:
+	case adv.CIFEC20221Row, adv.CIFEC20221Col:
 		return true
 	default:
 		return false
 	}
 }
 
-// fecRecvSimple feeds one received Simple-profile media packet (its RTP payload and
-// raw on-the-wire timestamp) into the decoder and delivers any packets it recovers.
-func (s *Session) fecRecvSimple(now clock.Timestamp, wireTS uint32, pkt wire.MediaPacket) {
+// fecRecvRTP feeds one received Simple- or Main-profile media packet (its inner RTP
+// payload and raw on-the-wire timestamp) into the decoder and delivers any it recovers.
+func (s *Session) fecRecvRTP(now clock.Timestamp, wireTS uint32, pkt wire.MediaPacket) {
 	if s.fecDec == nil {
 		s.fecDec = fec.NewDecoder(s.fecConfig(), fecPayloadSize, pkt.Seq)
 	}
@@ -244,7 +253,7 @@ func (s *Session) fecHandleRecovered(now clock.Timestamp, r fec.Recovered) {
 	}
 	s.feedMedia(now, 0, wire.MediaPacket{
 		Seq:        r.Seq,
-		SourceTime: s.fecSourceSimple(r.Timestamp),
+		SourceTime: s.fecSourceRTP(r.Timestamp),
 		SSRC:       s.fecMediaSSRC,
 		Payload:    r.Payload,
 	})

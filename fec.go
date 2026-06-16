@@ -22,17 +22,16 @@ import (
 // On the Advanced profile FEC is computed over the full wire datagram after
 // compression and PSK encryption, per TR-06-3 §5.3.5, so a recovery is the missing
 // packet's exact bytes and composes with payload fragmentation, PSK encryption, and
-// flow identification. On the Simple profile FEC is standard ST 2022-1 over the RTP
-// payload, the form that interoperates with any ST 2022-1 receiver (the Advanced
-// in-band carriage is ristgo-to-ristgo).
+// flow identification. On the Simple and Main profiles FEC is standard ST 2022-1
+// over the RTP payload, the form that interoperates with any ST 2022-1 receiver (the
+// Advanced in-band carriage is ristgo-to-ristgo).
 //
 // # Not yet supported
 //
-//   - The Main profile, and FEC together with link bonding (2022-7 duplication
-//     already provides seamless multipath recovery) — both rejected by validation.
+//   - FEC together with link bonding (2022-7 duplication already provides seamless
+//     multipath recovery) is rejected by validation.
 //   - ST 2022-5 (the high-bitrate variant; only ST 2022-1 is implemented).
-//   - Encrypted FEC packets, and fragmenting an over-MTU FEC control message, so the
-//     protected datagram should stay within one MTU.
+//   - Encrypted FEC packets.
 type FECConfig struct {
 	// Columns is L, the matrix width (the spacing between a column's packets).
 	Columns int

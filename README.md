@@ -210,12 +210,14 @@ tx, _ := ristgo.Dial(ctx, "host:5000", ristgo.WithFEC(10, 5)) // 10x5 matrix
 // ristgo.WithColumnOnlyFEC() for 1-D column-only (half the overhead)
 ```
 
-Two carriages (`FECConfig.Carriage`): standard ST 2022-1 on dedicated UDP ports
-(the media port + 2 / + 4 — the interoperable form), or, on the Advanced profile,
-in-band control messages on the data port (TR-06-3 §5.3.5). `Stats.FECRecovered`
-counts packets reconstructed by FEC. libRIST does not implement FEC, so this is a
-ristgo capability (interoperable with other ST 2022-1 receivers on the separate-port
-carriage).
+FEC works on every profile. The Simple and Main profiles carry standard ST 2022-1
+FEC over the RTP payload on two dedicated UDP ports (the media port plus 2 for
+column, plus 4 for row), the form that interoperates with any ST 2022-1 receiver.
+The Advanced profile instead carries FEC in-band as control messages on the data
+port (TR-06-3 §5.3.5), computed over the full encrypted datagram so it composes with
+payload fragmentation and PSK encryption. `FECConfig.Carriage` selects between them
+when both apply; the default is in-band for Advanced and separate ports otherwise.
+`Stats.FECRecovered` counts packets reconstructed by FEC.
 
 ### Source-adaptive bitrate (TR-06-4 Part 1)
 
