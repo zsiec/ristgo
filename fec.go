@@ -36,9 +36,17 @@ import (
 // Set [FECConfig.Variant] to [FECVariant2022_5] for the high-bit-rate ST 2022-5 wire
 // format (SMPTE ST 2022-5:2013 §7.3), which raises the matrix ceiling to L*D <= 6000.
 //
-// # Not yet supported
+// # FEC packet encryption
 //
-//   - Encrypted FEC packets.
+// ristgo does not separately encrypt or MAC the FEC packets, which TR-06-3 §5.3.5
+// permits ("senders may encrypt the FEC packets") and notes is "not technically
+// necessary, as they are computed over the already-encrypted content." The Advanced
+// in-band FEC is the XOR of the encrypted datagrams, so it carries no plaintext, and
+// a recovered datagram is re-decrypted through the normal AEAD path: a forged or
+// corrupted FEC packet yields a datagram whose AEAD tag fails and is rejected, so
+// recovery integrity comes from the data-layer AEAD rather than a separate FEC MAC
+// (the HMAC-SHA256-on-FEC recommendation applies to the AES-CTR-HMAC cipher, which
+// ristgo does not use). A peer that does encrypt its FEC packets is not interoperable.
 type FECConfig struct {
 	// Columns is L, the matrix width (the spacing between a column's packets).
 	Columns int
