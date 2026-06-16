@@ -115,6 +115,10 @@ const fecMaxCtrlBody = 1400
 
 // sendFEC transmits one FEC packet via the configured carriage.
 func (s *Session) sendFEC(now clock.Timestamp, fp fec.Packet) {
+	if s.bond != nil {
+		s.sendBondFEC(now, fp) // fan the FEC packet across the bonded paths
+		return
+	}
 	if !s.peer.Media.IsValid() {
 		return
 	}

@@ -226,11 +226,9 @@ dimensions, L×D ≤ 6000) for interop with ST 2022-5 / ST 2022-6 equipment.
 `Stats.FECRecovered` counts packets reconstructed by FEC.
 
 FEC is configured programmatically (`WithFEC` / `WithFEC2022_5`), not through the
-`rist://` URL. ristgo does not currently support FEC together with link bonding and
-rejects the combination at configuration time. This is an implementation limitation,
-not a spec restriction: SMPTE 2022-7 and ST 2022-1/5 FEC are orthogonal and the spec
-permits combining FEC with other recovery mechanisms; the bonded send path simply does
-not yet feed the FEC encoder.
+`rist://` URL. It composes with link bonding: a bonded sender fans its FEC across
+every path, and the receiver recovers a packet lost on every path at once, the
+correlated loss SMPTE 2022-7 duplication alone cannot cover.
 
 ### Source-adaptive bitrate (TR-06-4 Part 1)
 

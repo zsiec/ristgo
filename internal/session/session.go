@@ -114,6 +114,11 @@ type Config struct {
 	// The session owns and closes them.
 	FECColumn, FECRow *net.UDPConn
 
+	// FECSockets are a bonded receiver's per-path column/row FEC sockets for the
+	// separate-port carriage (two per path, all feeding the one FEC decoder). The
+	// session owns and closes them. nil on a single-path session or a sender.
+	FECSockets []*net.UDPConn
+
 	// OneWay runs the session as one-way / no-return-channel transport: the
 	// host emits no RTCP at all (no Sender/Receiver Reports, SDES, NACKs, RTT
 	// echoes, keepalives, GRE keepalives, LQM, or buffer negotiation), only
@@ -277,6 +282,7 @@ type Session struct {
 	// FEC sockets; fecIn forwards their RTP-stripped FEC bodies to the loop; the
 	// per-stream RTP sequence counters number the outbound FEC streams.
 	fecCol, fecRow       *net.UDPConn
+	fecSockets           []*net.UDPConn // bonded receiver's per-path FEC sockets
 	fecIn                chan []byte
 	fecColSeq, fecRowSeq uint16
 	fecCtrlReasm         fragReassembler // reassembles over-MTU in-band FEC control messages
@@ -578,7 +584,8 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	// Separate-port FEC carriage: the receiver binds column/row FEC sockets and
 	// forwards their bodies to the loop over fecIn (created before the loop starts).
 	s.fecCol, s.fecRow = cfg.FECColumn, cfg.FECRow
-	if s.fecCol != nil {
+	s.fecSockets = cfg.FECSockets
+	if s.fecCol != nil || len(s.fecSockets) > 0 {
 		s.fecIn = make(chan []byte, 64)
 	}
 	s.authed.Store(true) // no EAP gate by default (Simple, or Main without auth)
@@ -640,6 +647,10 @@ func (s *Session) start() {
 		s.wg.Add(2)
 		go s.readFEC(s.fecCol)
 		go s.readFEC(s.fecRow)
+	}
+	for _, c := range s.fecSockets { // bonded separate-port FEC: one reader per path socket
+		s.wg.Add(1)
+		go s.readFEC(c)
 	}
 	if s.injected {
 		return // a MultiReceiver owns the socket read and feeds Inject*

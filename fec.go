@@ -19,10 +19,10 @@ import (
 // default ST 2022-1, L in [1,20] (column-only) or [4,20] (2-D), D in [4,20], and
 // L*D <= 100; for ST 2022-5, L in [1,1020] or [4,1020], D in [4,255], L*D <= 6000.
 //
-// FEC is not currently supported together with link bonding: the bonded send path
-// does not feed the FEC encoder, so a bonded sender with FEC set is rejected. This is
-// an implementation limitation, not a spec restriction (SMPTE 2022-7 and ST 2022-1/5
-// FEC are orthogonal and composable).
+// FEC composes with link bonding: a bonded sender fans its FEC across every path
+// (in-band on the Advanced profile, on the per-path column/row ports on Simple and
+// Main), and the receiver recovers a packet lost on every path at once, the
+// correlated loss SMPTE 2022-7 duplication cannot cover.
 //
 // # Domain and interop
 //
@@ -38,8 +38,6 @@ import (
 //
 // # Not yet supported
 //
-//   - FEC together with link bonding (2022-7 duplication already provides seamless
-//     multipath recovery) is rejected by validation.
 //   - Encrypted FEC packets.
 type FECConfig struct {
 	// Columns is L, the matrix width (the spacing between a column's packets).

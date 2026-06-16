@@ -6,9 +6,11 @@ import (
 	"github.com/zsiec/ristgo/internal/adv"
 	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/clock"
+	"github.com/zsiec/ristgo/internal/fec"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/peer"
 	"github.com/zsiec/ristgo/internal/rtcp"
+	"github.com/zsiec/ristgo/internal/rtp"
 	"github.com/zsiec/ristgo/internal/socket"
 	"github.com/zsiec/ristgo/internal/wire"
 )
@@ -69,6 +71,12 @@ type bondState struct {
 
 	// peers tracks each path's learned/known addresses and liveness.
 	peers []*peer.Peer
+
+	// fecReasm reassembles over-MTU in-band FEC control messages per path: a bonded
+	// sender fans each FEC fragment to every path, so the receiver must reassemble
+	// each path's fragment run independently (a single shared reassembler would
+	// interleave fragments arriving on different paths). nil unless FEC is enabled.
+	fecReasm []fragReassembler
 }
 
 // NewBondedReceiver builds a Simple-profile bonded receiver: one socket per
@@ -79,6 +87,9 @@ func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *
 	s := newSession(conns[0], cfg, false)
 	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
 	bs := &bondState{group: group, conns: conns, peers: make([]*peer.Peer, len(conns))}
+	if cfg.FEC != nil {
+		bs.fecReasm = make([]fragReassembler, len(conns))
+	}
 	for i := range conns {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
 		// Register the path with the default duplicate weight / priority 0 unless
@@ -100,6 +111,9 @@ func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bond
 	s := newSession(conn, cfg, true)
 	s.flow = flow.New(flow.RoleSender, cfg.Flow)
 	bs := &bondState{group: group, conns: []*socket.Conn{conn}, remotes: remotes, peers: make([]*peer.Peer, len(remotes))}
+	if cfg.FEC != nil {
+		bs.fecReasm = make([]fragReassembler, len(remotes))
+	}
 	for i := range remotes {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
 		bs.peers[i].Media = remotes[i][0]
@@ -243,6 +257,9 @@ func (s *Session) handleBondSimple(now clock.Timestamp, idx uint8, p *peer.Peer,
 	p.LearnMedia(bi.src)
 	if pkt, err := s.mdec.decode(bi.data); err == nil {
 		s.feedMedia(now, idx, pkt)
+		if s.fecEnabled() {
+			s.fecRecvRTP(now, uint32(s.mdec.refTicks), pkt)
+		}
 	}
 }
 
@@ -264,6 +281,9 @@ func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, b
 	}
 	if isMedia {
 		s.feedMedia(now, idx, pkt)
+		if s.fecEnabled() {
+			s.fecRecvRTP(now, uint32(s.main.dec.refTicks), pkt)
+		}
 		return
 	}
 	s.bondObserveRTT(now, idx, fbs)
@@ -283,9 +303,18 @@ func (s *Session) handleBondAdv(now clock.Timestamp, idx uint8, p *peer.Peer, bi
 					s.handleBondAdvGRE(now, idx, pr.Payload)
 					return
 				}
+				// In-band SMPTE 2022 FEC control message (TR-06-3 §5.3.5): route to
+				// the FEC decoder, reassembling a fragmented one per path.
+				if s.fecEnabled() && pr.EncType == adv.TypeControl {
+					s.handleBondFECControl(now, idx, pr)
+					return
+				}
 				if isMedia, pkt, fbs, derr := s.adv.decodeParsed(pr); derr == nil {
 					if isMedia {
 						s.feedMedia(now, idx, pkt)
+						if s.fecEnabled() {
+							s.fecRecvAdv(now, pkt.Seq, data) // FEC over the full datagram
+						}
 					} else {
 						s.bondObserveRTT(now, idx, dropAdvEchoRequests(fbs))
 					}
@@ -386,6 +415,121 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		}
 	}
 	s.lastTx = now
+	if s.fecEnabled() {
+		s.fecOnSend(now, pkt, b) // generate row/column FEC and fan it across the paths
+	}
+}
+
+// sendBondFEC fans one FEC packet across the bonded paths in the configured
+// carriage. FEC protects the source stream, which every path carries (2022-7
+// duplication), so the FEC is duplicated the same way media is: to every sendable
+// duplicate path plus the elected weighted path. The receiver feeds all paths'
+// media and FEC into the one per-session decoder, which dedups by sequence, so FEC
+// recovers only the rare loss that struck every path at once.
+func (s *Session) sendBondFEC(now clock.Timestamp, fp fec.Packet) {
+	if s.cfg.FEC.SeparatePorts {
+		s.sendBondFECSeparate(now, fp)
+		return
+	}
+	rowCI, colCI := s.fecControlIndices()
+	ci := colCI
+	if fp.Direction == fec.Row {
+		ci = rowCI
+	}
+	body := adv.BuildControl(nil, ci, fp.Data)
+	if len(body) <= fecMaxCtrlBody {
+		s.writeBondFECControl(now, body, true, true)
+		return
+	}
+	for off := 0; off < len(body); off += fecMaxCtrlBody {
+		end := off + fecMaxCtrlBody
+		if end > len(body) {
+			end = len(body)
+		}
+		s.writeBondFECControl(now, body[off:end], off == 0, end == len(body))
+	}
+}
+
+// writeBondFECControl frames one (possibly fragmented) in-band FEC control message
+// and fans it across the paths.
+func (s *Session) writeBondFECControl(now clock.Timestamp, body []byte, first, last bool) {
+	b, err := s.adv.frameControlFrag(s.fecBuf[:0], body, first, last, advCtrlTS(now))
+	if err != nil {
+		s.logf("bond fec: frame control: %v", err)
+		return
+	}
+	s.fecBuf = b
+	s.fanBondPaths(now, func(media netip.AddrPort) {
+		if werr := s.bond.conns[0].WriteMedia(b, media); werr != nil {
+			s.logf("bond: write fec control: %v", werr)
+		}
+	})
+}
+
+// sendBondFECSeparate wraps a FEC packet in an RTP header (standard ST 2022-x) and
+// fans it to each path's column/row FEC port (the path's media port + 2 / + 4).
+func (s *Session) sendBondFECSeparate(now clock.Timestamp, fp fec.Packet) {
+	seqp := &s.fecColSeq
+	off := uint16(fecColumnPortOffset)
+	if fp.Direction == fec.Row {
+		seqp = &s.fecRowSeq
+		off = fecRowPortOffset
+	}
+	p := rtp.Packet{
+		Header:  rtp.Header{Version: rtp.Version, PayloadType: fecPT, SequenceNumber: *seqp, SSRC: s.cfg.SSRC},
+		Payload: fp.Data,
+	}
+	*seqp++
+	b, err := p.AppendTo(s.fecBuf[:0])
+	if err != nil {
+		s.logf("bond fec: rtp wrap: %v", err)
+		return
+	}
+	s.fecBuf = b
+	s.fanBondPaths(now, func(media netip.AddrPort) {
+		dst := netip.AddrPortFrom(media.Addr(), media.Port()+off)
+		if werr := s.bond.conns[0].WriteMedia(b, dst); werr != nil {
+			s.logf("bond: write fec separate: %v", werr)
+		}
+	})
+}
+
+// fanBondPaths invokes write with the media address of each path a media datagram
+// would currently be sent to: every sendable 2022-7 duplicate path plus the elected
+// weighted load-share path.
+func (s *Session) fanBondPaths(now clock.Timestamp, write func(media netip.AddrPort)) {
+	for i := range s.bond.remotes {
+		if !s.bond.group.ShouldDuplicate(uint8(i), now) {
+			continue
+		}
+		write(s.bond.remotes[i][0])
+	}
+	if idx, ok := s.bond.group.SelectWeighted(now); ok && int(idx) < len(s.bond.remotes) {
+		write(s.bond.remotes[idx][0])
+	}
+}
+
+// handleBondFECControl reassembles a (possibly fragmented) in-band FEC control
+// message arriving on path idx and feeds its FEC body to the decoder. Each path is
+// reassembled independently because the sender duplicates every fragment to all
+// paths, so a single shared reassembler would interleave their runs.
+func (s *Session) handleBondFECControl(now clock.Timestamp, idx uint8, pr adv.Parsed) {
+	if int(idx) >= len(s.bond.fecReasm) {
+		return
+	}
+	if !pr.FirstFrag || !pr.LastFrag {
+		full, ok := s.bond.fecReasm[idx].push(fecFragRole(pr.FirstFrag, pr.LastFrag), pr.Payload, false)
+		if !ok {
+			return
+		}
+		if ci, body, cerr := adv.ParseControl(full); cerr == nil && s.fecControlIndex(ci) {
+			s.fecOnRecvFEC(now, body)
+		}
+		return
+	}
+	if ci, body, cerr := adv.ParseControl(pr.Payload); cerr == nil && s.fecControlIndex(ci) {
+		s.fecOnRecvFEC(now, body)
+	}
 }
 
 // sendBondFeedback transmits drained feedback. A sender sends its compound on

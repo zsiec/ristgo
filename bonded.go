@@ -179,8 +179,63 @@ func newBondedReceiver(addrs []string, priorities []uint32, cfg Config) (*Bonded
 		closeConns(conns)
 		return nil, err
 	}
+	// Separate-port FEC (Simple/Main bonding) binds dedicated column/row sockets next
+	// to each path's media port; the Advanced profile carries FEC in-band and needs
+	// none. The session owns and closes them.
+	if cfg.FEC != nil && cfg.FEC.carriage(cfg.Profile == ProfileAdvanced) == FECCarriageSeparatePorts {
+		if err := bindBondFECSockets(&sc, addrs, cfg); err != nil {
+			closeConns(conns)
+			return nil, err
+		}
+	}
 	sess := session.NewBondedReceiver(conns, bondingGroupWith(cfg, priorities, nil), sc)
 	return &BondedReceiver{sess: sess}, nil
+}
+
+// bindBondFECSockets binds a column (media port + 2) and row (media port + 4) FEC
+// socket for every bonded receiver path, storing them on the session config. On any
+// error it closes whatever it has already bound and leaves sc untouched.
+func bindBondFECSockets(sc *session.Config, addrs []string, cfg Config) error {
+	var bound []*net.UDPConn
+	for i, a := range addrs {
+		host, port, err := bondPathHostPort(a, cfg.Profile)
+		if err != nil {
+			closeUDPConns(bound)
+			return err
+		}
+		col, err := socket.BindUDP(host, port+2)
+		if err != nil {
+			closeUDPConns(bound)
+			return fmt.Errorf("rist: bind column FEC port %d for bonded path %d: %w", port+2, i, err)
+		}
+		row, err := socket.BindUDP(host, port+4)
+		if err != nil {
+			col.Close()
+			closeUDPConns(bound)
+			return fmt.Errorf("rist: bind row FEC port %d for bonded path %d: %w", port+4, i, err)
+		}
+		bound = append(bound, col, row)
+	}
+	sc.FECSockets = bound
+	return nil
+}
+
+// bondPathHostPort resolves a bonded path address to its host and media port: the
+// even media port for the Simple profile, the single tunnel port otherwise.
+func bondPathHostPort(addr string, profile Profile) (string, int, error) {
+	if profile == ProfileSimple {
+		return resolveMediaPort(addr)
+	}
+	return resolveSinglePort(addr)
+}
+
+// closeUDPConns closes every non-nil UDP socket in cs.
+func closeUDPConns(cs []*net.UDPConn) {
+	for _, c := range cs {
+		if c != nil {
+			c.Close()
+		}
+	}
 }
 
 // NewBondedSender dials a bonded sender to addrs, duplicating every payload to
@@ -290,13 +345,6 @@ func bondedSupported(cfg Config) error {
 	}
 	if cfg.Username != "" {
 		return fmt.Errorf("%w: bonded EAP-SRP authentication is not supported", ErrInvalidConfig)
-	}
-	if cfg.FEC != nil {
-		// The bonded send path does not feed the FEC encoder, so FEC would silently
-		// do nothing over a bonded session. This is an implementation limitation, not
-		// a spec restriction: SMPTE 2022-7 and ST 2022-1/5 FEC are orthogonal and may
-		// be combined. Reject the combination rather than silently drop FEC.
-		return fmt.Errorf("%w: FEC is not currently supported together with link bonding", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -409,7 +457,11 @@ func (r *BondedReceiver) SetReadDeadline(t time.Time) error {
 }
 
 // Stats returns a snapshot of the merged flow's counters.
-func (r *BondedReceiver) Stats() Stats { return toStats(r.sess.Stats()) }
+func (r *BondedReceiver) Stats() Stats {
+	st := toStats(r.sess.Stats())
+	st.FECRecovered = r.sess.FECRecovered()
+	return st
+}
 
 // Close stops the receiver and releases every path's sockets and goroutines.
 func (r *BondedReceiver) Close() error {

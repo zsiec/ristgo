@@ -284,6 +284,9 @@ func (s *Session) shutdown(reason error) {
 		if s.fecRow != nil {
 			s.fecRow.Close()
 		}
+		for _, c := range s.fecSockets { // bonded per-path FEC sockets, owned by the session
+			c.Close()
+		}
 		// An injected (MultiReceiver-driven) session never owns its socket(s); the
 		// MultiReceiver closes them.
 	})
