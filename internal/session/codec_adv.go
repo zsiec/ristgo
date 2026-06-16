@@ -512,6 +512,13 @@ func (c *advCodec) encodeFeedback(fbs []wire.Feedback, bitmask bool, ts uint32) 
 // CONTROL, no encryption, no compression, F=L=E=1. The control sequence counter
 // advances once per call.
 func (c *advCodec) frameControl(dst, payload []byte, ts uint32) ([]byte, error) {
+	return c.frameControlFrag(dst, payload, true, true, ts)
+}
+
+// frameControlFrag is frameControl with explicit fragment roles: a control message
+// larger than the MTU is split across consecutive control packets carrying the
+// F/L bits (TR-06-3 §5.2.3), which the receiver reassembles before processing.
+func (c *advCodec) frameControlFrag(dst, payload []byte, first, last bool, ts uint32) ([]byte, error) {
 	seq := c.ctrlSeq
 	c.ctrlSeq++
 	params := adv.Params{
@@ -521,8 +528,8 @@ func (c *advCodec) frameControl(dst, payload []byte, ts uint32) ([]byte, error) 
 		EncType:   adv.TypeControl,
 		PSKMode:   adv.PSKNone,
 		LPCMode:   adv.LPCNone,
-		FirstFrag: true,
-		LastFrag:  true,
+		FirstFrag: first,
+		LastFrag:  last,
 		Expedite:  true,
 	}
 	return adv.Build(dst, params, payload)

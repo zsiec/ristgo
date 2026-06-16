@@ -279,6 +279,7 @@ type Session struct {
 	fecCol, fecRow       *net.UDPConn
 	fecIn                chan []byte
 	fecColSeq, fecRowSeq uint16
+	fecCtrlReasm         fragReassembler // reassembles over-MTU in-band FEC control messages
 
 	// advGRE is the Main-profile GRE control substrate used in Advanced mode.
 	// libRIST's Advanced profile begins with the Main-profile GRE handshake —
@@ -1172,8 +1173,19 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 					return
 				}
 				// SMPTE 2022-1 FEC control message: route to the FEC decoder rather
-				// than the feedback path (it is neither media nor RTCP feedback).
+				// than the feedback path (it is neither media nor RTCP feedback). A
+				// fragmented control message (only FEC messages are fragmented) is
+				// reassembled before its FEC body is decoded.
 				if s.fecEnabled() && p.EncType == adv.TypeControl {
+					if !p.FirstFrag || !p.LastFrag {
+						full, ok := s.fecCtrlReasm.push(fecFragRole(p.FirstFrag, p.LastFrag), p.Payload, false)
+						if ok {
+							if ci, body, cerr := adv.ParseControl(full); cerr == nil && fecIsControlIndex(ci) {
+								s.fecOnRecvFEC(now, body)
+							}
+						}
+						return
+					}
 					if ci, body, cerr := adv.ParseControl(p.Payload); cerr == nil && fecIsControlIndex(ci) {
 						s.fecOnRecvFEC(now, body)
 						return

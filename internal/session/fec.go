@@ -97,6 +97,12 @@ func (s *Session) fecOnSend(now clock.Timestamp, pkt wire.MediaPacket, datagram 
 	}
 }
 
+// fecMaxCtrlBody bounds the control-message body carried in one in-band FEC packet
+// so the framed datagram stays within a typical MTU; a larger FEC message (the
+// Advanced full-datagram FEC of a near-MTU payload) is fragmented across control
+// packets (TR-06-3 §5.3.5 -> §5.2.3).
+const fecMaxCtrlBody = 1400
+
 // sendFEC transmits one FEC packet via the configured carriage.
 func (s *Session) sendFEC(now clock.Timestamp, fp fec.Packet) {
 	if !s.peer.Media.IsValid() {
@@ -110,7 +116,25 @@ func (s *Session) sendFEC(now clock.Timestamp, fp fec.Packet) {
 	if fp.Direction == fec.Row {
 		ci = adv.CIFEC20221Row
 	}
-	b, err := s.adv.frameControl(s.fecBuf[:0], adv.BuildControl(nil, ci, fp.Data), advCtrlTS(now))
+	body := adv.BuildControl(nil, ci, fp.Data)
+	if len(body) <= fecMaxCtrlBody {
+		s.writeFECControl(body, true, true, now)
+		return
+	}
+	// Over-MTU FEC control message: fragment the body across consecutive control
+	// packets carrying the F/L bits; the receiver reassembles before decoding.
+	for off := 0; off < len(body); off += fecMaxCtrlBody {
+		end := off + fecMaxCtrlBody
+		if end > len(body) {
+			end = len(body)
+		}
+		s.writeFECControl(body[off:end], off == 0, end == len(body), now)
+	}
+}
+
+// writeFECControl frames one (possibly fragmented) FEC control message and sends it.
+func (s *Session) writeFECControl(body []byte, first, last bool, now clock.Timestamp) {
+	b, err := s.adv.frameControlFrag(s.fecBuf[:0], body, first, last, advCtrlTS(now))
 	if err != nil {
 		s.logf("fec: frame control: %v", err)
 		return
@@ -144,6 +168,21 @@ func (s *Session) sendFECSeparate(fp fec.Packet) {
 	s.fecBuf = b
 	if err := s.conn.WriteMedia(b, dst); err != nil {
 		s.logAt(LogWarning, CatSocket, "fec: write separate: %v", err)
+	}
+}
+
+// fecFragRole maps the Advanced F/L bits of a fragmented FEC control packet to the
+// reassembler's fragment role.
+func fecFragRole(first, last bool) wire.FragRole {
+	switch {
+	case first && last:
+		return wire.FragStandalone
+	case first:
+		return wire.FragFirst
+	case last:
+		return wire.FragLast
+	default:
+		return wire.FragMiddle
 	}
 }
 
