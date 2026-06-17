@@ -239,6 +239,67 @@ func TestHandshakeSuccess(t *testing.T) {
 	t.Logf("transcript: %v", transcript)
 }
 
+// sameReply reports whether two reply frames marshal identically (both nil counts as
+// equal). Used to assert a retransmit replays the cached reply byte-for-byte.
+func sameReply(a, b *Frame) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return bytes.Equal(a.AppendTo(nil), b.AppendTo(nil))
+}
+
+// TestRetransmittedFramesReplayIdempotently drives the full handshake but delivers
+// EVERY frame twice (a peer retransmit under loss). The duplicate must replay a
+// byte-identical reply — proving the state machine does not recompute a fresh SRP
+// ephemeral on a retransmit — and the handshake must still complete with agreeing keys.
+func TestRetransmittedFramesReplayIdempotently(t *testing.T) {
+	const user, pass = "rist", "mainprofile"
+	salt := mustHex(t, "72F9D5383B7EB7599FB63028F47475B60A55F313D40E0BE023E026C97C0A2C32")
+	verifier := srp.MakeVerifier(srp.DefaultGroup(), user, pass, salt)
+
+	authee, err := NewAuthenticatee(user, pass)
+	if err != nil {
+		t.Fatalf("NewAuthenticatee: %v", err)
+	}
+	auth, err := NewAuthenticator(StaticVerifier(user, verifier, salt))
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+
+	cur := authee.Start()
+	turn := serverTurn // the authenticator receives START first
+	for steps := 0; steps < 16; steps++ {
+		wire := cur.AppendTo(nil)
+		var first, dup *Frame
+		var e1, e2 error
+		if turn == serverTurn {
+			first, e1 = auth.Recv(wire)
+			dup, e2 = auth.Recv(wire) // exact retransmit
+		} else {
+			first, e1 = authee.Recv(wire)
+			dup, e2 = authee.Recv(wire) // exact retransmit
+		}
+		if e1 != nil || e2 != nil {
+			t.Fatalf("step %d (%s): recv error: %v / %v", steps, cur.Kind, e1, e2)
+		}
+		if !sameReply(first, dup) {
+			t.Fatalf("step %d (%s): retransmit did not replay the identical reply", steps, cur.Kind)
+		}
+		if first == nil {
+			break
+		}
+		cur = *first
+		turn = !turn
+	}
+
+	if !authee.Authenticated() || !auth.Authenticated() {
+		t.Fatal("not authenticated under retransmitted frames")
+	}
+	if k1, k2 := authee.SessionKey(), auth.SessionKey(); len(k1) != 32 || !bytes.Equal(k1, k2) {
+		t.Fatal("session keys disagree despite duplicated frames")
+	}
+}
+
 type turnSide bool
 
 const serverTurn turnSide = true

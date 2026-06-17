@@ -334,6 +334,15 @@ type Session struct {
 	// listener authenticatee (listener-sender topology) cannot speak until it learns
 	// the caller, so the loop defers the Start until the peer's address is known.
 	eapStartSent bool
+	// eapLastTx is the last EAP frame transmitted (EAPOL-Start or a handshake reply),
+	// retransmitted on the keepalive tick until the handshake authenticates. EAP frames
+	// are not ARQ-protected, so without this a single dropped handshake datagram would
+	// deadlock auth under loss; the peer replays its reply idempotently (eap.Recv), so a
+	// retransmit cannot desync the SRP exchange.
+	eapLastTx *eap.Frame
+	// eapRetx counts consecutive keepalive-driven EAP retransmits with no intervening
+	// inbound EAP frame; reset whenever the peer advances the exchange. Caps a stall.
+	eapRetx int
 	// peerCNAME is the peer's RTCP SDES canonical name, recorded ONLY from an
 	// authenticated EAP-SRP session (forgeable otherwise). It is the identity key for
 	// NAT source-port rebind re-association (see maybeReassociate). Empty until learned.
@@ -914,6 +923,26 @@ func (s *Session) loop() {
 				} else {
 					s.shutdown(s.cfg.ErrSessionTimeout)
 					return
+				}
+			}
+			// Retransmit the outstanding EAP frame until the handshake authenticates.
+			// EAP-SRP frames are not ARQ-protected, so without this a single dropped
+			// handshake datagram deadlocks auth under loss; the peer replays its reply
+			// idempotently (eap.Recv), so a retransmit never desyncs the SRP exchange.
+			// Runs during the initial handshake AND a re-auth (media held either way). A
+			// stalled handshake that never advances is abandoned at the retry cap: an
+			// initial failure tears the session down; a re-auth is already bounded by
+			// reauthDeadline.
+			if !s.authed.Load() && (s.eapClient != nil || s.eapServer != nil) &&
+				s.peer.Media.IsValid() && s.eapLastTx != nil {
+				if s.eapRetx >= maxEAPRetx {
+					if !s.everAuthed {
+						s.shutdown(s.cfg.ErrAuth)
+						return
+					}
+				} else {
+					s.eapRetx++
+					s.sendEAP(*s.eapLastTx, now)
 				}
 			}
 			// Emit a periodic keepalive. Bonding ages its paths and sends every
@@ -1666,6 +1695,8 @@ func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 			Done() bool
 		}
 	)
+	// An inbound EAP frame is forward progress: reset the retransmit budget.
+	s.eapRetx = 0
 	switch {
 	case s.eapClient != nil:
 		out, err = s.eapClient.Recv(payload)
@@ -1846,6 +1877,7 @@ func (s *Session) maybeStartEAP(now clock.Timestamp) {
 	}
 	s.sendEAP(s.eapClient.Start(), now)
 	s.eapStartSent = true
+	s.eapRetx = 0
 }
 
 // handleMainDatagram processes one inbound Main-profile datagram. It first offers it to the
@@ -2013,6 +2045,7 @@ func (s *Session) reauthTimeout() clock.Microseconds {
 // startReauth re-opens the EAP-SRP handshake to the (migrated) peer: the authenticatee
 // re-emits its EAPOL-Start; the authenticator re-issues an IDENTITY REQUEST.
 func (s *Session) startReauth(now clock.Timestamp) {
+	s.eapRetx = 0
 	switch {
 	case s.eapClient != nil:
 		s.eapStartSent = false
@@ -2028,6 +2061,10 @@ func (s *Session) sendEAP(f eap.Frame, now clock.Timestamp) {
 	if s.main == nil || !s.peer.Media.IsValid() {
 		return
 	}
+	// Remember this frame as the outstanding one to retransmit under loss (re-marshaling
+	// it yields byte-identical EAP payload, which the peer replays idempotently).
+	ff := f
+	s.eapLastTx = &ff
 	s.rtcpBuf = s.rtcpBuf[:0]
 	b, err := s.main.encodeEAPOL(s.rtcpBuf, f.AppendTo(nil))
 	if err != nil {
@@ -2040,6 +2077,11 @@ func (s *Session) sendEAP(f eap.Frame, now clock.Timestamp) {
 	}
 	s.lastTx = now
 }
+
+// maxEAPRetx caps consecutive keepalive-driven EAP retransmits with no inbound EAP
+// frame before a stalled handshake is abandoned (re-armed on any peer progress). At the
+// 1 s default keepalive this is a generous multi-round-trip budget.
+const maxEAPRetx = 16
 
 // pushApp feeds one application payload to the flow core, splitting it across
 // consecutive sequences when fragmentation is enabled (Advanced profile) and

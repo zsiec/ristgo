@@ -1,12 +1,24 @@
 package eap
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"errors"
 
 	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/srp"
 )
+
+// cloneFrame returns a shallow copy of f (a fresh header sharing the same read-only
+// payload slices), or nil. Used to replay a cached reply for a retransmitted frame
+// without handing out the cached pointer itself.
+func cloneFrame(f *Frame) *Frame {
+	if f == nil {
+		return nil
+	}
+	c := *f
+	return &c
+}
 
 // State is the EAP authentication state of a role, mirroring libRIST's
 // EAP_AUTH_STATE_*. The wire timers and retry counts that drive the full
@@ -110,6 +122,13 @@ type Authenticatee struct {
 	// validator on reaching SUCCESS). pwReqActive gates the matching response.
 	pwReqID     uint8
 	pwReqActive bool
+
+	// lastRx/lastReply cache the last processed frame and the reply it produced. A
+	// byte-identical re-arrival (a peer retransmit under loss) replays lastReply
+	// without re-running the state machine, which would recompute a fresh SRP
+	// ephemeral a and desync. See Recv.
+	lastRx    []byte
+	lastReply *Frame
 }
 
 // NewAuthenticatee creates an EAP-SRP client for the given credentials. The
@@ -217,6 +236,10 @@ func (a *Authenticatee) Restart() {
 	a.salt = nil
 	a.session = nil
 	a.pwReqActive = false
+	// Drop the retransmit-replay cache: a fresh handshake must not replay a reply from
+	// the previous one.
+	a.lastRx = nil
+	a.lastReply = nil
 }
 
 // Recv processes one received EAPOL frame (raw wire bytes as delivered out of
@@ -225,11 +248,23 @@ func (a *Authenticatee) Restart() {
 // send. It never panics on arbitrary input. On a definitive authentication
 // failure it sets the state to StateFailed and returns ErrAuthFailed.
 func (a *Authenticatee) Recv(payload []byte) (out *Frame, err error) {
+	// Retransmit idempotency: an exact duplicate of the last processed frame replays
+	// the cached reply without re-running the state machine (which would rebuild the
+	// SRP client with a fresh ephemeral a and desync). This makes the handshake
+	// recoverable when EAPOL datagrams are dropped.
+	if len(payload) > 0 && a.lastRx != nil && bytes.Equal(a.lastRx, payload) {
+		return cloneFrame(a.lastReply), nil
+	}
 	f, err := Parse(payload)
 	if err != nil {
 		return nil, err
 	}
-	return a.handle(f)
+	out, err = a.handle(f)
+	if err == nil { // never replay a terminal error
+		a.lastRx = append([]byte(nil), payload...)
+		a.lastReply = out
+	}
+	return out, err
 }
 
 // negotiatedVersion returns the EAPOL version to emit in reply to req: the peer's
@@ -510,6 +545,12 @@ type Authenticator struct {
 	// with a bit-7 PASSWORD_RESPONSE (process_eap_request_srp_passphrase), which is
 	// how the authenticatee confirms its RX key.
 	keying keying
+
+	// lastRx/lastReply cache the last processed frame and the reply it produced; a
+	// byte-identical re-arrival replays lastReply rather than rebuilding the SRP server
+	// with a fresh ephemeral B. See Recv.
+	lastRx    []byte
+	lastReply *Frame
 }
 
 // NewAuthenticator creates an EAP-SRP server that resolves verifiers via the
@@ -621,6 +662,10 @@ func (a *Authenticator) Restart() {
 	a.session = nil
 	a.verified = false
 	a.id++
+	// Drop the retransmit-replay cache: a fresh re-auth must not replay a reply from
+	// the previous handshake.
+	a.lastRx = nil
+	a.lastReply = nil
 }
 
 // Recv processes one received EAPOL frame and returns the frame to transmit in
@@ -628,11 +673,23 @@ func (a *Authenticator) Restart() {
 // (unknown user or a failed client proof) it sets StateFailed; a failed proof
 // also yields an EAP-FAILURE frame to send and ErrAuthFailed.
 func (a *Authenticator) Recv(payload []byte) (out *Frame, err error) {
+	// Retransmit idempotency: an exact duplicate of the last processed frame replays
+	// the cached reply without re-running the state machine (which would rebuild the
+	// SRP server with a fresh ephemeral B and desync). This makes the handshake
+	// recoverable when EAPOL datagrams are dropped.
+	if len(payload) > 0 && a.lastRx != nil && bytes.Equal(a.lastRx, payload) {
+		return cloneFrame(a.lastReply), nil
+	}
 	f, err := Parse(payload)
 	if err != nil {
 		return nil, err
 	}
-	return a.handle(f)
+	out, err = a.handle(f)
+	if err == nil { // never replay a terminal error / FAILURE
+		a.lastRx = append([]byte(nil), payload...)
+		a.lastReply = out
+	}
+	return out, err
 }
 
 // handle drives the authenticator state machine for a parsed frame.
