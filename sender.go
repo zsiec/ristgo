@@ -132,7 +132,7 @@ func newSimpleSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
-	fc.StartSeq = randomStartSeq()
+	fc.StartSeq = randomStartSeq(cfg.SplitMode != SplitOff)
 	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.OneWay = oneWay
@@ -178,7 +178,7 @@ func newMainSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
-	fc.StartSeq = randomStartSeq()
+	fc.StartSeq = randomStartSeq(cfg.SplitMode != SplitOff)
 	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Main = mp
@@ -215,7 +215,7 @@ func newAdvSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
-	fc.StartSeq = randomStartSeq()
+	fc.StartSeq = randomStartSeq(cfg.SplitMode != SplitOff)
 	fc.NoRecovery = oneWay
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Adv = ap
@@ -279,7 +279,7 @@ func newSimpleListenerSender(addr string, cfg Config) (*Sender, error) {
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
-	fc.StartSeq = randomStartSeq()
+	fc.StartSeq = randomStartSeq(cfg.SplitMode != SplitOff)
 	sc := toSessionConfig(cfg, fc, ssrc)
 	applyRateAdapt(&sc, cfg)
 	sess := session.NewListenerSender(conn, sc)
@@ -308,7 +308,7 @@ func newMainListenerSender(addr string, cfg Config) (*Sender, error) {
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
-	fc.StartSeq = randomStartSeq()
+	fc.StartSeq = randomStartSeq(cfg.SplitMode != SplitOff)
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Main = mp
 	applyRateAdapt(&sc, cfg)
@@ -334,7 +334,7 @@ func newAdvListenerSender(addr string, cfg Config) (*Sender, error) {
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
-	fc.StartSeq = randomStartSeq()
+	fc.StartSeq = randomStartSeq(cfg.SplitMode != SplitOff)
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.Adv = ap
 	applyRateAdapt(&sc, cfg)

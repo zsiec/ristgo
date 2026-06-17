@@ -149,6 +149,12 @@ type mainCodec struct {
 	// steady-state feedback path allocates no wire.PeerIdentity per datagram.
 	lastRxCNAME string
 
+	// peerCaps holds the capability bits from the most recently decoded v2 (VSF)
+	// keepalive, for the session to drive merge=auto (the L bit). A v1 keepalive
+	// surfaces its caps directly through peekControl; a v2 one lands in decodeMain,
+	// which stashes it here. nil until a v2 keepalive is decoded.
+	peerCaps *gre.Capabilities
+
 	// bitmask selects the NACK wire encoding for outbound feedback: false for
 	// RIST range NACK (TR-06 default), true for RFC 4585 bitmask NACK.
 	bitmask bool
@@ -594,6 +600,18 @@ func (c *mainCodec) peekControl(b []byte) (kind controlKind, ka gre.Keepalive, v
 	return controlKeepalive, ka, version, err
 }
 
+// takePeerCaps returns the capability bits from a v2 (VSF) keepalive decoded since
+// the last call, clearing the stash. The session reads it after decodeMain to drive
+// merge=auto from the peer's pair-split (L) bit (a v1 keepalive uses peekControl).
+func (c *mainCodec) takePeerCaps() (gre.Capabilities, bool) {
+	if c.peerCaps == nil {
+		return gre.Capabilities{}, false
+	}
+	caps := *c.peerCaps
+	c.peerCaps = nil
+	return caps, true
+}
+
 // encodeOOB frames an out-of-band data payload (libRIST RIST_PAYLOAD_TYPE_DATA_OOB):
 // GRE framing carrying protType (FULL, 0x0800, by default) with NO reduced-overhead
 // header and NO RTP header — the raw OOB bytes follow the GRE header directly,
@@ -811,7 +829,16 @@ func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool,
 			}
 			return nil, false, encrypted, &parsed, nil
 		default:
-			// Keepalive or any other control subtype: served at the peer layer.
+			// A v2 (VSF) keepalive carries no flow input, but its capability bits drive
+			// merge=auto (the L bit advertises pair-splitting). Stash them for the
+			// session via takePeerCaps; the v1 path uses peekControl. Any other control
+			// subtype is ignored.
+			if vsf.Subtype == gre.VSFSubtypeKeepalive {
+				if ka, kerr := gre.ParseKeepalive(region[vn:]); kerr == nil {
+					caps := ka.Caps
+					c.peerCaps = &caps
+				}
+			}
 			return nil, false, encrypted, nil, nil
 		}
 	}

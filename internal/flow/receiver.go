@@ -855,6 +855,7 @@ func (f *Flow) emitDeliver(s *slot) {
 	r := &f.receiver
 	f.events.push(Deliver{
 		Seq:           s.seq,
+		SourceTime:    s.sourceTime,
 		Payload:       s.payload,
 		Discontinuity: r.pendingDiscontinuity,
 		Frag:          s.frag,

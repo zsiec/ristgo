@@ -274,3 +274,46 @@ func TestNewSenderOddPortRejected(t *testing.T) {
 		t.Fatalf("error %v does not wrap ErrInvalidConfig", err)
 	}
 }
+
+func TestParseURLSplitMerge(t *testing.T) {
+	for _, c := range []struct {
+		q    string
+		want SplitMode
+	}{
+		{"split=off", SplitOff},
+		{"split=auto", SplitAuto},
+		{"split=ts", SplitAuto}, // libRIST alias for auto
+		{"split=half", SplitHalf},
+	} {
+		_, cfg, err := ParseURL("rist://h:5000?"+c.q, DefaultConfig())
+		if err != nil {
+			t.Fatalf("ParseURL %q: %v", c.q, err)
+		}
+		if cfg.SplitMode != c.want {
+			t.Fatalf("%q: SplitMode = %v, want %v", c.q, cfg.SplitMode, c.want)
+		}
+	}
+	for _, c := range []struct {
+		q    string
+		want MergeMode
+	}{
+		{"merge=off", MergeOff},
+		{"merge=pairs", MergePairs},
+		{"merge=auto", MergeAuto},
+	} {
+		_, cfg, err := ParseURL("rist://h:5000?"+c.q, DefaultConfig())
+		if err != nil {
+			t.Fatalf("ParseURL %q: %v", c.q, err)
+		}
+		if cfg.MergeMode != c.want {
+			t.Fatalf("%q: MergeMode = %v, want %v", c.q, cfg.MergeMode, c.want)
+		}
+	}
+	// Unknown mode words are rejected, not silently ignored.
+	if _, _, err := ParseURL("rist://h:5000?split=sometimes", DefaultConfig()); err == nil {
+		t.Fatal("split=sometimes must error")
+	}
+	if _, _, err := ParseURL("rist://h:5000?merge=both", DefaultConfig()); err == nil {
+		t.Fatal("merge=both must error")
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/zsiec/ristgo/internal/peer"
 	"github.com/zsiec/ristgo/internal/rtcp"
 	"github.com/zsiec/ristgo/internal/socket"
+	"github.com/zsiec/ristgo/internal/split"
 	"github.com/zsiec/ristgo/internal/wire"
 )
 
@@ -113,6 +114,14 @@ type Config struct {
 	// This is a ristgo<->ristgo capability: libRIST implements neither
 	// fragmentation nor reassembly.
 	FragmentSize int
+
+	// SplitMode (sender) and MergeMode (receiver) are the libRIST split=/merge=
+	// packet-split bonding modes: a split sender spreads each Write across a
+	// consecutive even/odd sequence pair (same source time); a merge receiver
+	// recombines the pair. Off (the default) disables them. They work on every
+	// profile and interoperate with libRIST.
+	SplitMode split.SplitMode
+	MergeMode split.MergeMode
 
 	// FEC, when non-nil, enables SMPTE ST 2022-1 forward error correction over the
 	// media stream (TR-06-3 §5.3.5). The sender emits row/column FEC packets and
@@ -457,6 +466,13 @@ type Session struct {
 	fragSize int
 	reasm    fragReassembler
 
+	// Packet split/merge bonding (libRIST split=/merge=, loop-owned). splitMode
+	// splits each Write across a consecutive even/odd sequence pair on the send
+	// side; merger recombines the pair on the receive side (after reassembly).
+	// merger is always non-nil (MergeOff when merging is disabled).
+	splitMode split.SplitMode
+	merger    *split.Merger
+
 	// statsVal is the published flow-stats snapshot, refreshed after every loop
 	// input by the loop goroutine and read by the public Stats(). It is guarded
 	// by statsMu rather than an atomic.Pointer so the per-input refresh reuses
@@ -632,6 +648,8 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		peer:      peer.New(cfg.SessionTimeout),
 		sender:    sender,
 		fragSize:  cfg.FragmentSize,
+		splitMode: cfg.SplitMode,
+		merger:    split.NewMerger(cfg.MergeMode),
 		timers:    make(map[flow.TimerID]clock.Timestamp),
 		mediaBuf:  make([]byte, 0, maxDatagram),
 		rtcpBuf:   make([]byte, 0, maxDatagram),
@@ -1565,6 +1583,11 @@ func (s *Session) localCaps() gre.Capabilities {
 	if s.fecEnabled() {
 		caps.P = true
 	}
+	// Advertise the pair-split capability (the L bit) when split mode is active, so a
+	// peer running merge=auto enables merging.
+	if s.splitMode != split.SplitOff {
+		caps.L = true
+	}
 	return caps
 }
 
@@ -1663,8 +1686,16 @@ func (s *Session) sendReceiverBufferNeg(curMs uint16) bool {
 // keepalive. (The monotonic version upgrade is driven separately from every
 // datagram's GRE-header version; see upgradeGREVersion.)
 func (s *Session) handleGREControl(ka gre.Keepalive) {
-	s.remoteCaps = ka.Caps
 	s.remoteMAC = ka.MAC
+	s.applyRemoteCaps(ka.Caps)
+}
+
+// applyRemoteCaps records the peer's advertised keepalive capabilities and drives
+// merge=auto from the pair-split (L) bit. Called from the v1 keepalive path
+// (handleGREControl) and, via the codec side-channel, the v2 (VSF) keepalive path.
+func (s *Session) applyRemoteCaps(caps gre.Capabilities) {
+	s.remoteCaps = caps
+	s.merger.SetAutoEnabled(caps.L)
 }
 
 // upgradeGREVersion applies libRIST's monotonic version-upgrade rule: adopt a
@@ -1926,6 +1957,11 @@ func (s *Session) handleMainDatagram(now clock.Timestamp, d inbound) {
 			s.deliverOOB(proto, oob)
 		}
 	} else if isMedia, pkt, fbs, bn, err := s.main.decodeMain(d.data, s.highestSent); err == nil {
+		// A v2 (VSF) keepalive surfaces its caps through this side-channel; the L bit
+		// drives merge=auto (the v1 keepalive path uses handleGREControl).
+		if caps, ok := s.main.takePeerCaps(); ok {
+			s.applyRemoteCaps(caps)
+		}
 		if bn != nil {
 			// VSF buffer-negotiation: a sender advertises the buffer it retains, which
 			// the receiver flow uses to bound its dynamic recovery-buffer sizing.
@@ -2091,6 +2127,18 @@ const maxEAPRetx = 16
 // it is a single unfragmented PushApp. p is a session-owned buffer (Write
 // copied it), so the fragment subslices the flow retains stay valid.
 func (s *Session) pushApp(now clock.Timestamp, p []byte) {
+	// Packet-split bonding (libRIST split=): send the payload as a consecutive
+	// even/odd pair sharing one source time. Split is an alternative to F/L
+	// fragmentation — when active it bypasses fragmentation (each half is a whole
+	// Standalone packet), so the peer's merge (not its reassembler) recombines them.
+	if s.splitMode != split.SplitOff {
+		first, last, ok := split.SplitPayload(s.splitMode, p)
+		s.flow.PushApp(now, first)
+		if ok {
+			s.flow.PushApp(now, last)
+		}
+		return
+	}
 	if s.fragSize <= 0 || len(p) <= s.fragSize {
 		s.flow.PushApp(now, p)
 		return
@@ -2121,8 +2169,17 @@ func (s *Session) pushApp(now clock.Timestamp, p []byte) {
 // produces. An unfragmented payload (FragStandalone) passes straight through,
 // so non-Advanced sessions and unfragmented Advanced streams are unaffected.
 func (s *Session) deliverFragment(d flow.Deliver) {
-	if out, ready := s.reasm.push(d.Frag, d.Payload, d.Discontinuity); ready {
-		s.queueDelivery(out) // copies internally before reasm's buffer is reused
+	out, ready := s.reasm.push(d.Frag, d.Payload, d.Discontinuity)
+	if !ready {
+		return
+	}
+	// Fold a split pair (libRIST merge=) back together after reassembly. With split
+	// active every delivery is Standalone, so the reassembler is a passthrough and
+	// d.Seq/d.SourceTime identify the pair. With merge off, Deliver returns the
+	// payload unchanged. queueDelivery copies internally before reasm's buffer is
+	// reused (and the merger copies any half it holds across calls).
+	for _, p := range s.merger.Deliver(d.Seq, d.SourceTime, out, d.Discontinuity) {
+		s.queueDelivery(p)
 	}
 }
 

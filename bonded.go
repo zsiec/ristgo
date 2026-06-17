@@ -331,7 +331,7 @@ func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Con
 	ssrc := randomEvenSSRC()
 	fc := toFlowConfig(cfg)
 	fc.SSRC = ssrc
-	fc.StartSeq = randomStartSeq()
+	fc.StartSeq = randomStartSeq(cfg.SplitMode != SplitOff)
 	sc := toSessionConfig(cfg, fc, ssrc)
 	sc.FragmentSize = cfg.FragmentSize // Advanced-only (validate gates it); 0 otherwise
 	if err := applyBondProfile(&sc, cfg); err != nil {

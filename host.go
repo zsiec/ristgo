@@ -18,6 +18,7 @@ import (
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/session"
 	"github.com/zsiec/ristgo/internal/socket"
+	"github.com/zsiec/ristgo/internal/split"
 	"github.com/zsiec/ristgo/internal/srp"
 )
 
@@ -561,6 +562,32 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 		ErrOOBUnsupported:      ErrOOBUnsupported,
 		ErrFlowAttrUnsupported: ErrFlowAttrUnsupported,
 		OnFlowAttr:             cfg.OnFlowAttr,
+		SplitMode:              toSplitMode(cfg.SplitMode),
+		MergeMode:              toMergeMode(cfg.MergeMode),
+	}
+}
+
+// toSplitMode maps the public SplitMode to the internal split package's enum.
+func toSplitMode(m SplitMode) split.SplitMode {
+	switch m {
+	case SplitAuto:
+		return split.SplitAuto
+	case SplitHalf:
+		return split.SplitHalf
+	default:
+		return split.SplitOff
+	}
+}
+
+// toMergeMode maps the public MergeMode to the internal split package's enum.
+func toMergeMode(m MergeMode) split.MergeMode {
+	switch m {
+	case MergePairs:
+		return split.MergePairs
+	case MergeAuto:
+		return split.MergeAuto
+	default:
+		return split.MergeOff
 	}
 }
 
@@ -584,5 +611,15 @@ func randomEvenSSRC() uint32 { return cryptoUint32() &^ 1 }
 
 // randomStartSeq returns a random initial RTP sequence number (RFC 3550
 // recommends randomizing it), kept in the low 16 bits since the wire sequence
-// is 16-bit.
-func randomStartSeq() uint32 { return cryptoUint32() & 0xFFFF }
+// is 16-bit. When even is set (packet-split bonding is active) the low bit is
+// cleared so the initial sequence is even: split emits every payload as an
+// even/+1 pair, and an even start keeps each pair's first half on an even
+// sequence — the parity the receiver's merge keys on. A slip would strand a later
+// pair across an (odd, even) boundary and corrupt the merge.
+func randomStartSeq(even bool) uint32 {
+	s := cryptoUint32() & 0xFFFF
+	if even {
+		s &^= 1
+	}
+	return s
+}

@@ -107,6 +107,12 @@ type Event interface {
 type Deliver struct {
 	// Seq is the 32-bit (widened) sequence number of the delivered packet.
 	Seq uint32
+	// SourceTime is the packet's source timestamp (the sender's NTP-64 media clock,
+	// as carried on the wire). Two packets the sender emitted from one application
+	// payload — e.g. a split/merge bonding pair — share a source time, so the host
+	// merge layer keys recombination on it (a mis-paired neighbour with a different
+	// source time stays a harmless orphan rather than corrupting the stream).
+	SourceTime uint64
 	// Payload is the delivered media payload.
 	Payload []byte
 	// Discontinuity reports that one or more sequence numbers immediately

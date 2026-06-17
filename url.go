@@ -244,6 +244,34 @@ func applyQuery(cfg *Config, q url.Values) error {
 		cfg.SRPCompat = v != "0"
 	}
 
+	// split (sender) and merge (receiver) are libRIST's packet-split bonding modes,
+	// spelled as words (not numbers): split=off|auto|half (ts is an alias for auto)
+	// and merge=off|pairs|auto.
+	if v := q.Get("split"); v != "" {
+		switch v {
+		case "off":
+			cfg.SplitMode = SplitOff
+		case "auto", "ts":
+			cfg.SplitMode = SplitAuto
+		case "half":
+			cfg.SplitMode = SplitHalf
+		default:
+			return fmt.Errorf("%w: split=%q must be off, auto, or half", ErrInvalidConfig, v)
+		}
+	}
+	if v := q.Get("merge"); v != "" {
+		switch v {
+		case "off":
+			cfg.MergeMode = MergeOff
+		case "pairs":
+			cfg.MergeMode = MergePairs
+		case "auto":
+			cfg.MergeMode = MergeAuto
+		default:
+			return fmt.Errorf("%w: merge=%q must be off, pairs, or auto", ErrInvalidConfig, v)
+		}
+	}
+
 	// Reject genuinely unknown parameters (a typo like "reoder-buffer"), matching
 	// libRIST's parse_url_options which fails on an unrecognized key rather than
 	// silently using a default. Keys libRIST honors but ristgo does not yet
@@ -275,7 +303,7 @@ var recognizedURLParams = map[string]bool{
 	"username": true, "password": true, "compression": true,
 	"miface": true, "ttl": true, "source": true,
 	"congestion-control": true, "timing-mode": true, "srp-compat": true,
-	"return-bandwidth": true,
+	"return-bandwidth": true, "split": true, "merge": true,
 	// Recognized by libRIST but not implemented as a rist:// query parameter by
 	// ristgo: recovery-priority is a PER-PEER NACK priority, only meaningful
 	// across bonded peers, set via the BondedPeer API (NewBondedReceiverPeers),

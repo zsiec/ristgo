@@ -202,6 +202,69 @@ func (c CongestionControl) String() string {
 	}
 }
 
+// SplitMode selects libRIST's packet-split bonding on the sender (split=): each
+// Write is spread across a consecutive even/odd sequence pair carrying the same
+// source time, so a bonded pair of links can each carry half and a merge=-configured
+// receiver recombines them. The zero value SplitOff disables it. Works on every
+// profile and interoperates with libRIST.
+type SplitMode int
+
+const (
+	// SplitOff sends each payload whole — no splitting (the default, zero value).
+	SplitOff SplitMode = 0
+	// SplitAuto splits on a 188-byte MPEG-TS boundary at the midpoint when the
+	// payload is TS-aligned, otherwise at the byte midpoint (libRIST split=auto).
+	SplitAuto SplitMode = 1
+	// SplitHalf always splits at the byte midpoint (libRIST split=half).
+	SplitHalf SplitMode = 2
+)
+
+// String returns a human-readable name for the split mode (the libRIST URL word).
+func (m SplitMode) String() string {
+	switch m {
+	case SplitAuto:
+		return "auto"
+	case SplitHalf:
+		return "half"
+	case SplitOff:
+		return "off"
+	default:
+		return "unknown"
+	}
+}
+
+// MergeMode selects libRIST's packet-merge bonding on the receiver (merge=), the
+// counterpart to SplitMode: it recombines a split pair — an even sequence and its
+// same-source-time seq+1 partner — back into the original payload. MergeAuto only
+// does so once the peer advertises pair-splitting (the GRE keepalive L bit). The zero
+// value MergeOff disables it. Works on every profile and interoperates with libRIST.
+type MergeMode int
+
+const (
+	// MergeOff delivers each packet as received — no merging (the default).
+	MergeOff MergeMode = 0
+	// MergePairs recombines every even/odd consecutive same-source-time pair
+	// (libRIST merge=pairs).
+	MergePairs MergeMode = 1
+	// MergeAuto recombines only once the peer advertises pair-splitting via the GRE
+	// keepalive L bit (libRIST merge=auto).
+	MergeAuto MergeMode = 2
+)
+
+// String returns a human-readable name for the merge mode (the libRIST URL word).
+func (m MergeMode) String() string {
+	switch m {
+	case MergePairs:
+		return "pairs"
+	case MergeAuto:
+		return "auto"
+	case MergeOff:
+		return "off"
+	default:
+		return "unknown"
+	}
+}
+
 // TimingMode selects how the receiver schedules media playout (libRIST
 // timing_mode). The zero value is TimingSource, the libRIST default. These
 // values match libRIST's SOURCE=0/ARRIVAL=1 numbering; libRIST's RTC=2 maps to

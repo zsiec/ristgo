@@ -236,6 +236,20 @@ type Config struct {
 	// one-packet-per-Write limit.
 	FragmentSize int
 
+	// SplitMode selects libRIST's packet-split bonding on the sender (split=): each
+	// Write is spread across a consecutive even/odd sequence pair (same source time)
+	// for a MergeMode-configured receiver to recombine. SplitOff (the zero value)
+	// disables it. Works on every profile and interoperates with libRIST. Set via the
+	// rist:// URL with split=off|auto|half.
+	SplitMode SplitMode
+
+	// MergeMode selects libRIST's packet-merge bonding on the receiver (merge=), the
+	// counterpart to SplitMode: it recombines a split pair back into the original
+	// payload (MergeAuto only once the peer advertises pair-split via the keepalive L
+	// bit). MergeOff (the zero value) disables it. Set via the rist:// URL with
+	// merge=off|pairs|auto.
+	MergeMode MergeMode
+
 	// FEC, when non-nil, enables SMPTE ST 2022-1 forward error correction
 	// (TR-06-3 §5.3.5): the sender emits row/column FEC packets and the receiver
 	// recovers single losses per row/column with no NACK round trip, complementing
