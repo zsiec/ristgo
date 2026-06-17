@@ -21,7 +21,7 @@ and NACK cadence) are testable on a fake clock.
 The dependency set beyond the standard library is the Go team's
 `golang.org/x/crypto` and `golang.org/x/net` (the latter for IP multicast: group
 membership, multicast TTL, and interface selection, which the standard library
-does not expose). There are no third-party or pion dependencies.
+does not expose). There are no third-party dependencies.
 
 ## Install
 
