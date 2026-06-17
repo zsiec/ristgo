@@ -153,6 +153,17 @@ func TestFirstPacketLocksOffsetAndSchedules(t *testing.T) {
 	}
 }
 
+// zeroGauges blanks the fields that depend on payload size or live estimator state
+// — the byte counters (ReceivedBytes/SentBytes/RetransmittedBytes) and the gauges
+// (SmoothedRTTUs/DataBitrateBps/RetryBitrateBps, which Stats() fills and so are never
+// zero) — so the packet-count snapshot can be compared against a literal in tests
+// that assert counting logic rather than byte totals.
+func zeroGauges(s Stats) Stats {
+	s.ReceivedBytes, s.SentBytes, s.RetransmittedBytes = 0, 0, 0
+	s.SmoothedRTTUs, s.DataBitrateBps, s.RetryBitrateBps = 0, 0, 0
+	return s
+}
+
 func TestFirstPacketRetransmitIgnored(t *testing.T) {
 	f := New(RoleReceiver, testConfig())
 	pkt := mkPkt(100, 0, []byte("a"))
@@ -161,7 +172,7 @@ func TestFirstPacketRetransmitIgnored(t *testing.T) {
 	if f.receiver.started {
 		t.Fatal("flow must not start on a retransmit")
 	}
-	if got := f.Stats(); got != (Stats{}) {
+	if got := zeroGauges(f.Stats()); got != (Stats{}) {
 		t.Fatalf("stats = %+v, want zero", got)
 	}
 }
@@ -234,7 +245,7 @@ func TestFeedDedupOverwriteInsert(t *testing.T) {
 				f.Feed(st.now, st.path, pkt)
 				last = pkt
 			}
-			if got := f.Stats(); got != tt.wantStats {
+			if got := zeroGauges(f.Stats()); got != tt.wantStats {
 				t.Fatalf("stats = %+v, want %+v", got, tt.wantStats)
 			}
 			s := &f.receiver.ring[last.Seq&f.receiver.mask]
@@ -711,7 +722,7 @@ func TestReceiverIgnoresSenderOnlyEntryPoints(t *testing.T) {
 	if outs := drainOutputs(f); outs != nil {
 		t.Fatalf("receiver NackRequest emitted %v", outs)
 	}
-	if got := f.Stats(); got != (Stats{IgnoredFeedback: 1}) {
+	if got := zeroGauges(f.Stats()); got != (Stats{IgnoredFeedback: 1}) {
 		t.Fatalf("stats = %+v, want IgnoredFeedback 1", got)
 	}
 }

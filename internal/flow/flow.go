@@ -350,8 +350,16 @@ func New(role Role, cfg Config) *Flow {
 // Role returns which half of the flow this state machine plays.
 func (f *Flow) Role() Role { return f.role }
 
-// Stats returns a snapshot of the flow's counters.
-func (f *Flow) Stats() Stats { return f.stats }
+// Stats returns a snapshot of the flow's counters, with the live gauges
+// (SmoothedRTTUs and the sender bit-rate fields) filled from the current
+// estimator/bitrate state.
+func (f *Flow) Stats() Stats {
+	s := f.stats
+	s.SmoothedRTTUs = int64(f.est.Smoothed())
+	s.DataBitrateBps = f.sender.dataBW.slowBps()
+	s.RetryBitrateBps = f.sender.retryBW.slowBps()
+	return s
+}
 
 // Feed ingests one inbound media packet that arrived on the given path at
 // instant now. Receiver-role only: it performs the dedup/overwrite/insert

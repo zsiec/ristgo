@@ -140,6 +140,24 @@ type Stats struct {
 	// drops are excluded).
 	Received uint64
 
+	// ReceivedBytes is the payload-byte analog of Received (libRIST received_bytes).
+	ReceivedBytes uint64
+
+	// --- Gauges (filled by Flow.Stats from live estimator/bitrate state; 0 in the
+	// raw incremental struct, unlike the counters). ---
+
+	// SmoothedRTTUs is the smoothed round-trip time in microseconds (the RTT EWMA),
+	// 0 before the first sample (libRIST per-flow rtt).
+	SmoothedRTTUs int64
+
+	// DataBitrateBps is the sender's smoothed first-transmission bit rate
+	// (bits/sec, 1 s window) — libRIST bandwidth. 0 on a receiver flow.
+	DataBitrateBps int64
+
+	// RetryBitrateBps is the sender's smoothed retransmission bit rate
+	// (bits/sec, 1 s window) — libRIST retry_bandwidth. 0 on a receiver flow.
+	RetryBitrateBps int64
+
 	// Duplicates counts media packets dropped by the (seq, sourceTime)
 	// duplicate test — ARQ duplicates and extra SMPTE 2022-7 path copies
 	// alike (libRIST stats_instant.dupe).
@@ -233,9 +251,16 @@ type Stats struct {
 	// Sent counts first-transmission media packets emitted by PushApp.
 	Sent uint64
 
+	// SentBytes is the payload-byte analog of Sent (libRIST sent_bytes).
+	SentBytes uint64
+
 	// Retransmitted counts retransmission media packets emitted in response
 	// to NackRequest feedback (each accepted sequence once per re-send).
 	Retransmitted uint64
+
+	// RetransmittedBytes is the payload-byte analog of Retransmitted
+	// (libRIST retransmitted_bytes).
+	RetransmittedBytes uint64
 
 	// RetransmitSkipped counts NACKed sequence numbers no longer in the
 	// sender history — aged out of the ring or never sent — and therefore

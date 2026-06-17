@@ -478,6 +478,7 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	s.outputTime = packetTime.Add(f.recoveryBuffer)
 	s.pathSeen = pathBit(path)
 	f.stats.Received++
+	f.stats.ReceivedBytes += uint64(len(pkt.Payload))
 	if outOfOrder {
 		f.stats.Reordered++
 	}
@@ -551,6 +552,7 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	s.outputTime = now.Add(f.recoveryBuffer)
 	s.pathSeen = pathBit(path)
 	f.stats.Received++
+	f.stats.ReceivedBytes += uint64(len(pkt.Payload))
 
 	f.armPlayout(s.outputTime)
 	// NoRecovery (one-way) transport has no return channel, so the receiver

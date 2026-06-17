@@ -137,6 +137,7 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte, frag wire.FragRole) 
 	})
 	s.dataBW.feed(now, wireBytes(len(payload))) // recovery_maxbitrate data-rate EWMA
 	f.stats.Sent++
+	f.stats.SentBytes += uint64(len(payload))
 }
 
 // serviceNack retransmits every requested sequence still resendable, applying
@@ -231,6 +232,7 @@ func (f *Flow) serviceNack(now clock.Timestamp, req wire.NackRequest) {
 			})
 			s.retryBW.feed(now, wireBytes(len(sl.payload)))
 			f.stats.Retransmitted++
+			f.stats.RetransmittedBytes += uint64(len(sl.payload))
 			emitted++
 			if emitted >= f.maxNacksPerLoop {
 				return // per-pass retransmit budget exhausted; receiver re-NACKs the rest
