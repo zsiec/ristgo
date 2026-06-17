@@ -36,7 +36,7 @@ func FuzzDecrypt(f *testing.F) {
 		case 1:
 			keyBits = KeySize256
 		case 2:
-			keyBits = 192 // invalid: must return ErrInvalidKeySize, never panic
+			keyBits = 200 // invalid: must return ErrInvalidKeySize, never panic
 		}
 		nonce := [NonceSize]byte{n0, n1, n2, n3}
 

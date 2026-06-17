@@ -640,8 +640,15 @@ func (cfg *Config) validate() error {
 	}
 	switch cfg.AESKeyBits {
 	case 0, 128, 256:
+	case 192:
+		// 192-bit AES is signalable only on the Advanced profile (the PSK
+		// future-nonce key_size_bits field). The Main GRE H bit encodes only
+		// 128 vs 256, so libRIST's receiver can't carry 192 there either.
+		if cfg.Profile != ProfileAdvanced {
+			return errors.New("rist: AESKeyBits=192 requires ProfileAdvanced (the Main wire signals only 128/256)")
+		}
 	default:
-		return errors.New("rist: AESKeyBits must be 0, 128, or 256")
+		return errors.New("rist: AESKeyBits must be 0, 128, 192, or 256")
 	}
 	// AESKeyBits requires either a Secret (PSK keying) or SRP credentials
 	// (use_key_as_passphrase keying from K). It is meaningless without a key.

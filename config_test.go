@@ -410,11 +410,21 @@ func TestConfigValidate(t *testing.T) {
 			c.Profile = ProfileMain
 			c.Secret = strings.Repeat("s", 128)
 		}, "rist: Secret must be at most 127 bytes"},
-		{"aes 192 rejected", func(c *Config) {
+		{"aes 192 rejected on main", func(c *Config) {
 			c.Profile = ProfileMain
 			c.Secret = "opensesame"
 			c.AESKeyBits = 192
-		}, "rist: AESKeyBits must be 0, 128, or 256"},
+		}, "rist: AESKeyBits=192 requires ProfileAdvanced (the Main wire signals only 128/256)"},
+		{"aes 200 rejected", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.Secret = "opensesame"
+			c.AESKeyBits = 200
+		}, "rist: AESKeyBits must be 0, 128, 192, or 256"},
+		{"aes 192 ok on advanced", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.Secret = "opensesame"
+			c.AESKeyBits = 192
+		}, ""},
 		{"aes bits without secret or srp", func(c *Config) {
 			c.Profile = ProfileMain
 			c.AESKeyBits = 128

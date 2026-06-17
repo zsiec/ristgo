@@ -106,7 +106,7 @@ func TestDeriveKeyErrors(t *testing.T) {
 		keyBits  int
 		wantErr  error
 	}{
-		{"badKeySize", []byte("p"), []byte{1, 2, 3, 4}, 192, ErrInvalidKeySize},
+		{"badKeySize", []byte("p"), []byte{1, 2, 3, 4}, 200, ErrInvalidKeySize},
 		{"zeroKeySize", []byte("p"), []byte{1, 2, 3, 4}, 0, ErrInvalidKeySize},
 		{"emptyPassword", nil, []byte{1, 2, 3, 4}, KeySize128, ErrEmptyPassword},
 		{"shortNonce", []byte("p"), []byte{1, 2, 3}, KeySize128, ErrInvalidNonceLength},

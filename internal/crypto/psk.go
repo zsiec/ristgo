@@ -44,12 +44,12 @@ import (
 // Sentinel errors returned by this package. Callers should test for them with
 // errors.Is; returned errors may wrap these with additional context.
 var (
-	// ErrInvalidKeySize is returned by NewKey and DeriveKey when the
-	// requested key size is not 128 or 256 bits. Only these two sizes are
-	// representable on the RIST wire: the GRE header signals key length with a
-	// single H bit (0 => 128, 1 => 256). libRIST's
-	// derivation backend also accepts 192, but it can never be signalled.
-	ErrInvalidKeySize = errors.New("rist: crypto: key size must be 128 or 256 bits")
+	// ErrInvalidKeySize is returned by NewKey and DeriveKey when the requested key
+	// size is not 128, 192, or 256 bits. On the Main GRE wire the header signals key
+	// length with a single H bit (0 => 128, 1 => 256), so 192 cannot be signalled
+	// there; it is usable only in the Advanced profile, which carries the key size
+	// explicitly (the PSK future-nonce key_size_bits field, TR-06-3 §5.3.9).
+	ErrInvalidKeySize = errors.New("rist: crypto: key size must be 128, 192, or 256 bits")
 
 	// ErrEmptyPassword is returned by NewKey when the passphrase is empty.
 	ErrEmptyPassword = errors.New("rist: crypto: empty passphrase")
@@ -90,6 +90,12 @@ const (
 	// KeySize128 selects a 128-bit (16-byte) AES key.
 	KeySize128 = 128
 
+	// KeySize192 selects a 192-bit (24-byte) AES key. Usable only in the Advanced
+	// profile, which signals the key size explicitly (the PSK future-nonce
+	// key_size_bits field, TR-06-3 §5.3.9); the Main GRE H bit encodes only 128 vs
+	// 256, so 192 cannot be signalled there.
+	KeySize192 = 192
+
 	// KeySize256 selects a 256-bit (32-byte) AES key.
 	KeySize256 = 256
 
@@ -127,13 +133,13 @@ const (
 
 // DeriveKey derives an AES key from a passphrase and the 4-byte GRE nonce
 // salt using PBKDF2-HMAC-SHA256 with RIST's fixed 1024-iteration count.
-// keyBits must be 128 or 256; nonce4 must be exactly
-// NonceSize bytes. The returned slice has length keyBits/8.
+// keyBits must be 128, 192, or 256 (192 is Advanced-profile only); nonce4 must be
+// exactly NonceSize bytes. The returned slice has length keyBits/8.
 //
 // This is a pure function exported for unit testing against published
 // PBKDF2-HMAC-SHA256 test vectors so the derivation is independently anchored.
 func DeriveKey(password, nonce4 []byte, keyBits int) ([]byte, error) {
-	if keyBits != KeySize128 && keyBits != KeySize256 {
+	if keyBits != KeySize128 && keyBits != KeySize192 && keyBits != KeySize256 {
 		return nil, ErrInvalidKeySize
 	}
 	if len(password) == 0 {
@@ -161,7 +167,7 @@ func DeriveKey(password, nonce4 []byte, keyBits int) ([]byte, error) {
 // string-secret path (DeriveKey) keeps the NUL-truncation because libRIST's
 // _librist_crypto_psk_rist_key_init uses strnlen there.
 func DeriveKeyRaw(password, nonce4 []byte, keyBits int) ([]byte, error) {
-	if keyBits != KeySize128 && keyBits != KeySize256 {
+	if keyBits != KeySize128 && keyBits != KeySize192 && keyBits != KeySize256 {
 		return nil, ErrInvalidKeySize
 	}
 	if len(password) == 0 {
@@ -250,7 +256,7 @@ func NewKeyRaw(password []byte, keyBits, keyRotation int, odd bool) (*Key, error
 }
 
 func newKey(password []byte, keyBits, keyRotation int, odd, raw bool) (*Key, error) {
-	if keyBits != KeySize128 && keyBits != KeySize256 {
+	if keyBits != KeySize128 && keyBits != KeySize192 && keyBits != KeySize256 {
 		return nil, ErrInvalidKeySize
 	}
 	if len(password) == 0 {
@@ -375,7 +381,7 @@ func NewDecryptorRaw(password []byte, keyBits int) (*Decryptor, error) {
 }
 
 func newDecryptor(password []byte, keyBits int, raw bool) (*Decryptor, error) {
-	if keyBits != KeySize128 && keyBits != KeySize256 {
+	if keyBits != KeySize128 && keyBits != KeySize192 && keyBits != KeySize256 {
 		return nil, ErrInvalidKeySize
 	}
 	if len(password) == 0 {
@@ -418,7 +424,7 @@ func (d *Decryptor) Precompute(nonce [NonceSize]byte, keyBits int) {
 		return // already the live key
 	}
 	bits := keyBits
-	if bits != KeySize128 && bits != KeySize256 {
+	if bits != KeySize128 && bits != KeySize192 && bits != KeySize256 {
 		bits = d.keyBits
 	}
 	if d.hasNext && nonce == d.nextNonce && bits == d.nextBits {
@@ -510,7 +516,7 @@ func Decrypt(password []byte, keyBits int, nonce [NonceSize]byte, seq uint32, ds
 // to the GRE-IV-based PSK path and does not disturb it. It never panics; a
 // wrong-length key returns ErrInvalidKeySize.
 func AESCTRRaw(key []byte, iv [ivSize]byte, dst, src []byte) ([]byte, error) {
-	if len(key) != KeySize128/8 && len(key) != KeySize256/8 {
+	if len(key) != KeySize128/8 && len(key) != KeySize192/8 && len(key) != KeySize256/8 {
 		return dst, ErrInvalidKeySize
 	}
 	block, err := aes.NewCipher(key)

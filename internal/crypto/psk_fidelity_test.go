@@ -159,7 +159,7 @@ func TestDeriveKeyRawNoTruncation(t *testing.T) {
 // protect an explicit EAP-SRP passphrase under the SRP session key K (IV = 15
 // zero bytes then the EAP identifier). It also rejects a wrong-length key.
 func TestAESCTRRaw(t *testing.T) {
-	for _, bits := range []int{KeySize128, KeySize256} {
+	for _, bits := range []int{KeySize128, KeySize192, KeySize256} {
 		key := make([]byte, bits/8)
 		for i := range key {
 			key[i] = byte(i*7 + 1)
@@ -190,8 +190,8 @@ func TestAESCTRRaw(t *testing.T) {
 		}
 	}
 
-	// A wrong-length key is rejected, never run.
-	if _, err := AESCTRRaw(make([]byte, 24), [16]byte{}, nil, []byte("x")); !errors.Is(err, ErrInvalidKeySize) {
-		t.Fatalf("AESCTRRaw(24-byte key) = %v, want ErrInvalidKeySize", err)
+	// A wrong-length key (20 bytes is not a valid AES size) is rejected, never run.
+	if _, err := AESCTRRaw(make([]byte, 20), [16]byte{}, nil, []byte("x")); !errors.Is(err, ErrInvalidKeySize) {
+		t.Fatalf("AESCTRRaw(20-byte key) = %v, want ErrInvalidKeySize", err)
 	}
 }

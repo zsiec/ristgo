@@ -96,6 +96,35 @@ func TestAdvMediaRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAdvMediaRoundTrip192 checks the Advanced media path round-trips under a
+// 192-bit AES-CTR key — the key size only the Advanced profile can carry (signalled
+// via the PSK future-nonce key_size_bits field; the Main GRE H bit cannot encode it).
+func TestAdvMediaRoundTrip192(t *testing.T) {
+	sendKey, err := crypto.NewKey([]byte(advTestSecret), crypto.KeySize192, 0, false)
+	if err != nil {
+		t.Fatalf("NewKey(192): %v", err)
+	}
+	recvKey, err := crypto.NewDecryptor([]byte(advTestSecret), crypto.KeySize192)
+	if err != nil {
+		t.Fatalf("NewDecryptor(192): %v", err)
+	}
+	tx := newAdvCodec(sendKey, nil, false, advTestSSRC, 1971, 1968)
+	rx := newAdvCodec(nil, recvKey, false, advTestSSRC, 0, 0)
+	payload := []byte("hello advanced profile 192-bit media payload")
+
+	b, err := tx.encodeAdvMedia(nil, mediaPkt(1000, 5_000_000, append([]byte(nil), payload...), false))
+	if err != nil {
+		t.Fatalf("encodeAdvMedia: %v", err)
+	}
+	isMedia, pkt, _, err := rx.decodeAdv(b)
+	if err != nil {
+		t.Fatalf("decodeAdv: %v", err)
+	}
+	if !isMedia || pkt.Seq != 1000 || !bytes.Equal(pkt.Payload, payload) {
+		t.Fatalf("192-bit round-trip mismatch: media=%v seq=%d payload=%x", isMedia, pkt.Seq, pkt.Payload)
+	}
+}
+
 // TestAdvFragRoundTrip checks every fragment role survives the encode↔decode of
 // the Advanced media path: the wire fragment role maps onto the header F/L bits
 // and back, across the encrypted+compressed combinations.
