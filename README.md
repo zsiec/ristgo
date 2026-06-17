@@ -293,6 +293,7 @@ Everything below is implemented and tested.
 | Stream multiplexing (MultiReceiver: N flows demultiplexed per port) | all | TR-06-1..3 |
 | SMPTE 2022-7 bonding, seamless multipath reconstruction | all | TR-06-1..3 |
 | Weighted load-share bonding (per-path weights, runtime SetWeight) | all | libRIST weight |
+| Packet split/merge bonding (`split=`/`merge=`) | all | libRIST parity |
 | Forward error correction (SMPTE ST 2022-1 and ST 2022-5, 2-D XOR; separate-port + Advanced in-band carriage) | all | TR-06-2 §8.4, TR-06-3 §5.3.5 |
 | Source adaptation (Link Quality Messages, encoder-rate callback) | all | TR-06-4 Part 1 |
 | IP multicast (group membership, multicast TTL, egress interface, source filter) | all | n/a |

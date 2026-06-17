@@ -1307,6 +1307,28 @@ func (s *Session) sendAdvGREHandshake(now clock.Timestamp) {
 	s.lastTx = now
 }
 
+// sendAdvSplitAdvert advertises packet-split on the Advanced GRE substrate with a v1
+// keepalive carrying the pair-split (L) bit, so a peer running merge=auto enables
+// merging. The native adv keepalive has no GRE capability octet, hence this separate
+// substrate beacon. Strictly gated on split being active, so the default Advanced wire
+// is byte-identical (the -p 2 interop is unaffected). v1 so the peer reads the caps
+// straight from peekControl.
+func (s *Session) sendAdvSplitAdvert(now clock.Timestamp) {
+	if s.advGRE == nil || s.splitMode == split.SplitOff || s.cfg.OneWay || !s.peer.RTCP.IsValid() {
+		return
+	}
+	ka := gre.Keepalive{MAC: s.localMAC, Caps: s.localCaps()} // localCaps sets L when split is active
+	b, err := s.advGRE.encodeKeepalive(nil, ka, gre.VersionMin)
+	if err != nil {
+		s.logf("adv: encode split advert: %v", err)
+		return
+	}
+	if err := s.conn.WriteMedia(b, s.peer.RTCP); err != nil {
+		s.logf("adv: write split advert: %v", err)
+	}
+	s.lastTx = now
+}
+
 // handleAdvInbound demultiplexes one inbound Advanced-profile datagram. libRIST
 // mixes PT=127 adv framing (Type=5 media, Type=4 control, Type=8 GRE-wrapped)
 // with raw Main-profile GRE (the RTCP handshake and keepalives), so the host
@@ -1380,6 +1402,15 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 // (they served their handshake/liveness purpose at the peer layer). A decode
 // error (e.g. a GRE keepalive, whose protocol type is not REDUCED) is ignored.
 func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
+	// A GRE keepalive on the substrate advertises pair-split via its L bit (merge=auto).
+	// A v1 keepalive (decodeMain rejects its non-REDUCED proto) is read here; a v2
+	// keepalive's caps come from decodeMain's side-channel below.
+	if kind, ka, _, cerr := s.advGRE.peekControl(data); kind == controlKeepalive {
+		if cerr == nil {
+			s.applyRemoteCaps(ka.Caps)
+		}
+		return
+	}
 	if oob, proto, ok, oerr := s.advGRE.peekOOB(data); ok {
 		if oerr != nil {
 			s.logf("adv: drop undecodable OOB: %v", oerr)
@@ -1391,6 +1422,9 @@ func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
 	isMedia, pkt, fbs, bn, err := s.advGRE.decodeMain(data, s.highestSent)
 	if err != nil {
 		return // keepalive or otherwise not a GRE media/RTCP datagram; ignore
+	}
+	if caps, ok := s.advGRE.takePeerCaps(); ok {
+		s.applyRemoteCaps(caps) // a v2 (VSF) substrate keepalive's L bit
 	}
 	if bn != nil {
 		s.handleBufferNeg(*bn)

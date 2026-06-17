@@ -161,6 +161,9 @@ func (s *Session) sendKeepalive(now clock.Timestamp) {
 	if s.adv != nil {
 		s.sendAdvGREHandshake(now)
 		s.sendAdvKeepalive(now)
+		// Advertise pair-split on the substrate (merge=auto) when split is active; a
+		// no-op (no datagram) otherwise, so the default Advanced wire is unchanged.
+		s.sendAdvSplitAdvert(now)
 		return
 	}
 	echo := []wire.Feedback{wire.RttEchoRequest{Timestamp: uint64(clock.NTPTimeFromTimestamp(now))}}
