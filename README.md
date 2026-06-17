@@ -81,10 +81,14 @@ for {
 }
 ```
 
-Runnable versions are in [`examples/sender`](examples/sender),
-[`examples/receiver`](examples/receiver), and
-[`examples/bonded-sender`](examples/bonded-sender). Each accepts a plain
-`host:port` or a `rist://host:port?profile=...&secret=...&...` URL.
+Runnable versions are in [`examples/sender`](examples/sender) and
+[`examples/receiver`](examples/receiver); each accepts a plain `host:port` or a
+`rist://host:port?profile=...&secret=...&...` URL. For SMPTE 2022-7 bonding,
+[`examples/bonded-tx`](examples/bonded-tx) and
+[`examples/bonded-rx`](examples/bonded-rx) take one URL (or `host:port`) per path
+and configure the whole session from the first URL's query parameters;
+[`examples/bonded-sender`](examples/bonded-sender) is a minimal variant fixed to
+the default Simple-profile config.
 
 ### Profiles, encryption, bonding
 
