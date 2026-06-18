@@ -246,6 +246,12 @@ func (c *mainCodec) setRecvKey(d *crypto.Decryptor) {
 // hasSendKey reports whether the codec is currently keying its send path.
 func (c *mainCodec) hasSendKey() bool { return c.sendKey != nil }
 
+// setNPD toggles null-packet deletion on the media encode path at runtime — the
+// host side of libRIST's rist_sender_npd_enable/_disable. It takes effect on the
+// next encodeMainMedia call; decode is unaffected (the NPD extension is
+// self-describing on the wire, so a receiver always expands).
+func (c *mainCodec) setNPD(on bool) { c.npdEnabled = on }
+
 // encodeMainMedia encodes a normalized MediaPacket as one Main-profile data
 // datagram, appending to dst and returning the extended slice. The RTP packet
 // is built exactly as the Simple codec's encodeMedia does (even-base SSRC with

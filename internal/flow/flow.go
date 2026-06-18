@@ -354,6 +354,16 @@ func New(role Role, cfg Config) *Flow {
 // Role returns which half of the flow this state machine plays.
 func (f *Flow) Role() Role { return f.role }
 
+// SetRTTMultiplier sets the recovery-buffer RTT multiplier (Config.RTTMultiplier)
+// at runtime — the receiver mirror of libRIST's rist_recovery_rtt_multiplier_set.
+// The new value is read live by the next auto-scale pass (the receiver's periodic
+// RTT-echo timer), and only when the buffer is windowed (RecoveryBufferMin !=
+// RecoveryBufferMax) and the peer has advertised a sender max; otherwise the buffer
+// stays the static midpoint and this is inert. 0 disables auto-scaling. Range
+// validation is the host's job (libRIST accepts >= 1). Already-buffered packets keep
+// their fixed deadlines, so this never re-dates a queued packet.
+func (f *Flow) SetRTTMultiplier(multiplier int) { f.cfg.RTTMultiplier = multiplier }
+
 // Stats returns a snapshot of the flow's counters, with the live gauges
 // (SmoothedRTTUs, the sender bit-rate fields, and the receiver inter-packet-spacing
 // fields) filled from the current estimator/bitrate/receiver state.

@@ -75,6 +75,9 @@ type Config struct {
 	// ErrOOBUnsupported is returned by WriteOOB/ReadOOB when the session has no
 	// out-of-band channel (the Simple profile). Supplied by the public layer.
 	ErrOOBUnsupported error
+	// ErrNPDUnsupported is returned by SetNullPacketDeletion when the session is
+	// not a Main-profile sender (NPD is Main-only).
+	ErrNPDUnsupported error
 	// ErrFlowAttrUnsupported is returned by WriteFlowAttribute when the session is
 	// not Advanced (flow attributes are an Advanced-profile control message).
 	// Supplied by the public layer.
@@ -437,6 +440,12 @@ type Session struct {
 	// concurrency-safe) bonding Group. Non-nil only on a bonded sender.
 	weightCmd chan weightSet
 
+	// ctrlCmd carries runtime config setters (nack-type, rtt-multiplier, NPD —
+	// libRIST rist_receiver_nack_type_set / rist_recovery_rtt_multiplier_set /
+	// rist_sender_npd_enable) onto the event loop, which owns the flow core, codec,
+	// and the live cfg.Bitmask. Created for every session by newSession.
+	ctrlCmd chan ctrlSet
+
 	// Out-of-band side channel (Main/Advanced only). oobIn carries application
 	// WriteOOB payloads to the loop; oobOut carries received OOB datagrams to
 	// ReadOOB. Each carries the GRE protocol type so a tunnelled datagram's
@@ -657,6 +666,7 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		writeWake: make(chan struct{}, 1),
 		done:      make(chan struct{}),
 		dtlsReady: make(chan struct{}),
+		ctrlCmd:   make(chan ctrlSet, 4), // runtime config setters (rare control)
 	}
 	if sender {
 		s.appIn = make(chan []byte, 64)
@@ -893,6 +903,10 @@ func (s *Session) loop() {
 			if s.bond != nil {
 				s.bond.group.SetWeight(wc.path, wc.weight)
 			}
+		case c := <-s.ctrlCmd:
+			// Apply a runtime config setter (nack-type / rtt-multiplier / NPD) on the
+			// loop goroutine, which owns the flow, codec, and live cfg.Bitmask.
+			s.applyCtrl(c)
 		case p := <-appIn:
 			now := s.clk.Now()
 			s.pushApp(now, p)

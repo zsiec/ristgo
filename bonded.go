@@ -473,6 +473,28 @@ func (r *BondedReceiver) Stats() Stats {
 	return st
 }
 
+// SetNackType switches the NACK feedback format at runtime (libRIST
+// rist_receiver_nack_type_set): NACKRange (the default) or NACKBitmask. It takes
+// effect from the next NACK the merged receiver emits. It returns ErrInvalidConfig
+// for an unknown nack type, or the close reason if the session has shut down.
+func (r *BondedReceiver) SetNackType(nack NACKType) error {
+	if nack != NACKRange && nack != NACKBitmask {
+		return fmt.Errorf("%w: NACKType must be NACKRange (0) or NACKBitmask (1)", ErrInvalidConfig)
+	}
+	return r.sess.SetNackType(nack == NACKBitmask)
+}
+
+// SetRTTMultiplier sets the recovery-buffer RTT multiplier at runtime (libRIST
+// rist_recovery_rtt_multiplier_set). multiplier must be in [1, MaxRTTMultiplier]. It
+// returns ErrInvalidConfig for an out-of-range value, or the close reason if the
+// session has shut down. See [Receiver.SetRTTMultiplier].
+func (r *BondedReceiver) SetRTTMultiplier(multiplier int) error {
+	if multiplier < 1 || multiplier > MaxRTTMultiplier {
+		return fmt.Errorf("%w: RTTMultiplier %d out of range [1,%d]", ErrInvalidConfig, multiplier, MaxRTTMultiplier)
+	}
+	return r.sess.SetRTTMultiplier(multiplier)
+}
+
 // Close stops the receiver and releases every path's sockets and goroutines.
 func (r *BondedReceiver) Close() error {
 	if r.ctxStop != nil {
@@ -528,6 +550,15 @@ func (s *BondedSender) SetWeight(path int, weight int) error {
 		return fmt.Errorf("%w: weight must be >= 0 (0 = duplicate)", ErrInvalidConfig)
 	}
 	return s.sess.SetPathWeight(uint8(path), weight)
+}
+
+// SetNullPacketDeletion enables or disables null-packet deletion on the send path at
+// runtime (libRIST rist_sender_npd_enable/_disable). The Main bonded sender encodes
+// media through one codec, so the toggle applies to every path's 2022-7 copy. It
+// returns ErrNPDUnsupported on a non-Main bonded sender and the close reason once
+// closed. See [Sender.SetNullPacketDeletion].
+func (s *BondedSender) SetNullPacketDeletion(on bool) error {
+	return s.sess.SetNullPacketDeletion(on)
 }
 
 // Close stops the sender and releases its socket and goroutines.

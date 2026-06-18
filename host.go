@@ -562,6 +562,7 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 		ErrAuth:                ErrAuth,
 		ErrOOBUnsupported:      ErrOOBUnsupported,
 		ErrFlowAttrUnsupported: ErrFlowAttrUnsupported,
+		ErrNPDUnsupported:      ErrNPDUnsupported,
 		OnFlowAttr:             cfg.OnFlowAttr,
 		SplitMode:              toSplitMode(cfg.SplitMode),
 		MergeMode:              toMergeMode(cfg.MergeMode),

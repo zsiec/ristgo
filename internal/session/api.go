@@ -272,6 +272,80 @@ func (s *Session) SetWriteDeadline(t time.Time) {
 	}
 }
 
+// ctrlKind tags a runtime config setter delivered over Session.ctrlCmd.
+type ctrlKind uint8
+
+const (
+	ctrlNackType ctrlKind = iota // set the live NACK format (b: bitmask)
+	ctrlRTTMult                  // set the recovery-buffer RTT multiplier (n)
+	ctrlNPD                      // toggle null-packet deletion (b)
+)
+
+// ctrlSet is one runtime config change marshalled onto the event loop, which owns
+// the flow core, the codec, and the live cfg.Bitmask. It is the setter analogue of
+// weightSet (BondedSender.SetWeight).
+type ctrlSet struct {
+	kind ctrlKind
+	b    bool // bitmask (nack-type) or on (NPD)
+	n    int  // rtt multiplier
+}
+
+// applyCtrl applies one runtime config setter on the loop goroutine.
+func (s *Session) applyCtrl(c ctrlSet) {
+	switch c.kind {
+	case ctrlNackType:
+		// Every encodeFeedback site reads s.cfg.Bitmask live, so this one mutation
+		// switches the NACK format from the next emitted feedback.
+		s.cfg.Bitmask = c.b
+	case ctrlRTTMult:
+		s.flow.SetRTTMultiplier(c.n)
+	case ctrlNPD:
+		// The Main bonded sender also encodes media through the single s.main codec,
+		// so this covers both single and bonded Main senders.
+		if s.main != nil {
+			s.main.setNPD(c.b)
+		}
+	}
+}
+
+// sendCtrl marshals one runtime config setter onto the event loop, returning the
+// close reason if the session has shut down. Mirrors SetPathWeight.
+func (s *Session) sendCtrl(c ctrlSet) error {
+	select {
+	case s.ctrlCmd <- c:
+		return nil
+	case <-s.done:
+		return s.closeReason()
+	}
+}
+
+// SetNackType switches the NACK feedback format at runtime (Receiver.SetNackType,
+// libRIST rist_receiver_nack_type_set). bitmask selects RFC 4585 bitmask encoding;
+// false selects RIST range. It takes effect on the next emitted NACK and is safe to
+// call from any goroutine.
+func (s *Session) SetNackType(bitmask bool) error {
+	return s.sendCtrl(ctrlSet{kind: ctrlNackType, b: bitmask})
+}
+
+// SetRTTMultiplier sets the recovery-buffer RTT multiplier at runtime
+// (Receiver.SetRTTMultiplier, libRIST rist_recovery_rtt_multiplier_set). It takes
+// effect on the next auto-scale recalculation and is safe to call from any
+// goroutine. Range validation is the caller's job.
+func (s *Session) SetRTTMultiplier(multiplier int) error {
+	return s.sendCtrl(ctrlSet{kind: ctrlRTTMult, n: multiplier})
+}
+
+// SetNullPacketDeletion toggles null-packet deletion on the send path at runtime
+// (Sender.SetNullPacketDeletion, libRIST rist_sender_npd_enable/_disable). It
+// returns ErrNPDUnsupported on a non-Main session (NPD is Main-only) and the close
+// reason once the session is closed. Safe to call from any goroutine.
+func (s *Session) SetNullPacketDeletion(on bool) error {
+	if s.main == nil {
+		return s.cfg.ErrNPDUnsupported
+	}
+	return s.sendCtrl(ctrlSet{kind: ctrlNPD, b: on})
+}
+
 // Stats returns the most recent snapshot of the flow's counters.
 func (s *Session) Stats() flow.Stats {
 	s.statsMu.Lock()

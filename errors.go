@@ -49,4 +49,9 @@ var (
 	// non-Advanced sender. Flow attributes (TR-06-3 §5.3.7) are an Advanced-profile
 	// control message; the Simple and Main profiles have no such channel.
 	ErrFlowAttrUnsupported = errors.New("rist: flow attributes require the Advanced profile")
+
+	// ErrNPDUnsupported is returned by [Sender.SetNullPacketDeletion] /
+	// [BondedSender.SetNullPacketDeletion] on a non-Main sender. Null-packet deletion
+	// (TR-06-2 §8.6) is a Main-profile feature.
+	ErrNPDUnsupported = errors.New("rist: null-packet deletion requires the Main profile")
 )

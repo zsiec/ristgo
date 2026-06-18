@@ -435,6 +435,15 @@ func (s *Sender) Authenticated() bool { return s.sess.Authenticated() }
 // RemoteAddr returns the receiver's media address.
 func (s *Sender) RemoteAddr() net.Addr { return net.UDPAddrFromAddrPort(s.remote) }
 
+// SetNullPacketDeletion enables or disables null-packet deletion (NPD) on the send
+// path at runtime — the counterpart of libRIST's rist_sender_npd_enable /
+// rist_sender_npd_disable. NPD suppresses MPEG-TS null packets before transmission
+// and signals their positions so the receiver reconstructs them byte-exact, shrinking
+// the wire on a padded stream. It takes effect from the next submitted packet; the
+// receiver always expands, so the toggle is one-sided. It returns ErrNPDUnsupported on
+// a non-Main sender (NPD is a Main-profile feature) and the close reason once closed.
+func (s *Sender) SetNullPacketDeletion(on bool) error { return s.sess.SetNullPacketDeletion(on) }
+
 // Close stops the sender and releases its sockets and goroutines.
 func (s *Sender) Close() error {
 	if s.ctxStop != nil {

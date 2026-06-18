@@ -402,6 +402,32 @@ func (r *Receiver) SSRC() uint32 { return r.sess.SSRC() }
 // has been authenticated; otherwise it is always true.
 func (r *Receiver) Authenticated() bool { return r.sess.Authenticated() }
 
+// SetNackType switches the NACK feedback format at runtime (libRIST
+// rist_receiver_nack_type_set): NACKRange (the default) or NACKBitmask. It takes
+// effect from the next NACK the receiver emits; the choice is local — a libRIST or
+// ristgo sender decodes either format. It returns ErrInvalidConfig for an unknown
+// nack type, or the close reason if the session has shut down.
+func (r *Receiver) SetNackType(nack NACKType) error {
+	if nack != NACKRange && nack != NACKBitmask {
+		return fmt.Errorf("%w: NACKType must be NACKRange (0) or NACKBitmask (1)", ErrInvalidConfig)
+	}
+	return r.sess.SetNackType(nack == NACKBitmask)
+}
+
+// SetRTTMultiplier sets the recovery-buffer RTT multiplier at runtime (libRIST
+// rist_recovery_rtt_multiplier_set): the factor by which the auto-scaling recovery
+// buffer grows relative to the smoothed RTT. It is effective only when the buffer is
+// windowed (RecoveryBufferMin != RecoveryBufferMax) and the sender has advertised
+// its retained buffer; it then takes effect on the next recalculation (~1 s).
+// multiplier must be in [1, MaxRTTMultiplier]. It returns ErrInvalidConfig for an
+// out-of-range value, or the close reason if the session has shut down.
+func (r *Receiver) SetRTTMultiplier(multiplier int) error {
+	if multiplier < 1 || multiplier > MaxRTTMultiplier {
+		return fmt.Errorf("%w: RTTMultiplier %d out of range [1,%d]", ErrInvalidConfig, multiplier, MaxRTTMultiplier)
+	}
+	return r.sess.SetRTTMultiplier(multiplier)
+}
+
 // Close stops the receiver and releases its sockets and goroutines.
 func (r *Receiver) Close() error {
 	if r.ctxStop != nil {

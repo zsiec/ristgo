@@ -144,3 +144,32 @@ func TestAutoScaleBuffer(t *testing.T) {
 		}
 	})
 }
+
+// TestSetRTTMultiplier verifies the runtime setter (BondedReceiver/Receiver.
+// SetRTTMultiplier, libRIST rist_recovery_rtt_multiplier_set): a changed multiplier
+// is read live by the next auto-scale pass, and 0 disables scaling.
+func TestSetRTTMultiplier(t *testing.T) {
+	f := windowedReceiver()
+	f.SetSenderMaxBuffer(ms(1000))
+	f.est = rtt.New(ms(100)) // mult 7 -> 100*7 + 15 = 715ms
+	f.autoScaleBuffer()
+	if f.recoveryBuffer != ms(715) {
+		t.Fatalf("buffer = %v, want 715ms (mult 7)", f.recoveryBuffer)
+	}
+
+	// A runtime change is read live: mult 3 -> 100*3 + 15 = 315ms (within [200,1000]).
+	// The decrease is rate-limited to 50ms/recalc, so converge to the new steady value.
+	f.SetRTTMultiplier(3)
+	converge(f)
+	if f.recoveryBuffer != ms(315) {
+		t.Fatalf("buffer = %v, want 315ms (mult 3 after runtime set)", f.recoveryBuffer)
+	}
+
+	// 0 disables auto-scaling: the buffer freezes wherever it was.
+	f.SetRTTMultiplier(0)
+	f.est = rtt.New(ms(500)) // would be huge if scaling were live
+	f.autoScaleBuffer()
+	if f.recoveryBuffer != ms(315) {
+		t.Fatalf("buffer = %v, want 315ms (mult 0 freezes the buffer)", f.recoveryBuffer)
+	}
+}
