@@ -6,6 +6,7 @@ import (
 	"github.com/zsiec/ristgo/internal/adv"
 	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/clock"
+	"github.com/zsiec/ristgo/internal/eap"
 	"github.com/zsiec/ristgo/internal/fec"
 	"github.com/zsiec/ristgo/internal/flow"
 	"github.com/zsiec/ristgo/internal/peer"
@@ -14,6 +15,19 @@ import (
 	"github.com/zsiec/ristgo/internal/socket"
 	"github.com/zsiec/ristgo/internal/wire"
 )
+
+// bondAuth is one bonded path's EAP-SRP state (combined PSK+SRP mode): a sender path
+// drives an Authenticatee, a receiver path an Authenticator, gating that path's media
+// until its handshake succeeds. The media itself stays keyed by the shared PSK codec, so
+// only the gate is per-path. Empty (the whole slice nil) when authentication is disabled.
+type bondAuth struct {
+	client    *eap.Authenticatee // sender role (nil on a receiver)
+	server    *eap.Authenticator // receiver role (nil on a sender)
+	authed    bool               // this path's handshake has succeeded
+	startSent bool               // sender: EAPOL-Start emitted once the peer is known
+	lastTx    *eap.Frame         // the outstanding frame to retransmit under loss
+	retx      int                // consecutive keepalive-driven retransmits
+}
 
 // This file is the link-bonding / SMPTE 2022-7 host: N network paths feeding one
 // flow. It is the Simple-profile bonded analog of the single-path host — the
@@ -99,18 +113,36 @@ type bondState struct {
 	// interleave fragments arriving on different paths). Each tracks its own control
 	// sequence so a dropped fragment is detected per path. nil unless FEC is enabled.
 	fecReasm []fecCtrlReassembler
+
+	// auth is the per-path EAP-SRP state (combined PSK+SRP mode). nil when no
+	// credentials are configured; otherwise one entry per path, gating that path's
+	// media until its handshake succeeds. See bondAuth.
+	auth []bondAuth
+
+	// everConnected records that the host connect callback has fired (the first path
+	// to authenticate); the bonded session connects once though paths auth per-path.
+	everConnected bool
 }
 
 // NewBondedReceiver builds a Simple-profile bonded receiver: one socket per
 // path, all feeding flow into a single deduplicated ring. group must already
 // have a path registered per conn (index = conn index); the constructor
 // registers them if empty.
-func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *Session {
+// eapServers, when non-nil, is one EAP-SRP Authenticator per path (combined PSK+SRP
+// mode): each path authenticates the connecting sender before its media is accepted.
+func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config, eapServers []*eap.Authenticator) *Session {
 	s := newSession(conns[0], cfg, false)
 	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
 	bs := &bondState{group: group, conns: conns, peers: make([]*peer.Peer, len(conns))}
 	if cfg.FEC != nil {
 		bs.fecReasm = make([]fecCtrlReassembler, len(conns))
+	}
+	if len(eapServers) > 0 {
+		bs.auth = make([]bondAuth, len(conns))
+		for i := range eapServers {
+			bs.auth[i].server = eapServers[i]
+		}
+		s.authed.Store(false) // hold every path's media until its handshake succeeds
 	}
 	for i := range conns {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
@@ -130,12 +162,21 @@ func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *
 // NewBondedSender builds a Simple-profile bonded sender: one socket that
 // duplicates every media datagram to each remote {media, rtcp} pair. conn is the
 // local ephemeral socket; remotes are the per-path receiver addresses.
-func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bonding.Group, cfg Config) *Session {
+// eapClients, when non-nil, is one EAP-SRP Authenticatee per path (combined PSK+SRP
+// mode): each path runs its own handshake to the receiver before its media flows.
+func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bonding.Group, cfg Config, eapClients []*eap.Authenticatee) *Session {
 	s := newSession(conn, cfg, true)
 	s.flow = flow.New(flow.RoleSender, cfg.Flow)
 	bs := &bondState{group: group, conns: []*socket.Conn{conn}, remotes: remotes, peers: make([]*peer.Peer, len(remotes))}
 	if cfg.FEC != nil {
 		bs.fecReasm = make([]fecCtrlReassembler, len(remotes))
+	}
+	if len(eapClients) > 0 {
+		bs.auth = make([]bondAuth, len(remotes))
+		for i := range eapClients {
+			bs.auth[i].client = eapClients[i]
+		}
+		s.authed.Store(false) // hold media until at least one path's handshake succeeds
 	}
 	for i := range remotes {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
@@ -396,6 +437,138 @@ func (s *Session) bondObserveRTT(now clock.Timestamp, idx uint8, fbs []wire.Feed
 	}
 }
 
+// bondPathAuthed reports whether path idx may carry media: always true when bonded
+// authentication is disabled, otherwise once that path's EAP-SRP handshake has succeeded.
+func (s *Session) bondPathAuthed(idx uint8) bool {
+	return len(s.bond.auth) == 0 || (int(idx) < len(s.bond.auth) && s.bond.auth[idx].authed)
+}
+
+// maybeStartBondEAP emits each sender path's EAPOL-Start exactly once (the remotes are
+// known at construction). A no-op on a receiver, a session without EAP, or after Start.
+func (s *Session) maybeStartBondEAP(now clock.Timestamp) {
+	for i := range s.bond.auth {
+		a := &s.bond.auth[i]
+		if a.client == nil || a.startSent {
+			continue
+		}
+		a.startSent = true
+		a.retx = 0
+		f := a.client.Start()
+		a.lastTx = &f
+		s.sendBondEAP(uint8(i), f, now)
+	}
+}
+
+// handleBondEAP drives path idx's EAP-SRP handshake with one inbound EAPOL frame: the
+// sender's Authenticatee or the receiver's Authenticator. On the first path to
+// authenticate it opens the session data channel (s.authed) and, on a receiver, runs the
+// host connect gate (rejecting tears the whole bonded session down). The media stays
+// keyed by the shared PSK codec — SRP only gates here — so no re-keying is done.
+func (s *Session) handleBondEAP(now clock.Timestamp, idx uint8, payload []byte) {
+	if int(idx) >= len(s.bond.auth) {
+		return
+	}
+	a := &s.bond.auth[idx]
+	a.retx = 0
+	var (
+		out      *eap.Frame
+		err      error
+		authedAt bool
+	)
+	switch {
+	case a.client != nil:
+		out, err = a.client.Recv(payload)
+		authedAt = a.client.Authenticated()
+	case a.server != nil:
+		out, err = a.server.Recv(payload)
+		authedAt = a.server.Authenticated()
+	default:
+		return
+	}
+	if err != nil {
+		s.logf("bond: eap path %d: %v", idx, err)
+	}
+	if out != nil {
+		a.lastTx = out
+		s.sendBondEAP(idx, *out, now)
+	}
+	wasAuthed := a.authed
+	a.authed = authedAt
+	if a.authed && !wasAuthed {
+		// First successful auth on this path. On a receiver, gate the connection once
+		// (the session connects on its first authenticated path).
+		if a.server != nil && !s.bond.everConnected {
+			s.bond.everConnected = true
+			if !s.admitBondPeer(idx) {
+				s.shutdown(s.cfg.ErrAuth)
+				return
+			}
+		}
+		// Open the session data channel on the first path up: app media + feedback flow,
+		// and sendBondMedia begins fanning to the now-authenticated path(s).
+		s.authed.Store(true)
+	}
+}
+
+// sendBondEAP frames an EAPOL payload through the shared codec and sends it on path idx
+// to that path's peer: a sender writes its one socket to remote idx; a receiver writes
+// path idx's socket to the learned sender address.
+func (s *Session) sendBondEAP(idx uint8, f eap.Frame, now clock.Timestamp) {
+	s.lastTx = now
+	s.rtcpBuf = s.rtcpBuf[:0]
+	b, err := s.main.encodeEAPOL(s.rtcpBuf, f.AppendTo(nil))
+	if err != nil {
+		s.logf("bond: encode eap path %d: %v", idx, err)
+		return
+	}
+	s.rtcpBuf = b
+	var (
+		conn *socket.Conn
+		dst  netip.AddrPort
+	)
+	if s.sender {
+		conn, dst = s.bond.conns[0], s.bond.remotes[idx][0]
+	} else {
+		conn, dst = s.bond.conns[idx], s.bond.peers[idx].Media
+	}
+	if !dst.IsValid() {
+		return
+	}
+	if err := conn.WriteMedia(b, dst); err != nil {
+		s.logf("bond: write eap path %d: %v", idx, err)
+	}
+}
+
+// admitBondPeer offers path idx's just-authenticated peer to the host connect callback
+// (libRIST rist_auth_handler_set) and records the ConnectInfo for the disconnect
+// callback. Returns whether the peer is admitted (true when no callback is set).
+func (s *Session) admitBondPeer(idx uint8) bool {
+	info := ConnectInfo{Remote: s.bond.peers[idx].Media.String()}
+	if a := s.bond.auth[idx].server; a != nil {
+		info.Username = a.PeerUsername()
+	}
+	if s.cfg.OnConnect != nil && !s.cfg.OnConnect(info) {
+		return false
+	}
+	s.connected = &info
+	return true
+}
+
+// maybeRetransmitBondEAP re-sends each not-yet-authenticated path's outstanding EAPOL
+// frame (EAP-SRP frames are not ARQ-protected, so a dropped handshake datagram would
+// otherwise deadlock auth under loss). Called on the keepalive tick; the peer replays
+// its reply idempotently, and a stalled handshake is bounded by the session timeout.
+func (s *Session) maybeRetransmitBondEAP(now clock.Timestamp) {
+	for i := range s.bond.auth {
+		a := &s.bond.auth[i]
+		if a.authed || a.lastTx == nil || a.retx >= maxEAPRetx {
+			continue
+		}
+		a.retx++
+		s.sendBondEAP(uint8(i), *a.lastTx, now)
+	}
+}
+
 // handleBondSimple routes one Simple-profile bonded datagram: RTCP into feedback
 // (with per-path RTT), media into the flow with its path index. Media is decoded
 // with the SHARED decoder so identical wire bytes from any path reconstruct to
@@ -429,6 +602,13 @@ func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, b
 		}
 		return
 	}
+	// EAP-SRP authentication frame: route to this path's handshake (combined PSK+SRP).
+	if len(s.bond.auth) > 0 {
+		if eapPayload, ok := s.main.peekEAPOL(bi.data); ok {
+			s.handleBondEAP(now, idx, eapPayload)
+			return
+		}
+	}
 	isMedia, pkt, fbs, bn, err := s.main.decodeMain(bi.data, s.highestSent)
 	if err != nil {
 		return
@@ -438,6 +618,11 @@ func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, b
 		return
 	}
 	if isMedia {
+		// Drop media on a path that has not completed its EAP-SRP handshake (a no-op
+		// when authentication is disabled — bondPathAuthed is then always true).
+		if !s.bondPathAuthed(idx) {
+			return
+		}
 		s.feedMedia(now, idx, pkt)
 		if s.fecEnabled() {
 			s.fecRecvRTP(now, s.main.dec.lastWireTS, pkt)
@@ -563,6 +748,11 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		if !s.bond.group.ShouldDuplicate(uint8(i), now) {
 			continue
 		}
+		// Don't transmit media on a path whose EAP-SRP handshake has not yet succeeded
+		// (a no-op when authentication is disabled).
+		if !s.bondPathAuthed(uint8(i)) {
+			continue
+		}
 		s.bond.group.CountSent(uint8(i), len(pkt.Payload), pkt.Retransmit)
 		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[i][0]); err != nil {
 			s.logf("bond: write media path %d: %v", i, err)
@@ -574,7 +764,7 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	// above, so no path is sent the same datagram twice. Record the election so the
 	// FEC fan-out reuses it instead of spending another rotation credit (see fanBondPaths).
 	idx, ok := s.bond.group.SelectWeighted(now)
-	s.bond.lastWeighted, s.bond.lastWeightedOK = idx, ok && int(idx) < len(s.bond.remotes)
+	s.bond.lastWeighted, s.bond.lastWeightedOK = idx, ok && int(idx) < len(s.bond.remotes) && s.bondPathAuthed(idx)
 	if s.bond.lastWeightedOK {
 		s.bond.group.CountSent(idx, len(pkt.Payload), pkt.Retransmit)
 		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[idx][0]); err != nil {
@@ -854,6 +1044,11 @@ func (s *Session) writeBondFeedback(conn *socket.Conn, greCodec *mainCodec, simp
 // FEC regardless of it, so the only effect is that a peer inspecting the beacon is not
 // told FEC is in use on a bonded Main link.
 func (s *Session) sendBondKeepalive(now clock.Timestamp) {
+	// Retransmit any path's outstanding EAP-SRP frame until it authenticates (EAPOL is
+	// not ARQ-protected); a no-op once every path is up or auth is disabled.
+	if len(s.bond.auth) > 0 {
+		s.maybeRetransmitBondEAP(now)
+	}
 	echo := []wire.Feedback{wire.RttEchoRequest{Timestamp: uint64(clock.NTPTimeFromTimestamp(now))}}
 	if s.sender {
 		s.sendBondFeedback(echo, now)

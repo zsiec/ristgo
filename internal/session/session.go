@@ -910,6 +910,11 @@ func (s *Session) loop() {
 	// A caller knows its peer now, so it starts immediately; a listener authenticatee
 	// has no peer yet and defers until one is learned (maybeStartEAP from the loop).
 	s.maybeStartEAP(s.clk.Now())
+	// A bonded sender opens an EAP-SRP handshake on every path at once (the remotes are
+	// known up front); a bonded receiver authenticates each path as it responds.
+	if s.bond != nil {
+		s.maybeStartBondEAP(s.clk.Now())
+	}
 
 	for {
 		// Hold outbound media (appIn) until the data channel is authenticated;

@@ -8,6 +8,7 @@ import (
 
 	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/clock"
+	"github.com/zsiec/ristgo/internal/eap"
 	"github.com/zsiec/ristgo/internal/session"
 	"github.com/zsiec/ristgo/internal/socket"
 )
@@ -199,7 +200,21 @@ func newBondedReceiver(addrs []string, priorities []uint32, cfg Config) (*Bonded
 			return nil, err
 		}
 	}
-	sess := session.NewBondedReceiver(conns, bondingGroupWith(cfg, priorities, nil), sc)
+	// Bonded EAP-SRP (combined PSK+SRP; validated to require a Secret): one fresh
+	// Authenticator per path, each with its own salt/verifier, gating that path's media.
+	var eapServers []*eap.Authenticator
+	if cfg.Username != "" {
+		eapServers = make([]*eap.Authenticator, len(conns))
+		for i := range conns {
+			srv, eerr := buildEAPServer(cfg)
+			if eerr != nil {
+				closeConns(conns)
+				return nil, eerr
+			}
+			eapServers[i] = srv
+		}
+	}
+	sess := session.NewBondedReceiver(conns, bondingGroupWith(cfg, priorities, nil), sc, eapServers)
 	return &BondedReceiver{sess: sess, cfg: cfg}, nil
 }
 
@@ -343,7 +358,21 @@ func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Con
 		conn.Close()
 		return nil, err
 	}
-	sess := session.NewBondedSender(conn, remotes, bondingGroupWith(cfg, priorities, weights), sc)
+	// Bonded EAP-SRP (combined PSK+SRP): one Authenticatee per path, each running its
+	// own handshake to the receiver before that path's media flows.
+	var eapClients []*eap.Authenticatee
+	if cfg.Username != "" {
+		eapClients = make([]*eap.Authenticatee, len(remotes))
+		for i := range remotes {
+			cl, eerr := buildEAPClient(cfg)
+			if eerr != nil {
+				conn.Close()
+				return nil, eerr
+			}
+			eapClients[i] = cl
+		}
+	}
+	sess := session.NewBondedSender(conn, remotes, bondingGroupWith(cfg, priorities, weights), sc, eapClients)
 	maxWrite := 0
 	if cfg.FragmentSize > 0 {
 		maxWrite = cfg.FragmentSize * maxFragmentsPerWrite
@@ -352,14 +381,19 @@ func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Con
 }
 
 // bondedSupported fails closed on the bonded features not implemented: DTLS over
-// multipath and EAP-SRP authentication over multipath. All three profiles
-// (Simple, Main, Advanced) are supported, including Main/Advanced PSK encryption.
+// multipath, and EAP-SRP over multipath WITHOUT a pre-shared Secret. All three
+// profiles (Simple, Main, Advanced) are supported, including Main/Advanced PSK
+// encryption. Bonded EAP-SRP is supported only in the combined PSK+SRP mode (a Secret
+// is set): each path authenticates with its own handshake but the media stays keyed by
+// the shared PSK, so the per-path gate rides on one shared codec. The pure-SRP
+// use_key_as_passphrase mode (no Secret) would re-key each path's media to its own SRP
+// session key and is not supported on bonded (the single-flow path supports it).
 func bondedSupported(cfg Config) error {
 	if cfg.DTLS != nil {
 		return fmt.Errorf("%w: bonded DTLS is not supported", ErrInvalidConfig)
 	}
-	if cfg.Username != "" {
-		return fmt.Errorf("%w: bonded EAP-SRP authentication is not supported", ErrInvalidConfig)
+	if cfg.Username != "" && cfg.Secret == "" {
+		return fmt.Errorf("%w: bonded EAP-SRP requires a Secret (the PSK+SRP mode); pure-SRP bonding is not supported", ErrInvalidConfig)
 	}
 	return nil
 }
