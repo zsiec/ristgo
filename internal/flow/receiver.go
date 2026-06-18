@@ -80,6 +80,12 @@ type slot struct {
 	// an unfragmented payload.
 	frag wire.FragRole
 
+	// virtSrcPort/virtDstPort are the RIST virtual ports decoded from the packet
+	// (Main), surfaced on Deliver so the host can report them per block. 0 on the
+	// Simple/Advanced profiles.
+	virtSrcPort uint16
+	virtDstPort uint16
+
 	// state is slotEmpty or slotFilled.
 	state slotState
 }
@@ -516,6 +522,8 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	s.sourceTime = pkt.SourceTime
 	s.payload = pkt.Payload
 	s.frag = pkt.Frag
+	s.virtSrcPort = pkt.VirtSrcPort
+	s.virtDstPort = pkt.VirtDstPort
 	s.arrival = now
 	s.packetTime = packetTime
 	s.outputTime = packetTime.Add(f.recoveryBuffer)
@@ -590,6 +598,8 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	s.sourceTime = pkt.SourceTime
 	s.payload = pkt.Payload
 	s.frag = pkt.Frag
+	s.virtSrcPort = pkt.VirtSrcPort
+	s.virtDstPort = pkt.VirtDstPort
 	s.arrival = now
 	s.packetTime = now
 	s.outputTime = now.Add(f.recoveryBuffer)
@@ -907,6 +917,8 @@ func (f *Flow) emitDeliver(s *slot) {
 		Payload:       s.payload,
 		Discontinuity: r.pendingDiscontinuity,
 		Frag:          s.frag,
+		VirtSrcPort:   s.virtSrcPort,
+		VirtDstPort:   s.virtDstPort,
 	})
 	r.pendingDiscontinuity = false
 	f.stats.Delivered++

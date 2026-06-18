@@ -90,7 +90,7 @@ func (r *Reflector) Close() error {
 func (r *Reflector) pump() {
 	defer close(r.pumpDone)
 	for {
-		seq, sourceTime, payload, err := r.sess.RecvBlock()
+		seq, sourceTime, _, _, payload, err := r.sess.RecvBlock()
 		if err != nil {
 			return // input closed
 		}

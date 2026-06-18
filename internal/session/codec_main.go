@@ -131,6 +131,13 @@ type mainCodec struct {
 	srcPort uint16
 	dstPort uint16
 
+	// lastVirtSrc/lastVirtDst hold the virtual ports parsed from the most recent
+	// inbound reduced-overhead header, read by decodeMediaMain (which runs right after
+	// mainRegion parses them) to surface them on the MediaPacket. Per-decode scratch;
+	// the codec is single-threaded.
+	lastVirtSrc uint16
+	lastVirtDst uint16
+
 	// npdEnabled selects null-packet deletion on the media encode path. When
 	// set and a payload is a whole number of <=7 TS packets with at least one
 	// null packet, the codec suppresses the nulls and attaches the RIST NPD
@@ -849,10 +856,12 @@ func (c *mainCodec) mainRegion(b []byte) (region []byte, isRTCP, encrypted bool,
 		}
 	}
 
-	// Strip the reduced-overhead header; the inner packet follows.
-	if _, n, perr := gre.ParseReduced(region); perr != nil {
+	// Strip the reduced-overhead header; the inner packet follows. Keep its virtual
+	// ports so decodeMediaMain can surface them per packet (libRIST data-block).
+	if rh, n, perr := gre.ParseReduced(region); perr != nil {
 		return nil, false, false, nil, perr
 	} else {
+		c.lastVirtSrc, c.lastVirtDst = rh.SrcPort, rh.DstPort
 		region = region[n:]
 	}
 
@@ -956,11 +965,13 @@ func (c *mainCodec) decodeMediaMain(b []byte) (wire.MediaPacket, error) {
 	c.dec.lastWireTS = p.Timestamp
 
 	return wire.MediaPacket{
-		Seq:        seq32,
-		SourceTime: c.dec.sourceTime(seq32, p.Timestamp),
-		SSRC:       rtp.NormalizeSSRC(p.SSRC),
-		Payload:    payload,
-		Retransmit: rtp.IsRetransmit(p.SSRC),
+		Seq:         seq32,
+		SourceTime:  c.dec.sourceTime(seq32, p.Timestamp),
+		SSRC:        rtp.NormalizeSSRC(p.SSRC),
+		Payload:     payload,
+		Retransmit:  rtp.IsRetransmit(p.SSRC),
+		VirtSrcPort: c.lastVirtSrc,
+		VirtDstPort: c.lastVirtDst,
 	}, nil
 }
 

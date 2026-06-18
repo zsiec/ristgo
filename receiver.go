@@ -32,8 +32,27 @@ func readEOF(n int, err error) (int, error) {
 // but Read itself is not safe to call from multiple goroutines at once (it is
 // a single-consumer stream, like a net.Conn).
 type Receiver struct {
-	sess    *session.Session
-	ctxStop func() // ends the context watcher (set by Listen); nil for New* constructors
+	sess      *session.Session
+	ctxStop   func() // ends the context watcher (set by Listen); nil for New* constructors
+	blockMode bool   // Config.BlockDelivery: RecvBlock is the delivery path, Read is unavailable
+}
+
+// DataBlock is one recovered media packet with its per-packet metadata, returned by
+// [Receiver.RecvBlock] when [Config.BlockDelivery] is set (libRIST
+// rist_receiver_data_block). Raw per-packet granularity: it bypasses the split-merge
+// recombination that Read applies.
+type DataBlock struct {
+	// Payload is the recovered media payload (a fresh copy the caller owns).
+	Payload []byte
+	// Seq is the 32-bit (widened) sequence number of the packet.
+	Seq uint32
+	// SourceTime is the sender's NTP-64 source timestamp (libRIST ts_ntp).
+	SourceTime uint64
+	// VirtSrcPort is the RIST virtual source port decoded from the reduced-overhead header.
+	VirtSrcPort uint16
+	// VirtDstPort is the RIST virtual destination port decoded from the reduced-overhead
+	// header — the virtual-stream demux key.
+	VirtDstPort uint16
 }
 
 // NewReceiver binds a RIST receiver at addr ("host:port" or a rist:// URL
@@ -176,6 +195,7 @@ func newMainReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 	sc.Main = mp
 	sc.AdaptLQM = cfg.SourceAdaptation
 	sc.OneWay = oneWay
+	sc.BlockDelivery = cfg.BlockDelivery
 	// Main-profile FEC (over the inner RTP payload) uses the separate-port carriage,
 	// like Simple: bind the column/row FEC sockets next to the media port.
 	if cfg.FEC != nil && cfg.FEC.carriage(false) == FECCarriageSeparatePorts {
@@ -185,7 +205,7 @@ func newMainReceiver(addr string, cfg Config, oneWay bool) (*Receiver, error) {
 		}
 	}
 	sess := session.NewMainReceiver(conn, sc)
-	return &Receiver{sess: sess}, nil
+	return &Receiver{sess: sess, blockMode: cfg.BlockDelivery}, nil
 }
 
 // newAdvReceiver binds an Advanced-profile receiver: RTP-based media (with
@@ -334,7 +354,28 @@ func newAdvReceiverCaller(addr string, cfg Config) (*Receiver, error) {
 // available, the read deadline passes (ErrTimeout), or the stream ends. A clean
 // Close ends the stream with io.EOF (so io.Copy returns nil); an abnormal
 // teardown returns ErrSessionTimeout, ErrBufferOverflow, or ErrAuth.
-func (r *Receiver) Read(p []byte) (int, error) { return readEOF(r.sess.Read(p)) }
+func (r *Receiver) Read(p []byte) (int, error) {
+	if r.blockMode {
+		return 0, fmt.Errorf("%w: Read is unavailable on a block-delivery receiver; use RecvBlock", ErrInvalidConfig)
+	}
+	return readEOF(r.sess.Read(p))
+}
+
+// RecvBlock returns the next recovered packet as a [DataBlock] with its per-packet
+// metadata — sequence, source timestamp, and decoded virtual ports (libRIST
+// rist_receiver_data_block). Delivery is at raw per-packet granularity (no split-merge
+// recombination). Requires [Config.BlockDelivery]; it blocks until a block is available
+// or the session closes (returning the close reason, e.g. ErrTimeout / ErrAuth / EOF).
+func (r *Receiver) RecvBlock() (DataBlock, error) {
+	if !r.blockMode {
+		return DataBlock{}, fmt.Errorf("%w: RecvBlock requires Config.BlockDelivery on a Main receiver", ErrInvalidConfig)
+	}
+	seq, st, vs, vd, payload, err := r.sess.RecvBlock()
+	if err != nil {
+		return DataBlock{}, err
+	}
+	return DataBlock{Payload: payload, Seq: seq, SourceTime: st, VirtSrcPort: vs, VirtDstPort: vd}, nil
+}
 
 // SetReadDeadline sets the deadline for future Read calls; a zero time clears
 // it.

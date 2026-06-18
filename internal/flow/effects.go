@@ -126,6 +126,11 @@ type Deliver struct {
 	// payload, dropping the run when a Discontinuity marks a lost fragment. The
 	// zero value FragStandalone is a whole, unfragmented payload.
 	Frag wire.FragRole
+	// VirtSrcPort and VirtDstPort are the RIST virtual source/destination ports
+	// decoded from the delivered packet (Main reduced-overhead header), for the host
+	// to surface per block (libRIST data-block). 0 on the Simple/Advanced profiles.
+	VirtSrcPort uint16
+	VirtDstPort uint16
 }
 
 // isEvent seals Deliver into the Event variant set.

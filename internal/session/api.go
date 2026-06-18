@@ -286,24 +286,27 @@ type appBlock struct {
 // receive-side counterpart of appBlock, carried to a reflector pump so it can re-emit
 // the packet preserving (seq, sourceTime).
 type mediaBlock struct {
-	seq        uint32
-	sourceTime uint64
-	payload    []byte
+	seq         uint32
+	sourceTime  uint64
+	virtSrcPort uint16
+	virtDstPort uint16
+	payload     []byte
 }
 
-// RecvBlock returns the next recovered, in-order media block from a reflector-input
-// session (NewMainReflectorInput): its sequence number, source timestamp, and payload.
-// It blocks until a block is available or the session closes, returning the close
-// reason on close. The payload is a fresh copy the caller owns.
-func (s *Session) RecvBlock() (seq uint32, sourceTime uint64, payload []byte, err error) {
+// RecvBlock returns the next recovered, in-order media block: its sequence number,
+// source timestamp, decoded virtual ports, and payload. Used by a reflector-input
+// session (NewMainReflectorInput) and by a block-delivery receiver (Config.BlockDelivery).
+// It blocks until a block is available or the session closes, returning the close reason
+// on close. The payload is a fresh copy the caller owns.
+func (s *Session) RecvBlock() (seq uint32, sourceTime uint64, virtSrc, virtDst uint16, payload []byte, err error) {
 	select {
 	case b, ok := <-s.blockOut:
 		if !ok {
-			return 0, 0, nil, s.closeReason()
+			return 0, 0, 0, 0, nil, s.closeReason()
 		}
-		return b.seq, b.sourceTime, b.payload, nil
+		return b.seq, b.sourceTime, b.virtSrcPort, b.virtDstPort, b.payload, nil
 	case <-s.done:
-		return 0, 0, nil, s.closeReason()
+		return 0, 0, 0, 0, nil, s.closeReason()
 	}
 }
 

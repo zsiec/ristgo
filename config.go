@@ -196,6 +196,13 @@ type Config struct {
 	// (source|arrival|rtc; rtc maps to arrival).
 	TimingMode TimingMode
 
+	// BlockDelivery makes a Main receiver deliver each recovered packet as a
+	// [DataBlock] over [Receiver.RecvBlock] — sequence, source timestamp, and decoded
+	// virtual ports — instead of merged payloads over Read (libRIST
+	// rist_receiver_data_block). Raw per-packet granularity (bypasses the split-merge
+	// recombination). Main profile, receiver-side; false (default) keeps payload delivery.
+	BlockDelivery bool
+
 	// Secret is the pre-shared passphrase enabling PSK encryption
 	// (Main and Advanced profiles). Empty disables encryption.
 	// Maximum 127 bytes (libRIST RIST_MAX_STRING_SHORT).
@@ -504,6 +511,9 @@ func (cfg *Config) validate() error {
 	}
 	if len(cfg.SRPUsers) > 0 && cfg.Profile != ProfileMain {
 		return errors.New("rist: SRPUsers (multi-user EAP-SRP) requires ProfileMain")
+	}
+	if cfg.BlockDelivery && cfg.Profile != ProfileMain {
+		return errors.New("rist: BlockDelivery (per-packet block delivery) requires ProfileMain")
 	}
 	if cfg.Compression && cfg.Profile != ProfileAdvanced {
 		return errors.New("rist: Compression requires ProfileAdvanced")

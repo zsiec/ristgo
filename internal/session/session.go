@@ -170,6 +170,12 @@ type Config struct {
 	// design — an unseen peer never expires). The zero value is the normal
 	// bidirectional session.
 	OneWay bool
+
+	// BlockDelivery makes a Main receiver deliver each recovered packet as a media
+	// block over RecvBlock (seq + sourceTime + virtual ports + payload), rather than a
+	// bare payload over Read — libRIST rist_receiver_data_block. Per-packet granularity
+	// (bypasses the split-merge reassembly).
+	BlockDelivery bool
 }
 
 // MainParams carries the Main-profile codec parameters. The public layer builds
@@ -582,6 +588,11 @@ func NewMainSender(conn *socket.Conn, remote netip.AddrPort, cfg Config) *Sessio
 func NewMainReceiver(conn *socket.Conn, cfg Config) *Session {
 	s := newSession(conn, cfg, false)
 	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	if cfg.BlockDelivery {
+		// Per-packet block delivery (Config.BlockDelivery): the deliver path feeds each
+		// recovered packet to blockOut for RecvBlock instead of the payload Read path.
+		s.blockOut = make(chan mediaBlock, 256)
+	}
 	s.start()
 	return s
 }
@@ -1188,7 +1199,7 @@ func (s *Session) queueBlock(d flow.Deliver) {
 	cp := make([]byte, len(d.Payload))
 	copy(cp, d.Payload)
 	select {
-	case s.blockOut <- mediaBlock{seq: d.Seq, sourceTime: d.SourceTime, payload: cp}:
+	case s.blockOut <- mediaBlock{seq: d.Seq, sourceTime: d.SourceTime, virtSrcPort: d.VirtSrcPort, virtDstPort: d.VirtDstPort, payload: cp}:
 	case <-s.done:
 	}
 }

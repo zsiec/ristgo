@@ -90,6 +90,16 @@ type MediaPacket struct {
 	// through opaquely (it never inspects it); the session splits payloads on
 	// send and reassembles fragments after in-order delivery.
 	Frag FragRole
+
+	// VirtSrcPort and VirtDstPort are the RIST virtual source/destination ports
+	// carried in the Main reduced-overhead data header. The receiving codec sets
+	// them per packet from the wire; flow carries them opaquely through the ring to
+	// delivery so the host can surface them per block (libRIST data-block
+	// virt_src_port/virt_dst_port). They are 0 on a send-built packet (the sending
+	// codec uses the configured ports) and on the Simple/Advanced profiles, which
+	// carry no virtual ports in their data header.
+	VirtSrcPort uint16
+	VirtDstPort uint16
 }
 
 // FragRole is the Advanced-profile fragment role of a MediaPacket, mapping to
