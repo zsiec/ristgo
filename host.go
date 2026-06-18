@@ -343,17 +343,35 @@ func buildEAPClient(cfg Config) (*eap.Authenticatee, error) {
 // username/password, served by a single-user lookup. Returns (nil, nil) when no
 // Username is set.
 func buildEAPServer(cfg Config) (*eap.Authenticator, error) {
-	if cfg.Username == "" {
+	// Collect the single user plus any multi-user credentials (libRIST multi-user SRP).
+	creds := make(map[string]string)
+	if cfg.Username != "" {
+		creds[cfg.Username] = cfg.Password
+	}
+	for u, p := range cfg.SRPUsers {
+		creds[u] = p
+	}
+	if len(creds) == 0 {
 		return nil, nil
 	}
-	salt := make([]byte, 32)
-	if _, err := randRead(salt); err != nil {
-		return nil, fmt.Errorf("%w: SRP salt: %w", ErrInvalidConfig, err)
+	// Derive a fresh per-session salt + verifier per user into a lookup table keyed by
+	// username (libRIST's user_verifier_lookup_t resolves by the username a connecting
+	// peer presents in its IDENTITY RESPONSE).
+	type vs struct{ verifier, salt []byte }
+	table := make(map[string]vs, len(creds))
+	for user, pass := range creds {
+		if user == "" || pass == "" {
+			return nil, fmt.Errorf("%w: SRP username and password must be non-empty", ErrInvalidConfig)
+		}
+		salt := make([]byte, 32)
+		if _, err := randRead(salt); err != nil {
+			return nil, fmt.Errorf("%w: SRP salt: %w", ErrInvalidConfig, err)
+		}
+		table[user] = vs{srp.MakeVerifier(srp.DefaultGroup(), user, pass, salt), salt}
 	}
-	verifier := srp.MakeVerifier(srp.DefaultGroup(), cfg.Username, cfg.Password, salt)
 	lookup := func(user string) ([]byte, []byte, bool) {
-		if user == cfg.Username {
-			return verifier, salt, true
+		if e, ok := table[user]; ok {
+			return e.verifier, e.salt, true
 		}
 		return nil, nil, false
 	}
@@ -565,8 +583,20 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 		ErrNPDUnsupported:       ErrNPDUnsupported,
 		ErrSendBlockUnsupported: ErrSendBlockUnsupported,
 		OnFlowAttr:              cfg.OnFlowAttr,
+		OnConnect:               toSessionConnectCB(cfg.OnConnect),
 		SplitMode:               toSplitMode(cfg.SplitMode),
 		MergeMode:               toMergeMode(cfg.MergeMode),
+	}
+}
+
+// toSessionConnectCB adapts the public OnConnect callback to the session's ConnectInfo
+// type (the two packages keep separate ConnectInfo types to avoid an import cycle).
+func toSessionConnectCB(cb func(ConnectInfo) bool) func(session.ConnectInfo) bool {
+	if cb == nil {
+		return nil
+	}
+	return func(si session.ConnectInfo) bool {
+		return cb(ConnectInfo{Remote: si.Remote, Username: si.Username})
 	}
 }
 

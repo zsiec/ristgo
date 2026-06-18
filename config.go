@@ -46,6 +46,17 @@ const (
 	maxLongString  = 255
 )
 
+// ConnectInfo describes a peer offered to a [Config.OnConnect] callback when it
+// connects: its remote address and, for an EAP-SRP-authenticated connection, the
+// username it authenticated as (libRIST rist_auth_handler_set's connect-callback args).
+type ConnectInfo struct {
+	// Remote is the peer's remote address ("host:port").
+	Remote string
+	// Username is the SRP username the peer authenticated as, or "" for an
+	// unauthenticated (no-SRP) connection.
+	Username string
+}
+
 // Config contains RIST sender/receiver configuration.
 //
 // The zero value of every field means "use the default"; validation fills
@@ -228,6 +239,14 @@ type Config struct {
 	// false (RFC-5054 PAD, the libRIST 0.2.16+ default).
 	SRPCompat bool
 
+	// SRPUsers is an additional set of EAP-SRP username->password credentials a
+	// listener (authenticator) accepts (libRIST multi-user SRP / rist_enable_eap_srp_2):
+	// when non-empty, the authenticator looks up the verifier for whichever username a
+	// connecting peer presents, so any of these users (plus Username/Password if also
+	// set) can authenticate. Ignored on a sender. Pair it with OnConnect to gate which
+	// authenticated users are admitted.
+	SRPUsers map[string]string
+
 	// Compression enables payload compression (Advanced profile only;
 	// libRIST compression). Receivers auto-detect. Default: false.
 	Compression bool
@@ -308,6 +327,15 @@ type Config struct {
 	// retain), and the callback runs on the session's event loop, so it must not
 	// block. nil (the default) drops inbound flow attributes. Advanced profile only.
 	OnFlowAttr func(json []byte)
+
+	// OnConnect, set on a listener, is the connection accept/reject callback (libRIST
+	// rist_auth_handler_set): it is invoked once per peer after a successful EAP-SRP
+	// handshake with the peer's [ConnectInfo] (remote address + authenticated username);
+	// returning false rejects (tears down) the connection, mirroring libRIST's non-zero
+	// connect-callback return. nil (the default) admits every authenticated peer. Pair it
+	// with SRPUsers to gate which of several identities may connect. The callback runs on
+	// the session's event loop, so it must not block.
+	OnConnect func(info ConnectInfo) bool
 
 	// Interface is the name of the network interface used for multicast
 	// (libRIST "miface"): a sender's outbound multicast egress interface and a
@@ -473,6 +501,9 @@ func (cfg *Config) validate() error {
 	}
 	if cfg.Username != "" && cfg.Profile != ProfileMain {
 		return errors.New("rist: Username/Password (EAP-SRP authentication) requires ProfileMain")
+	}
+	if len(cfg.SRPUsers) > 0 && cfg.Profile != ProfileMain {
+		return errors.New("rist: SRPUsers (multi-user EAP-SRP) requires ProfileMain")
 	}
 	if cfg.Compression && cfg.Profile != ProfileAdvanced {
 		return errors.New("rist: Compression requires ProfileAdvanced")

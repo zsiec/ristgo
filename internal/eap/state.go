@@ -608,6 +608,11 @@ func (a *Authenticator) Done() bool {
 // (eap_is_authenticated).
 func (a *Authenticator) Authenticated() bool { return a.state == StateSuccess }
 
+// PeerUsername returns the username the peer presented in its IDENTITY RESPONSE
+// (empty until one has arrived). After a successful handshake it is the authenticated
+// identity, used by the host's connection callback (libRIST multi-user SRP).
+func (a *Authenticator) PeerUsername() string { return a.username }
+
 // SessionKey returns the SRP session key K derived during a successful
 // handshake, or nil before then.
 func (a *Authenticator) SessionKey() []byte {

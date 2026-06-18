@@ -38,6 +38,16 @@ import (
 // maxDatagram bounds a single UDP read (RIST packets are MTU-sized).
 const maxDatagram = 2048
 
+// ConnectInfo describes a peer offered to the [Config.OnConnect] callback: its remote
+// address and the SRP username it authenticated as (the host maps it to the public
+// ristgo.ConnectInfo, kept separate to avoid an import cycle).
+type ConnectInfo struct {
+	// Remote is the peer's remote address ("host:port").
+	Remote string
+	// Username is the SRP username the peer authenticated as, or "" if unauthenticated.
+	Username string
+}
+
 // Config carries the per-session parameters the host needs, already translated
 // from the public ristgo.Config (kept separate to avoid an import cycle).
 type Config struct {
@@ -112,6 +122,12 @@ type Config struct {
 	// only for the duration of the call (it aliases codec scratch); the callback
 	// runs on the event loop, so it must not block. nil disables the channel.
 	OnFlowAttr func(json []byte)
+
+	// OnConnect, set on a listener, gates a peer after a successful EAP-SRP handshake
+	// (libRIST rist_auth_handler_set): it is called once with the peer's ConnectInfo and
+	// returning false tears the session down. nil admits every authenticated peer. The
+	// callback runs on the event loop, so it must not block.
+	OnConnect func(info ConnectInfo) bool
 
 	// FragmentSize, when > 0, makes the sender split an application payload
 	// larger than this many bytes across consecutive sequences, each an
@@ -1845,6 +1861,21 @@ func (s *Session) upgradeGREVersion(version uint8) {
 // payload: it feeds the configured role, sends any reply EAPOL frame, opens the
 // data channel (authed) once the handshake authenticates, and tears the session
 // down with ErrAuth if it definitively fails.
+// admitPeer offers a just-authenticated peer to the host connection callback (libRIST
+// rist_auth_handler_set): it builds the ConnectInfo (remote address + the SRP username)
+// and returns whether the peer is admitted. Admits unconditionally when no callback is
+// configured.
+func (s *Session) admitPeer() bool {
+	if s.cfg.OnConnect == nil {
+		return true
+	}
+	info := ConnectInfo{Remote: s.peer.Media.String()}
+	if s.eapServer != nil {
+		info.Username = s.eapServer.PeerUsername()
+	}
+	return s.cfg.OnConnect(info)
+}
+
 func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 	var (
 		out  *eap.Frame
@@ -1882,9 +1913,16 @@ func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {
 	switch {
 	case role.Authenticated():
 		// SUCCESS — the initial handshake, or a NAT-rebind / in-band re-auth just
-		// completed and re-proved the tuple. The authenticatee drives the post-SUCCESS
-		// PASSWORD_REQUEST once, after installing its keys (eap_request_passphrase on
-		// SUCCESS).
+		// completed and re-proved the tuple. The host connection callback gates the
+		// FIRST authentication only (a re-auth re-proves an already-admitted peer); a
+		// rejection tears the session down before media ever flows (libRIST
+		// rist_auth_handler_set).
+		if !s.everAuthed && !s.admitPeer() {
+			s.shutdown(s.cfg.ErrAuth)
+			return
+		}
+		// The authenticatee drives the post-SUCCESS PASSWORD_REQUEST once, after
+		// installing its keys (eap_request_passphrase on SUCCESS).
 		s.maybeSendPasswordRequest(now)
 		s.authed.Store(true)
 		s.everAuthed = true
