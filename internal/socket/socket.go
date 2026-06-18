@@ -258,6 +258,11 @@ func bindNet(network, host string, port int) (*net.UDPConn, error) {
 	// to grow the buffer must not fail the bind.
 	_ = conn.SetReadBuffer(SocketBufferBytes)
 	_ = conn.SetWriteBuffer(SocketBufferBytes)
+	// Best-effort Don't-Fragment: set the DF bit so an oversized datagram is dropped
+	// rather than silently IP-fragmented — a fragmented RIST datagram loses the whole
+	// packet if any fragment is lost, which ARQ then has to recover (libRIST sets this
+	// on every UDP socket; failure is non-fatal and the socket still works).
+	setDontFragment(conn)
 	return conn, nil
 }
 
