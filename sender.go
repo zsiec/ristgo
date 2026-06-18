@@ -455,7 +455,19 @@ func (s *Sender) SetNullPacketDeletion(on bool) error { return s.sess.SetNullPac
 func (s *Sender) SendBlock(payload []byte, seq *uint32, sourceTime *uint64) error {
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
-	return s.sess.SendBlock(buf, seq, sourceTime)
+	// Deep-copy the overrides: they cross to the event loop asynchronously, so
+	// forwarding the caller's pointers would race a caller that reuses the variable.
+	var seqCopy *uint32
+	if seq != nil {
+		v := *seq
+		seqCopy = &v
+	}
+	var stCopy *uint64
+	if sourceTime != nil {
+		v := *sourceTime
+		stCopy = &v
+	}
+	return s.sess.SendBlock(buf, seqCopy, stCopy)
 }
 
 // Close stops the sender and releases its sockets and goroutines.

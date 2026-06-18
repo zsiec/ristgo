@@ -281,6 +281,31 @@ type appBlock struct {
 	sourceTime *uint64
 }
 
+// mediaBlock is one recovered, in-order delivery with its wire identity — the
+// receive-side counterpart of appBlock, carried to a reflector pump so it can re-emit
+// the packet preserving (seq, sourceTime).
+type mediaBlock struct {
+	seq        uint32
+	sourceTime uint64
+	payload    []byte
+}
+
+// RecvBlock returns the next recovered, in-order media block from a reflector-input
+// session (NewMainReflectorInput): its sequence number, source timestamp, and payload.
+// It blocks until a block is available or the session closes, returning the close
+// reason on close. The payload is a fresh copy the caller owns.
+func (s *Session) RecvBlock() (seq uint32, sourceTime uint64, payload []byte, err error) {
+	select {
+	case b, ok := <-s.blockOut:
+		if !ok {
+			return 0, 0, nil, s.closeReason()
+		}
+		return b.seq, b.sourceTime, b.payload, nil
+	case <-s.done:
+		return 0, 0, nil, s.closeReason()
+	}
+}
+
 // SendBlock submits one media payload with optional explicit sequence number and/or
 // source timestamp (Sender.SendBlock, libRIST USE_SEQ + ts_ntp), marshalled onto the
 // event loop. It returns ErrSendBlockUnsupported on a non-Main session (the block

@@ -468,6 +468,11 @@ type Session struct {
 
 	// delivery to Read
 	delivery chan []byte
+	// blockOut carries recovered, in-order media blocks (seq + sourceTime + payload)
+	// to a reflector pump instead of bare payloads on delivery. Non-nil only on a
+	// reflector-input session; when set the PollEvent loop forwards each Deliver here
+	// (bypassing the split merger / fragment reassembler) rather than to delivery.
+	blockOut chan mediaBlock
 	leftover []byte // partially-read payload (stream semantics)
 
 	// scratch encode buffers (loop-owned)
@@ -551,6 +556,18 @@ func NewMainSender(conn *socket.Conn, remote netip.AddrPort, cfg Config) *Sessio
 // traffic. cfg.Main must be set.
 func NewMainReceiver(conn *socket.Conn, cfg Config) *Session {
 	s := newSession(conn, cfg, false)
+	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
+	s.start()
+	return s
+}
+
+// NewMainReflectorInput builds a Main-profile reflector input: a receiver that
+// recovers and orders the inbound flow exactly like NewMainReceiver but delivers each
+// packet as a media block (seq + sourceTime + payload) over RecvBlock for transparent
+// re-emission, rather than a bare payload over Read.
+func NewMainReflectorInput(conn *socket.Conn, cfg Config) *Session {
+	s := newSession(conn, cfg, false)
+	s.blockOut = make(chan mediaBlock, 256)
 	s.flow = flow.New(flow.RoleReceiver, cfg.Flow)
 	s.start()
 	return s
@@ -1112,8 +1129,30 @@ func (s *Session) drain(now clock.Timestamp) {
 			break
 		}
 		if d, ok := ev.(flow.Deliver); ok {
-			s.deliverFragment(d)
+			if s.blockOut != nil {
+				s.queueBlock(d)
+			} else {
+				s.deliverFragment(d)
+			}
 		}
+	}
+}
+
+// queueBlock forwards one recovered, in-order delivery to the reflector pump as a
+// media block, preserving its (seq, sourceTime) so the relay can re-emit it
+// transparently. It bypasses the split merger and fragment reassembler (a reflector
+// forwards raw recovered packets) and copies the payload out of the reusable receive
+// buffer. The send blocks (back-pressuring the input) until the pump takes the block
+// or the session closes.
+func (s *Session) queueBlock(d flow.Deliver) {
+	if !s.authed.Load() {
+		return // hold until the EAP-SRP handshake authenticates the peer
+	}
+	cp := make([]byte, len(d.Payload))
+	copy(cp, d.Payload)
+	select {
+	case s.blockOut <- mediaBlock{seq: d.Seq, sourceTime: d.SourceTime, payload: cp}:
+	case <-s.done:
 	}
 }
 
