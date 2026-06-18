@@ -149,7 +149,9 @@ func TestTimerWheel(t *testing.T) {
 // (unstarted) Session is used so the call is single-threaded and race-free.
 func TestPublishStatsZeroAlloc(t *testing.T) {
 	s := &Session{flow: flow.New(flow.RoleReceiver, flow.Config{})}
-	if allocs := testing.AllocsPerRun(200, s.publishStats); allocs != 0 {
+	// A non-bonded session (s.bond == nil) publishes no per-path peers, so the hot
+	// publish stays allocation-free.
+	if allocs := testing.AllocsPerRun(200, func() { s.publishStats(0) }); allocs != 0 {
 		t.Errorf("publishStats allocs/op = %v, want 0", allocs)
 	}
 }

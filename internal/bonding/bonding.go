@@ -69,6 +69,30 @@ type Path struct {
 	seen     bool
 	dead     bool // edge-detection flag for Tick's "report death once"; not the
 	// authoritative liveness — use Group.Alive(index, now) for that.
+
+	// Per-path media counters for PeerSnapshots (libRIST per-peer stats): a receiver
+	// group fills recv*; a sender group fills sent*/retx*. Each path uses only its
+	// role's counters (the other stays 0).
+	recvPkts, recvBytes uint64
+	sentPkts, sentBytes uint64
+	retxPkts, retxBytes uint64
+}
+
+// PathStats is a snapshot of one bonded path's per-peer statistics (libRIST
+// rist_stats_*_peer), produced by Group.PeerSnapshots for the host's public
+// Stats.Peers.
+type PathStats struct {
+	Index              uint8
+	RTT                clock.Microseconds
+	Alive              bool
+	Weight             int
+	Priority           uint32
+	RecvPkts           uint64
+	RecvBytes          uint64
+	SentPkts           uint64
+	SentBytes          uint64
+	RetransmittedPkts  uint64
+	RetransmittedBytes uint64
 }
 
 // RTT returns the path's smoothed RTT estimate clamped to the group's
@@ -155,6 +179,55 @@ func (g *Group) ObserveRTT(index uint8, sample clock.Microseconds) {
 	if p := g.path(index); p != nil {
 		p.rtt = p.rtt.Observe(sample)
 	}
+}
+
+// CountRecv counts one media packet of bytes payload received on index (a receiver
+// group), for the per-peer stats. Unknown indices are ignored.
+func (g *Group) CountRecv(index uint8, bytes int) {
+	if p := g.path(index); p != nil {
+		p.recvPkts++
+		p.recvBytes += uint64(bytes)
+	}
+}
+
+// CountSent counts one media packet of bytes payload sent on index (a sender group),
+// split into first-transmission or retransmission tallies by retransmit. Unknown
+// indices are ignored.
+func (g *Group) CountSent(index uint8, bytes int, retransmit bool) {
+	p := g.path(index)
+	if p == nil {
+		return
+	}
+	if retransmit {
+		p.retxPkts++
+		p.retxBytes += uint64(bytes)
+	} else {
+		p.sentPkts++
+		p.sentBytes += uint64(bytes)
+	}
+}
+
+// PeerSnapshots returns a snapshot of every registered path's per-peer statistics
+// (RTT, liveness, weight/priority, media counters) in registration order, for the
+// host's public Stats.Peers. now resolves liveness.
+func (g *Group) PeerSnapshots(now clock.Timestamp) []PathStats {
+	out := make([]PathStats, 0, len(g.paths))
+	for _, p := range g.paths {
+		out = append(out, PathStats{
+			Index:              p.Index,
+			RTT:                p.rtt.Clamped(g.rttMin, g.rttMax),
+			Alive:              p.seen && now.Sub(p.lastSeen) <= g.timeout,
+			Weight:             p.Weight,
+			Priority:           p.Priority,
+			RecvPkts:           p.recvPkts,
+			RecvBytes:          p.recvBytes,
+			SentPkts:           p.sentPkts,
+			SentBytes:          p.sentBytes,
+			RetransmittedPkts:  p.retxPkts,
+			RetransmittedBytes: p.retxBytes,
+		})
+	}
+	return out
 }
 
 // Alive reports whether path index has been seen and has not been silent longer

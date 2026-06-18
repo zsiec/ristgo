@@ -42,6 +42,11 @@ func (s *Session) feedMedia(now clock.Timestamp, path uint8, pkt wire.MediaPacke
 	if !s.authed.Load() {
 		return
 	}
+	// Per-path received stat (libRIST per-peer) on a bonded receiver; a non-bonded
+	// session has no group and derives its single peer from the flow aggregate.
+	if s.bond != nil {
+		s.bond.group.CountRecv(path, len(pkt.Payload))
+	}
 	s.flow.Feed(now, path, pkt)
 	s.observeRx(now, pkt)
 }

@@ -3,6 +3,7 @@ package session
 import (
 	"time"
 
+	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/flow"
 )
@@ -403,6 +404,17 @@ func (s *Session) Stats() flow.Stats {
 	v := s.statsVal
 	s.statsMu.Unlock()
 	return v
+}
+
+// PeerStats returns the most recent per-path peer snapshots for a bonded session, or
+// nil for a non-bonded session (the host then derives a single peer from the flow).
+func (s *Session) PeerStats() []bonding.PathStats {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	if s.statsPeers == nil {
+		return nil
+	}
+	return append([]bonding.PathStats(nil), s.statsPeers...)
 }
 
 // Authenticated reports whether the data channel is open: true for a Simple

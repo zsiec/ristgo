@@ -21,6 +21,7 @@ import (
 
 	"github.com/zsiec/ristgo/internal/adapt"
 	"github.com/zsiec/ristgo/internal/adv"
+	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/eap"
@@ -501,6 +502,10 @@ type Session struct {
 	// CLAUDE.md requires to stay alloc-free.
 	statsMu  sync.Mutex
 	statsVal flow.Stats
+	// statsPeers is the published per-path peer snapshot for a bonded session (nil on
+	// a non-bonded session, where the host derives one peer from the flow). Refreshed
+	// with statsVal under statsMu by the loop goroutine, which owns the bonding Group.
+	statsPeers []bonding.PathStats
 
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
@@ -1065,16 +1070,24 @@ func (s *Session) loop() {
 func (s *Session) afterInput(now clock.Timestamp, timer *time.Timer) {
 	s.drain(now)
 	s.rearm(timer, now)
-	s.publishStats()
+	s.publishStats(now)
 }
 
 // publishStats copies the flow's current counters into the published snapshot
 // for the public Stats() reader. It runs on the loop goroutine after every
 // input and allocates nothing: the snapshot struct is reused under statsMu.
-func (s *Session) publishStats() {
+func (s *Session) publishStats(now clock.Timestamp) {
 	v := s.flow.Stats()
+	// A bonded session also publishes per-path peer snapshots (the loop owns the
+	// Group, so this read is race-free); a non-bonded session leaves them nil and the
+	// host derives a single peer from the flow aggregate.
+	var peers []bonding.PathStats
+	if s.bond != nil {
+		peers = s.bond.group.PeerSnapshots(now)
+	}
 	s.statsMu.Lock()
 	s.statsVal = v
+	s.statsPeers = peers
 	s.statsMu.Unlock()
 }
 

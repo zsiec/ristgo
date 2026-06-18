@@ -425,6 +425,7 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		if !s.bond.group.ShouldDuplicate(uint8(i), now) {
 			continue
 		}
+		s.bond.group.CountSent(uint8(i), len(pkt.Payload), pkt.Retransmit)
 		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[i][0]); err != nil {
 			s.logf("bond: write media path %d: %v", i, err)
 		}
@@ -437,6 +438,7 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	idx, ok := s.bond.group.SelectWeighted(now)
 	s.bond.lastWeighted, s.bond.lastWeightedOK = idx, ok && int(idx) < len(s.bond.remotes)
 	if s.bond.lastWeightedOK {
+		s.bond.group.CountSent(idx, len(pkt.Payload), pkt.Retransmit)
 		if err := s.bond.conns[0].WriteMedia(b, s.bond.remotes[idx][0]); err != nil {
 			s.logf("bond: write media weighted path %d: %v", idx, err)
 		}

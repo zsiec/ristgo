@@ -470,7 +470,7 @@ func (r *BondedReceiver) SetReadDeadline(t time.Time) error {
 func (r *BondedReceiver) Stats() Stats {
 	st := toStats(r.sess.Stats())
 	st.FECRecovered = r.sess.FECRecovered()
-	return st
+	return withPeers(st, r.sess.PeerStats())
 }
 
 // SetNackType switches the NACK feedback format at runtime (libRIST
@@ -530,7 +530,9 @@ func (s *BondedSender) SetWriteDeadline(t time.Time) error {
 }
 
 // Stats returns a snapshot of the sender's counters.
-func (s *BondedSender) Stats() Stats { return toStats(s.sess.Stats()) }
+func (s *BondedSender) Stats() Stats {
+	return withPeers(toStats(s.sess.Stats()), s.sess.PeerStats())
+}
 
 // RemoteAddr returns the first path's media address.
 func (s *BondedSender) RemoteAddr() net.Addr { return net.UDPAddrFromAddrPort(s.remote) }

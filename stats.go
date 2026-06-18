@@ -2,10 +2,29 @@ package ristgo
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/flow"
 )
+
+// PeerStats is per-peer (per-path) statistics for one bonded path, or the single peer
+// of a non-bonded session — the libRIST rist_stats_*_peer analog, surfaced in
+// Stats.Peers. A receiver session fills the Received* counters; a sender session fills
+// Sent* / Retransmitted*; RTT is per-path.
+type PeerStats struct {
+	RTT                time.Duration // smoothed per-path RTT (the flow RTT when non-bonded)
+	Received           uint64        // media packets received from this peer (receiver)
+	ReceivedBytes      uint64        // payload bytes received from this peer (receiver)
+	Sent               uint64        // first-transmission packets sent to this peer (sender)
+	SentBytes          uint64        // first-transmission payload bytes sent to this peer (sender)
+	Retransmitted      uint64        // retransmitted packets sent to this peer (sender)
+	RetransmittedBytes uint64        // retransmitted payload bytes sent to this peer (sender)
+	Weight             int           // 2022-7 load-share weight (0 = duplication / single peer)
+	Priority           uint32        // NACK-recovery priority (0 on the single peer)
+	Alive              bool          // whether the path is currently live (always true for the single peer)
+}
 
 // Stats is a snapshot of a Sender's or Receiver's counters and gauges. Sender-only
 // and receiver-only fields are zero on the other role.
@@ -112,6 +131,11 @@ type Stats struct {
 	// avg_buffer_time): the running mean of the dynamic buffer, equal to the static
 	// buffer when not windowed, and zero on a sender.
 	AvgBufferTime time.Duration
+
+	// Peers is the per-peer (per-path) statistics (libRIST rist_stats_*_peer). A
+	// non-bonded session reports exactly one peer mirroring the flow; a bonded session
+	// reports one per path with its own RTT, counters, weight, and liveness.
+	Peers []PeerStats
 }
 
 // toStats maps the internal flow counters and gauges to the public Stats and
@@ -157,7 +181,44 @@ func toStats(f flow.Stats) Stats {
 		InterPacketCur:        time.Duration(maxI64(f.IpsCurUs, 0)) * time.Microsecond,
 		InterPacketMax:        time.Duration(maxI64(f.IpsMaxUs, 0)) * time.Microsecond,
 		AvgBufferTime:         time.Duration(maxI64(f.AvgBufferTimeUs, 0)) * time.Microsecond,
+		// The single-peer default: one peer mirroring the flow aggregate. A bonded
+		// handle replaces this via withPeers; a non-bonded session keeps it (libRIST
+		// reports a single peer for a single-peer flow).
+		Peers: []PeerStats{{
+			RTT:                time.Duration(maxI64(f.SmoothedRTTUs, 0)) * time.Microsecond,
+			Received:           f.Received,
+			ReceivedBytes:      f.ReceivedBytes,
+			Sent:               f.Sent,
+			SentBytes:          f.SentBytes,
+			Retransmitted:      f.Retransmitted,
+			RetransmittedBytes: f.RetransmittedBytes,
+			Alive:              true,
+		}},
 	}
+}
+
+// withPeers replaces st.Peers with a bonded session's per-path snapshots when it has
+// them (a non-bonded session returns nil, keeping the flow-derived single peer).
+func withPeers(st Stats, peers []bonding.PathStats) Stats {
+	if peers == nil {
+		return st
+	}
+	st.Peers = make([]PeerStats, len(peers))
+	for i, p := range peers {
+		st.Peers[i] = PeerStats{
+			RTT:                time.Duration(maxI64(int64(p.RTT), 0)) * time.Microsecond,
+			Received:           p.RecvPkts,
+			ReceivedBytes:      p.RecvBytes,
+			Sent:               p.SentPkts,
+			SentBytes:          p.SentBytes,
+			Retransmitted:      p.RetransmittedPkts,
+			RetransmittedBytes: p.RetransmittedBytes,
+			Weight:             p.Weight,
+			Priority:           p.Priority,
+			Alive:              p.Alive,
+		}
+	}
+	return st
 }
 
 func maxI64(a, b int64) int64 {
@@ -171,6 +232,10 @@ func maxI64(a, b int64) int64 {
 // analog), every counter and gauge as a field. Hand-rolled to keep the
 // dependency set to the standard library.
 func (s Stats) ToJSON() string {
+	peers := make([]string, len(s.Peers))
+	for i, p := range s.Peers {
+		peers[i] = p.toJSON()
+	}
 	return fmt.Sprintf(
 		`{"received":%d,"received_bytes":%d,"delivered":%d,"lost":%d,`+
 			`"recovered":%d,"recovered_one_retry":%d,"fec_recovered":%d,"duplicates":%d,"reordered":%d,`+
@@ -181,7 +246,8 @@ func (s Stats) ToJSON() string {
 			`"retransmit_skipped":%d,"retransmit_suppressed":%d,`+
 			`"retransmit_exhausted":%d,"bandwidth_skipped":%d,`+
 			`"rtt_us":%d,"bandwidth_bps":%d,"retry_bandwidth_bps":%d,"quality":%.3f,`+
-			`"ips_min_us":%d,"ips_cur_us":%d,"ips_max_us":%d,"avg_buffer_time_us":%d}`,
+			`"ips_min_us":%d,"ips_cur_us":%d,"ips_max_us":%d,"avg_buffer_time_us":%d,`+
+			`"peers":[%s]}`,
 		s.Received, s.ReceivedBytes, s.Delivered, s.Lost,
 		s.Recovered, s.RecoveredOneRetry, s.FECRecovered, s.Duplicates, s.Reordered,
 		s.TooLate, s.TooLateRetransmit, s.RetransmittedReceived,
@@ -193,5 +259,16 @@ func (s Stats) ToJSON() string {
 		s.RTT.Microseconds(), s.BandwidthBps, s.RetryBandwidthBps, s.Quality,
 		s.InterPacketMin.Microseconds(), s.InterPacketCur.Microseconds(), s.InterPacketMax.Microseconds(),
 		s.AvgBufferTime.Microseconds(),
+		strings.Join(peers, ","),
+	)
+}
+
+// toJSON serializes one peer for ToJSON's peers array.
+func (p PeerStats) toJSON() string {
+	return fmt.Sprintf(
+		`{"rtt_us":%d,"received":%d,"received_bytes":%d,"sent":%d,"sent_bytes":%d,`+
+			`"retransmitted":%d,"retransmitted_bytes":%d,"weight":%d,"priority":%d,"alive":%t}`,
+		p.RTT.Microseconds(), p.Received, p.ReceivedBytes, p.Sent, p.SentBytes,
+		p.Retransmitted, p.RetransmittedBytes, p.Weight, p.Priority, p.Alive,
 	)
 }

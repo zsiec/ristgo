@@ -387,7 +387,7 @@ func (r *Receiver) LocalPort() int { return r.sess.MediaPort() }
 func (r *Receiver) Stats() Stats {
 	st := toStats(r.sess.Stats())
 	st.FECRecovered = r.sess.FECRecovered()
-	return st
+	return withPeers(st, r.sess.PeerStats())
 }
 
 // SSRC returns the flow's reporter SSRC. For a Receiver from [MultiReceiver.Accept]
