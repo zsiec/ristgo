@@ -272,6 +272,32 @@ func (s *Session) SetWriteDeadline(t time.Time) {
 	}
 }
 
+// appBlock is one per-block media submit (Sender.SendBlock, USE_SEQ + ts_ntp)
+// delivered to the event loop. A nil seq/sourceTime takes the flow's auto sequence /
+// now-derived timestamp; non-nil values are used verbatim.
+type appBlock struct {
+	payload    []byte
+	seq        *uint32
+	sourceTime *uint64
+}
+
+// SendBlock submits one media payload with optional explicit sequence number and/or
+// source timestamp (Sender.SendBlock, libRIST USE_SEQ + ts_ntp), marshalled onto the
+// event loop. It returns ErrSendBlockUnsupported on a non-Main session (the block
+// channel is wired for the single-socket Main profile) and the close reason once the
+// session is closed. payload must not be mutated after the call (the flow retains it).
+func (s *Session) SendBlock(payload []byte, seq *uint32, sourceTime *uint64) error {
+	if s.blockIn == nil {
+		return s.cfg.ErrSendBlockUnsupported
+	}
+	select {
+	case s.blockIn <- appBlock{payload: payload, seq: seq, sourceTime: sourceTime}:
+		return nil
+	case <-s.done:
+		return s.closeReason()
+	}
+}
+
 // ctrlKind tags a runtime config setter delivered over Session.ctrlCmd.
 type ctrlKind uint8
 

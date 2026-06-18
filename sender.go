@@ -444,6 +444,20 @@ func (s *Sender) RemoteAddr() net.Addr { return net.UDPAddrFromAddrPort(s.remote
 // a non-Main sender (NPD is a Main-profile feature) and the close reason once closed.
 func (s *Sender) SetNullPacketDeletion(on bool) error { return s.sess.SetNullPacketDeletion(on) }
 
+// SendBlock submits one media payload with explicit per-block metadata: an app-chosen
+// sequence number (seq, libRIST's RIST_DATA_FLAGS_USE_SEQ) and/or source timestamp
+// (sourceTime, NTP-64 bits — libRIST's ts_ntp). A nil pointer for either takes the
+// flow's auto-incremented sequence or a now-derived timestamp, exactly like Write.
+// Supplying both lets a transparent relay re-emit an upstream flow's packets preserving
+// their (seq, sourceTime) — the pair a receiver's SMPTE 2022-7 merge and playout key
+// on. payload is copied, so the caller may reuse the slice immediately. It returns
+// ErrSendBlockUnsupported on a non-Main sender, or the close reason once closed.
+func (s *Sender) SendBlock(payload []byte, seq *uint32, sourceTime *uint64) error {
+	buf := make([]byte, len(payload))
+	copy(buf, payload)
+	return s.sess.SendBlock(buf, seq, sourceTime)
+}
+
 // Close stops the sender and releases its sockets and goroutines.
 func (s *Sender) Close() error {
 	if s.ctxStop != nil {

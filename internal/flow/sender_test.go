@@ -69,6 +69,34 @@ func TestPushAppFirstPacketArmsEchoAndSends(t *testing.T) {
 	}
 }
 
+func TestPushAppBlockUsesExplicitSeqAndSourceTime(t *testing.T) {
+	f := New(RoleSender, senderConfig())
+	// USE_SEQ + ts_ntp: the explicit seq 5000 and source time are used verbatim, not
+	// the auto sequence (which would have started at 100).
+	seq := uint32(5000)
+	st := srcNTP(7_000)
+	f.PushAppBlock(10_000, []byte("a"), wire.FragStandalone, &seq, &st)
+	ms := mediaOutputs(drainOutputs(f))
+	if len(ms) != 1 || ms[0].Pkt.Seq != 5000 || ms[0].Pkt.SourceTime != st {
+		t.Fatalf("block packet = %+v, want seq 5000 sourceTime %d", ms, st)
+	}
+	if sl := &f.sender.ring[5000&f.sender.mask]; sl.state != slotFilled {
+		t.Fatalf("history slot for explicit seq not filled: %+v", sl)
+	}
+
+	// The auto counter advanced past the override: a plain PushApp takes 5001.
+	f.PushApp(11_000, []byte("b"))
+	if ms := mediaOutputs(drainOutputs(f)); ms[0].Pkt.Seq != 5001 {
+		t.Fatalf("auto seq after override = %d, want 5001", ms[0].Pkt.Seq)
+	}
+
+	// Nil overrides fall back to the auto sequence and now-derived source time.
+	f.PushAppBlock(12_000, []byte("c"), wire.FragStandalone, nil, nil)
+	if ms := mediaOutputs(drainOutputs(f)); ms[0].Pkt.Seq != 5002 || ms[0].Pkt.SourceTime != srcNTP(12_000) {
+		t.Fatalf("nil-override packet = %+v, want seq 5002 sourceTime %d", ms, srcNTP(12_000))
+	}
+}
+
 func TestServiceNackRetransmitsFromHistory(t *testing.T) {
 	f := New(RoleSender, senderConfig())
 	f.PushApp(10_000, []byte("a")) // seq 100

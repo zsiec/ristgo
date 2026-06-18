@@ -496,6 +496,19 @@ func (f *Flow) PushAppFrag(now clock.Timestamp, payload []byte, frag wire.FragRo
 	f.pushApp(now, payload, frag)
 }
 
+// PushAppBlock submits one payload with an explicit sequence number and/or source
+// timestamp — libRIST's RIST_DATA_FLAGS_USE_SEQ (seq) plus ts_ntp (sourceTime, NTP-64
+// bits). A nil seq takes the auto-incremented sequence; a nil sourceTime derives it
+// from now. A transparent relay re-sends an upstream flow's packets through this to
+// preserve their (seq, sourceTime) — the pair the receiver's 2022-7 merge and playout
+// key on. Sender-role only.
+func (f *Flow) PushAppBlock(now clock.Timestamp, payload []byte, frag wire.FragRole, seq *uint32, sourceTime *uint64) {
+	if f.role != RoleSender {
+		return
+	}
+	f.pushAppBlock(now, payload, frag, seq, sourceTime)
+}
+
 // HandleTimer must be called by the host when a deadline previously
 // requested via a SetTimer effect passes; now is the (fake or real) instant
 // the timer fired. Unknown or no-longer-relevant IDs are ignored.

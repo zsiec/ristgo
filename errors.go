@@ -54,4 +54,8 @@ var (
 	// [BondedSender.SetNullPacketDeletion] on a non-Main sender. Null-packet deletion
 	// (TR-06-2 §8.6) is a Main-profile feature.
 	ErrNPDUnsupported = errors.New("rist: null-packet deletion requires the Main profile")
+
+	// ErrSendBlockUnsupported is returned by [Sender.SendBlock] on a non-Main sender.
+	// Per-block submit (USE_SEQ + ts_ntp) is wired for the single-socket Main profile.
+	ErrSendBlockUnsupported = errors.New("rist: per-block submit requires the Main profile")
 )

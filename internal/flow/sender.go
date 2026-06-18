@@ -83,6 +83,16 @@ type senderState struct {
 // the packet in the history ring, and emit its first transmission. It mirrors
 // rist_sender_enqueue followed by the data send.
 func (f *Flow) pushApp(now clock.Timestamp, payload []byte, frag wire.FragRole) {
+	f.pushAppBlock(now, payload, frag, nil, nil)
+}
+
+// pushAppBlock is pushApp with an optional explicit sequence number and/or source
+// timestamp (libRIST's RIST_DATA_FLAGS_USE_SEQ + ts_ntp). A nil seq takes the next
+// auto-incremented sequence; a nil sourceTime derives it from now. When seq is
+// supplied the auto counter is advanced past it so a later auto-sequenced send cannot
+// collide. A transparent relay uses this to preserve an upstream flow's
+// (seq, sourceTime) on the re-sent copy.
+func (f *Flow) pushAppBlock(now clock.Timestamp, payload []byte, frag wire.FragRole, seq *uint32, sourceTime *uint64) {
 	s := &f.sender
 	if !s.started {
 		s.started = true
@@ -101,9 +111,18 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte, frag wire.FragRole) 
 		}
 	}
 
+	// An explicit (USE_SEQ) sequence is used verbatim, then the auto counter is
+	// advanced past it so a subsequent auto-sequenced send cannot collide; an absent
+	// override takes and advances the counter as usual.
 	seqn := s.nextSeq
-	s.nextSeq++
-	sourceTime := uint64(clock.NTPTimeFromTimestamp(now))
+	if seq != nil {
+		seqn = *seq
+	}
+	s.nextSeq = seqn + 1
+	srcTime := uint64(clock.NTPTimeFromTimestamp(now))
+	if sourceTime != nil {
+		srcTime = *sourceTime
+	}
 
 	// NoRecovery (one-way) transport never retransmits, so retaining the
 	// packet in the history ring would only waste memory: emit and forget.
@@ -115,7 +134,7 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte, frag wire.FragRole) 
 		// reported unserviceable.
 		sl.state = slotFilled
 		sl.seq = seqn
-		sl.sourceTime = sourceTime
+		sl.sourceTime = srcTime
 		sl.payload = payload
 		sl.transmitCount = 0
 		sl.retried = false
@@ -127,7 +146,7 @@ func (f *Flow) pushApp(now clock.Timestamp, payload []byte, frag wire.FragRole) 
 		Path: s.txPath,
 		Pkt: wire.MediaPacket{
 			Seq:        seqn,
-			SourceTime: sourceTime,
+			SourceTime: srcTime,
 			SSRC:       s.ssrc,
 			Payload:    payload,
 			Retransmit: false,

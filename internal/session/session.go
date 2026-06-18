@@ -78,6 +78,9 @@ type Config struct {
 	// ErrNPDUnsupported is returned by SetNullPacketDeletion when the session is
 	// not a Main-profile sender (NPD is Main-only).
 	ErrNPDUnsupported error
+	// ErrSendBlockUnsupported is returned by SendBlock when the session has no
+	// block channel (not a Main-profile sender).
+	ErrSendBlockUnsupported error
 	// ErrFlowAttrUnsupported is returned by WriteFlowAttribute when the session is
 	// not Advanced (flow attributes are an Advanced-profile control message).
 	// Supplied by the public layer.
@@ -434,6 +437,9 @@ type Session struct {
 	advIn   chan inbound     // Advanced single UDP socket (media and control)
 	bondIn  chan bondInbound // bonded multipath: per-path media/RTCP, tagged
 	appIn   chan []byte
+	// blockIn carries per-block media submits (Sender.SendBlock, USE_SEQ + ts_ntp)
+	// onto the event loop. Non-nil only on a Main-profile sender.
+	blockIn chan appBlock
 
 	// weightCmd carries runtime load-balancing weight changes (BondedSender.SetWeight,
 	// libRIST rist_peer_weight_set) onto the event loop, which owns the (not
@@ -670,6 +676,11 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 	}
 	if sender {
 		s.appIn = make(chan []byte, 64)
+		// Per-block submit (Sender.SendBlock) is wired for the single-socket Main
+		// profile only, mirroring ristrust.
+		if cfg.Main != nil {
+			s.blockIn = make(chan appBlock, 64)
+		}
 	} else {
 		s.delivery = make(chan []byte, 4096)
 	}
@@ -841,8 +852,10 @@ func (s *Session) loop() {
 		// a nil channel never fires in the select, applying back-pressure to
 		// Write until the EAP handshake completes (or instantly when unused).
 		var appIn chan []byte
+		var blockIn chan appBlock
 		if s.authed.Load() {
 			appIn = s.appIn
+			blockIn = s.blockIn
 		}
 		select {
 		case <-s.done:
@@ -910,6 +923,13 @@ func (s *Session) loop() {
 		case p := <-appIn:
 			now := s.clk.Now()
 			s.pushApp(now, p)
+			s.afterInput(now, timer)
+		case b := <-blockIn:
+			// Per-block media submit (Sender.SendBlock): push with the app-supplied
+			// sequence/source-time overrides. Bypasses split bonding so the explicit
+			// sequence is used verbatim.
+			now := s.clk.Now()
+			s.flow.PushAppBlock(now, b.payload, wire.FragStandalone, b.seq, b.sourceTime)
 			s.afterInput(now, timer)
 		case od := <-s.oobIn:
 			now := s.clk.Now()
