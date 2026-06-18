@@ -383,7 +383,7 @@ func TestConfigValidate(t *testing.T) {
 		{"congestion invalid", func(c *Config) { c.CongestionControl = CongestionControl(9) },
 			"rist: CongestionControl must be CongestionNormal, CongestionAggressive, or CongestionOff"},
 		{"timing-mode invalid", func(c *Config) { c.TimingMode = TimingMode(9) },
-			"rist: TimingMode must be TimingSource or TimingArrival"},
+			"rist: TimingMode must be TimingSource, TimingArrival, or TimingRTC"},
 		{"return-bandwidth negative", func(c *Config) { c.ReturnBandwidth = -1 },
 			"rist: ReturnBandwidth must be at least 0 (kbps; 0 = unlimited)"},
 

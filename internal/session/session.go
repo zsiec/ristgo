@@ -2293,20 +2293,29 @@ const maxEAPRetx = 16
 // it is a single unfragmented PushApp. p is a session-owned buffer (Write
 // copied it), so the fragment subslices the flow retains stay valid.
 func (s *Session) pushApp(now clock.Timestamp, p []byte) {
+	// RTC timing: stamp source_time from the NTP wall clock (one read per submit; the
+	// split/fragment pieces are the one media instant, so they share it). Otherwise the
+	// flow core derives it from the monotonic `now`. The host owns the clock; the
+	// deterministic core never reads one.
+	var st *uint64
+	if s.cfg.Flow.TimingMode == flow.TimingRTC {
+		v := uint64(clock.NTPTimeFromTime(time.Now()))
+		st = &v
+	}
 	// Packet-split bonding (libRIST split=): send the payload as a consecutive
 	// even/odd pair sharing one source time. Split is an alternative to F/L
 	// fragmentation — when active it bypasses fragmentation (each half is a whole
 	// Standalone packet), so the peer's merge (not its reassembler) recombines them.
 	if s.splitMode != split.SplitOff {
 		first, last, ok := split.SplitPayload(s.splitMode, p)
-		s.flow.PushApp(now, first)
+		s.flow.PushAppBlock(now, first, wire.FragStandalone, nil, st)
 		if ok {
-			s.flow.PushApp(now, last)
+			s.flow.PushAppBlock(now, last, wire.FragStandalone, nil, st)
 		}
 		return
 	}
 	if s.fragSize <= 0 || len(p) <= s.fragSize {
-		s.flow.PushApp(now, p)
+		s.flow.PushAppBlock(now, p, wire.FragStandalone, nil, st)
 		return
 	}
 	for off := 0; off < len(p); off += s.fragSize {
@@ -2323,7 +2332,7 @@ func (s *Session) pushApp(now clock.Timestamp, p []byte) {
 		default:
 			role = wire.FragMiddle
 		}
-		s.flow.PushAppFrag(now, p[off:end], role)
+		s.flow.PushAppBlock(now, p[off:end], role, nil, st)
 	}
 }
 

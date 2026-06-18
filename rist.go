@@ -266,9 +266,8 @@ func (m MergeMode) String() string {
 }
 
 // TimingMode selects how the receiver schedules media playout (libRIST
-// timing_mode). The zero value is TimingSource, the libRIST default. These
-// values match libRIST's SOURCE=0/ARRIVAL=1 numbering; libRIST's RTC=2 maps to
-// TimingArrival (ristgo has no wall-clock source).
+// timing_mode). The zero value is TimingSource, the libRIST default. These values
+// match libRIST's SOURCE=0/ARRIVAL=1/RTC=2 numbering.
 type TimingMode int
 
 const (
@@ -283,6 +282,14 @@ const (
 	// robust to a drifting or absent source clock but does not preserve source
 	// inter-packet timing.
 	TimingArrival TimingMode = 1
+
+	// TimingRTC (libRIST RIST_TIMING_MODE_RTC) is source-paced like TimingSource but
+	// treats the source timestamps as a common NTP wall clock: the sender stamps
+	// SourceTime from the real-time clock (Main/Advanced) and the receiver maps it
+	// through a fixed offset, with the 32-bit source-clock wrap re-anchor disabled (a
+	// 64-bit NTP wall clock does not wrap on that boundary). Scheduling stays on the
+	// monotonic clock, so an NTP step cannot jolt the timer wheel.
+	TimingRTC TimingMode = 2
 )
 
 // String returns a human-readable name for the timing mode.
@@ -292,6 +299,8 @@ func (m TimingMode) String() string {
 		return "source"
 	case TimingArrival:
 		return "arrival"
+	case TimingRTC:
+		return "rtc"
 	default:
 		return "unknown"
 	}

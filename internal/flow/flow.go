@@ -235,6 +235,16 @@ const (
 	// absent source clock at the cost of not preserving source inter-packet
 	// timing.
 	TimingArrival
+
+	// TimingRTC paces playout by the SOURCE timestamps as TimingSource does, but
+	// treats them as a common NTP wall clock (libRIST RIST_TIMING_MODE_RTC): the
+	// sender stamps SourceTime from the real-time clock and the receiver maps it
+	// through the offset locked at the first packet. The 32-bit source-clock wrap
+	// re-anchor is disabled (a 64-bit NTP wall clock does not wrap on that boundary)
+	// while the source-time too-late/reorder test still applies. Scheduling stays on
+	// the monotonic clock (the offset absorbs the wall-monotonic difference), so an
+	// NTP step cannot jolt the timer wheel.
+	TimingRTC
 )
 
 // DefaultConfig returns the libRIST defaults:

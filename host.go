@@ -490,13 +490,17 @@ func effectiveRTTBounds(cfg Config) (rttMin, rttMax clock.Microseconds) {
 }
 
 // toFlowTiming maps the public TimingMode to the flow core's TimingMode (the
-// values align — SOURCE=0, ARRIVAL=1 — but the mapping keeps the public and
+// values align — SOURCE=0, ARRIVAL=1, RTC=2 — but the mapping keeps the public and
 // core types decoupled).
 func toFlowTiming(m TimingMode) flow.TimingMode {
-	if m == TimingArrival {
+	switch m {
+	case TimingArrival:
 		return flow.TimingArrival
+	case TimingRTC:
+		return flow.TimingRTC
+	default:
+		return flow.TimingSource
 	}
-	return flow.TimingSource
 }
 
 // toFlowCongestion maps the public CongestionControl mode to the flow core's

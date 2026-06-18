@@ -433,7 +433,10 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 		//     so a wrap is corrected at most once per dwell window.
 		//   - bump, don't snap: offset += one wrap period, so the wrapped source time
 		//     maps to ~now and playout continues without a timing discontinuity.
-		if !pkt.Retransmit && pkt.SourceTime < r.maxSourceTime &&
+		// RTC timing carries a 64-bit NTP wall clock that never wraps on the 32-bit
+		// RTP boundary, so the re-anchor is disabled there (libRIST gates it on
+		// !rtc_timing_mode).
+		if f.cfg.TimingMode == TimingSource && !pkt.Retransmit && pkt.SourceTime < r.maxSourceTime &&
 			r.maxSourceTime-pkt.SourceTime > srcWrapHalfNTP &&
 			now.Sub(r.lastResync) >= 3*f.recoveryBuffer {
 			r.offset += srcWrapPeriodMicros
@@ -465,7 +468,7 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	// and looks like a typo for & UINT16_MAX; we compare against the true
 	// widened successor.
 	outOfOrder := false
-	if f.cfg.TimingMode == TimingSource && packetTime.Before(r.lastPacketTime) && pkt.Seq != r.lastFound+1 {
+	if f.cfg.TimingMode != TimingArrival && packetTime.Before(r.lastPacketTime) && pkt.Seq != r.lastFound+1 {
 		if now.After(packetTime.Add(f.recoveryBuffer110)) {
 			// now > packetTime + recoveryBuffer*1.1.
 			f.stats.TooLate++

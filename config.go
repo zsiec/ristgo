@@ -672,8 +672,8 @@ func (cfg *Config) validate() error {
 		return errors.New("rist: CongestionControl must be CongestionNormal, CongestionAggressive, or CongestionOff")
 	}
 
-	if cfg.TimingMode != TimingSource && cfg.TimingMode != TimingArrival {
-		return errors.New("rist: TimingMode must be TimingSource or TimingArrival")
+	if cfg.TimingMode != TimingSource && cfg.TimingMode != TimingArrival && cfg.TimingMode != TimingRTC {
+		return errors.New("rist: TimingMode must be TimingSource, TimingArrival, or TimingRTC")
 	}
 
 	if len(cfg.Secret) > maxShortString {

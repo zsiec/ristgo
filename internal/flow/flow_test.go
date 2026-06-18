@@ -863,6 +863,34 @@ func TestSourceClockWrapReanchor(t *testing.T) {
 	}
 }
 
+// TestRTCTimingDisablesWrapReanchor verifies that RTC timing disables the 32-bit
+// source-clock wrap re-anchor: the exact backward jump that TestSourceClockWrapReanchor
+// re-anchors under SOURCE timing produces NO resync under RTC (a 64-bit NTP wall clock
+// never wraps on the 32-bit boundary; libRIST gates the re-anchor on !rtc_timing_mode).
+func TestRTCTimingDisablesWrapReanchor(t *testing.T) {
+	cfg := testConfig()
+	cfg.TimingMode = TimingRTC
+	f := New(RoleReceiver, cfg)
+	wrap := srcWrapPeriodMicros
+	step := clock.Microseconds(1_000_000)
+	startSrc := wrap - 4*step
+	f.Feed(clock.Timestamp(startSrc), 0, mkPkt(100, startSrc, []byte{0}))
+	for i := 1; i <= 4; i++ {
+		src := startSrc + clock.Microseconds(i)*step
+		f.Feed(clock.Timestamp(src), 0, mkPkt(uint32(100+i), src, []byte{byte(i)}))
+	}
+	drainOutputs(f)
+	drainEvents(f)
+	before := f.Stats()
+
+	now := clock.Timestamp(startSrc + 5*step)
+	wrappedSrc := startSrc + 5*step - wrap
+	f.Feed(now, 0, mkPkt(105, wrappedSrc, []byte{5}))
+	if got := f.Stats().ClockResync; got != before.ClockResync {
+		t.Fatalf("ClockResync = %d, want %d (RTC must not re-anchor on a backward jump)", got, before.ClockResync)
+	}
+}
+
 // TestMissingCounterMaxCaps verifies the receiver stops queuing new missing
 // entries once the missing queue exceeds missing_counter_max (libRIST's
 // buffer-bloat / overflow guard), so a large gap cannot fill the ring.
