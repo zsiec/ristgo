@@ -165,6 +165,12 @@ type Stats struct {
 	IpsCurUs int64
 	IpsMaxUs int64
 
+	// AvgBufferTimeUs is the average receiver recovery-buffer (playout) level in
+	// microseconds — libRIST avg_buffer_time. The running mean of the dynamic
+	// recovery buffer, sampled on each ~100 ms recalc tick; equals the static buffer
+	// when the buffer is not windowed, and 0 on a sender flow.
+	AvgBufferTimeUs int64
+
 	// Duplicates counts media packets dropped by the (seq, sourceTime)
 	// duplicate test — ARQ duplicates and extra SMPTE 2022-7 path copies
 	// alike (libRIST stats_instant.dupe).
@@ -215,6 +221,11 @@ type Stats struct {
 	// Recovered counts missing entries removed because the packet arrived
 	// after at least one NACK was sent (libRIST stats_instant.recovered).
 	Recovered uint64
+
+	// RecoveredOneRetry counts the subset of Recovered that cleared after exactly
+	// one NACK (libRIST recovered_one_retry) — a high ratio to Recovered means
+	// losses are clearing on the first retransmission request (a healthy link).
+	RecoveredOneRetry uint64
 
 	// Abandoned counts missing entries given up on, either after
 	// MaxRetries NACKs or after ageing past recoveryBuffer*1.1.

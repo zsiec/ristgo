@@ -24,6 +24,9 @@ type Stats struct {
 	Lost uint64
 	// Recovered counts packets recovered by retransmission after a NACK.
 	Recovered uint64
+	// RecoveredOneRetry counts the subset of Recovered that cleared on the first
+	// NACK (libRIST recovered_one_retry) — a high ratio indicates a healthy link.
+	RecoveredOneRetry uint64
 	// FECRecovered counts packets reconstructed by SMPTE ST 2022-1 / 2022-5 FEC
 	// (no NACK round trip), distinct from Recovered (ARQ retransmission).
 	FECRecovered uint64
@@ -104,6 +107,11 @@ type Stats struct {
 	InterPacketMin time.Duration
 	InterPacketCur time.Duration
 	InterPacketMax time.Duration
+
+	// AvgBufferTime is the average recovery-buffer (playout) level (libRIST
+	// avg_buffer_time): the running mean of the dynamic buffer, equal to the static
+	// buffer when not windowed, and zero on a sender.
+	AvgBufferTime time.Duration
 }
 
 // toStats maps the internal flow counters and gauges to the public Stats and
@@ -120,6 +128,7 @@ func toStats(f flow.Stats) Stats {
 		Delivered:             f.Delivered,
 		Lost:                  f.Lost,
 		Recovered:             f.Recovered,
+		RecoveredOneRetry:     f.RecoveredOneRetry,
 		Duplicates:            f.Duplicates,
 		Reordered:             f.Reordered,
 		TooLate:               f.TooLate,
@@ -147,6 +156,7 @@ func toStats(f flow.Stats) Stats {
 		InterPacketMin:        time.Duration(maxI64(f.IpsMinUs, 0)) * time.Microsecond,
 		InterPacketCur:        time.Duration(maxI64(f.IpsCurUs, 0)) * time.Microsecond,
 		InterPacketMax:        time.Duration(maxI64(f.IpsMaxUs, 0)) * time.Microsecond,
+		AvgBufferTime:         time.Duration(maxI64(f.AvgBufferTimeUs, 0)) * time.Microsecond,
 	}
 }
 
@@ -163,7 +173,7 @@ func maxI64(a, b int64) int64 {
 func (s Stats) ToJSON() string {
 	return fmt.Sprintf(
 		`{"received":%d,"received_bytes":%d,"delivered":%d,"lost":%d,`+
-			`"recovered":%d,"fec_recovered":%d,"duplicates":%d,"reordered":%d,`+
+			`"recovered":%d,"recovered_one_retry":%d,"fec_recovered":%d,"duplicates":%d,"reordered":%d,`+
 			`"too_late":%d,"too_late_retransmit":%d,"retransmitted_received":%d,`+
 			`"clock_resync":%d,"missing":%d,"nacks_sent":%d,"abandoned":%d,`+
 			`"overwritten":%d,"flow_resets":%d,"discontinuities":%d,`+
@@ -171,9 +181,9 @@ func (s Stats) ToJSON() string {
 			`"retransmit_skipped":%d,"retransmit_suppressed":%d,`+
 			`"retransmit_exhausted":%d,"bandwidth_skipped":%d,`+
 			`"rtt_us":%d,"bandwidth_bps":%d,"retry_bandwidth_bps":%d,"quality":%.3f,`+
-			`"ips_min_us":%d,"ips_cur_us":%d,"ips_max_us":%d}`,
+			`"ips_min_us":%d,"ips_cur_us":%d,"ips_max_us":%d,"avg_buffer_time_us":%d}`,
 		s.Received, s.ReceivedBytes, s.Delivered, s.Lost,
-		s.Recovered, s.FECRecovered, s.Duplicates, s.Reordered,
+		s.Recovered, s.RecoveredOneRetry, s.FECRecovered, s.Duplicates, s.Reordered,
 		s.TooLate, s.TooLateRetransmit, s.RetransmittedReceived,
 		s.ClockResync, s.Missing, s.NACKsSent, s.Abandoned,
 		s.Overwritten, s.FlowResets, s.Discontinuities,
@@ -182,5 +192,6 @@ func (s Stats) ToJSON() string {
 		s.RetransmitExhausted, s.BandwidthSkipped,
 		s.RTT.Microseconds(), s.BandwidthBps, s.RetryBandwidthBps, s.Quality,
 		s.InterPacketMin.Microseconds(), s.InterPacketCur.Microseconds(), s.InterPacketMax.Microseconds(),
+		s.AvgBufferTime.Microseconds(),
 	)
 }

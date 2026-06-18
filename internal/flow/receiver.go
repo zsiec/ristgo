@@ -198,6 +198,13 @@ type receiverState struct {
 	ipsMinUs       int64
 	ipsCurUs       int64
 	ipsMaxUs       int64
+
+	// bufferTimeSum/bufferTimeSamples accumulate the running mean of the recovery
+	// buffer level (libRIST avg_buffer_time), sampled once per recalc tick (~100 ms)
+	// in autoScaleBuffer. The gauge is bufferTimeSum/bufferTimeSamples; before the
+	// first sample the flow reports the current static buffer instead.
+	bufferTimeSum     int64
+	bufferTimeSamples uint64
 }
 
 // pathBit returns the pathSeen bit for a path index (aliasing mod 64; see
@@ -271,7 +278,17 @@ func (f *Flow) CurrentRecoveryBuffer() clock.Microseconds { return f.recoveryBuf
 // retroactively re-dating a packet, which preserves the in-order/no-late-delivery
 // invariants. Growth is unbounded within [min, max]; shrink is rate-limited.
 func (f *Flow) autoScaleBuffer() {
-	if f.role != RoleReceiver || f.cfg.RTTMultiplier <= 0 {
+	if f.role != RoleReceiver {
+		return
+	}
+	// Sample the live recovery-buffer level for the AvgBufferTimeUs gauge on every
+	// recalc tick (~100 ms), whether or not the dynamic scaling below proceeds — a
+	// static or scaling-disabled buffer still contributes its constant level to the
+	// running mean.
+	f.receiver.bufferTimeSum += int64(f.recoveryBuffer)
+	f.receiver.bufferTimeSamples++
+
+	if f.cfg.RTTMultiplier <= 0 {
 		return
 	}
 	if f.cfg.RecoveryBufferMin == f.cfg.RecoveryBufferMax {
@@ -754,6 +771,9 @@ func (f *Flow) processNacks(now clock.Timestamp) {
 		case s.state == slotFilled && s.seq == e.seq:
 			if e.nackCount > 0 {
 				f.stats.Recovered++
+				if e.nackCount == 1 {
+					f.stats.RecoveredOneRetry++
+				}
 			}
 			remove = true
 		case s.state == slotFilled:

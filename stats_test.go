@@ -16,6 +16,7 @@ func TestToStatsMapsBytesGaugesAndQuality(t *testing.T) {
 	f.TooLate, f.Missing = 2, 12
 	f.SmoothedRTTUs, f.DataBitrateBps, f.RetryBitrateBps = 8000, 12_000_000, 800_000
 	f.IpsMinUs, f.IpsCurUs, f.IpsMaxUs = 3_000, 4_000, 9_000
+	f.Recovered, f.RecoveredOneRetry, f.AvgBufferTimeUs = 5, 4, 600_000
 	s := toStats(f)
 	if s.ReceivedBytes != 90*1316 || s.SentBytes != 100*1316 || s.RetransmittedBytes != 7*1316 {
 		t.Fatalf("byte counts: %+v", s)
@@ -28,6 +29,9 @@ func TestToStatsMapsBytesGaugesAndQuality(t *testing.T) {
 	}
 	if s.InterPacketMin != 3_000*time.Microsecond || s.InterPacketCur != 4_000*time.Microsecond || s.InterPacketMax != 9_000*time.Microsecond {
 		t.Fatalf("ips gauges: %+v", s)
+	}
+	if s.RecoveredOneRetry != 4 || s.AvgBufferTime != 600_000*time.Microsecond {
+		t.Fatalf("recovered_one_retry/avg_buffer_time: %+v", s)
 	}
 	if d := s.Quality - 90.0; d > 1e-9 || d < -1e-9 {
 		t.Fatalf("quality = %v, want 90", s.Quality)
@@ -43,11 +47,12 @@ func TestQualityIs100WhenNoPacketsExpected(t *testing.T) {
 func TestToJSONIsFlatAndContainsFields(t *testing.T) {
 	var f flow.Stats
 	f.Received, f.SentBytes, f.SmoothedRTTUs = 3, 4096, 5000
+	f.RecoveredOneRetry, f.AvgBufferTimeUs = 2, 700_000
 	j := toStats(f).ToJSON()
 	if !strings.HasPrefix(j, "{") || !strings.HasSuffix(j, "}") {
 		t.Fatalf("not a JSON object: %s", j)
 	}
-	for _, key := range []string{`"received":3`, `"sent_bytes":4096`, `"rtt_us":5000`, `"bandwidth_bps":0`, `"quality":100.000`, `"ips_max_us":0`} {
+	for _, key := range []string{`"received":3`, `"sent_bytes":4096`, `"rtt_us":5000`, `"bandwidth_bps":0`, `"quality":100.000`, `"ips_max_us":0`, `"recovered_one_retry":2`, `"avg_buffer_time_us":700000`} {
 		if !strings.Contains(j, key) {
 			t.Fatalf("JSON missing %q: %s", key, j)
 		}

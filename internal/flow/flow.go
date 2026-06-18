@@ -377,7 +377,22 @@ func (f *Flow) Stats() Stats {
 	}
 	s.IpsCurUs = f.receiver.ipsCurUs
 	s.IpsMaxUs = f.receiver.ipsMaxUs
+	s.AvgBufferTimeUs = f.avgBufferTimeUs()
 	return s
+}
+
+// avgBufferTimeUs is the average recovery-buffer (playout) level in microseconds —
+// the libRIST avg_buffer_time gauge. The running mean of the dynamic buffer sampled
+// per recalc tick; before the first sample (or on a sender) it reports the current
+// static buffer so the gauge is never a misleading 0.
+func (f *Flow) avgBufferTimeUs() int64 {
+	if f.role != RoleReceiver {
+		return 0
+	}
+	if f.receiver.bufferTimeSamples == 0 {
+		return int64(f.recoveryBuffer)
+	}
+	return f.receiver.bufferTimeSum / int64(f.receiver.bufferTimeSamples)
 }
 
 // Feed ingests one inbound media packet that arrived on the given path at

@@ -145,6 +145,42 @@ func TestAutoScaleBuffer(t *testing.T) {
 	})
 }
 
+// TestAvgBufferTime verifies the avg_buffer_time gauge: it reports the constant
+// buffer for a static receiver (even before any sample) and the running mean of the
+// sampled levels for a windowed one, and 0 on a sender.
+func TestAvgBufferTime(t *testing.T) {
+	// Static (non-windowed) receiver: the gauge is the constant buffer.
+	cfg := DefaultConfig()
+	cfg.RecoveryBufferMin = ms(500)
+	cfg.RecoveryBufferMax = ms(500)
+	f := New(RoleReceiver, cfg)
+	if got := f.avgBufferTimeUs(); got != int64(ms(500)) {
+		t.Fatalf("pre-sample static = %d, want %d", got, int64(ms(500)))
+	}
+	for i := 0; i < 4; i++ {
+		f.autoScaleBuffer() // samples 500ms each tick, never scales
+	}
+	if got := f.avgBufferTimeUs(); got != int64(ms(500)) {
+		t.Fatalf("static mean = %d, want %d", got, int64(ms(500)))
+	}
+
+	// Windowed receiver scaling 600 -> 715ms: the running mean lies between the two
+	// sampled levels (600 sampled pre-scale, then 715).
+	f = windowedReceiver()
+	f.SetSenderMaxBuffer(ms(1000))
+	f.est = rtt.New(ms(100))
+	f.autoScaleBuffer() // samples 600, grows to 715
+	f.autoScaleBuffer() // samples 715
+	if got, want := f.avgBufferTimeUs(), (int64(ms(600))+int64(ms(715)))/2; got != want {
+		t.Fatalf("windowed mean = %d, want %d", got, want)
+	}
+
+	// A sender flow always reports 0.
+	if got := New(RoleSender, DefaultConfig()).avgBufferTimeUs(); got != 0 {
+		t.Fatalf("sender avg_buffer_time = %d, want 0", got)
+	}
+}
+
 // TestSetRTTMultiplier verifies the runtime setter (BondedReceiver/Receiver.
 // SetRTTMultiplier, libRIST rist_recovery_rtt_multiplier_set): a changed multiplier
 // is read live by the next auto-scale pass, and 0 disables scaling.

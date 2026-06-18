@@ -162,6 +162,7 @@ func zeroGauges(s Stats) Stats {
 	s.ReceivedBytes, s.SentBytes, s.RetransmittedBytes = 0, 0, 0
 	s.SmoothedRTTUs, s.DataBitrateBps, s.RetryBitrateBps = 0, 0, 0
 	s.IpsMinUs, s.IpsCurUs, s.IpsMaxUs = 0, 0, 0
+	s.AvgBufferTimeUs = 0 // gauge: Stats() reports the static buffer, never 0 on a receiver
 	return s
 }
 
