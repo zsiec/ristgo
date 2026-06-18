@@ -6,6 +6,7 @@ import (
 	"github.com/zsiec/ristgo/internal/adv"
 	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/clock"
+	"github.com/zsiec/ristgo/internal/crypto"
 	"github.com/zsiec/ristgo/internal/eap"
 	"github.com/zsiec/ristgo/internal/fec"
 	"github.com/zsiec/ristgo/internal/flow"
@@ -18,8 +19,11 @@ import (
 
 // bondAuth is one bonded path's EAP-SRP state (combined PSK+SRP mode): a sender path
 // drives an Authenticatee, a receiver path an Authenticator, gating that path's media
-// until its handshake succeeds. The media itself stays keyed by the shared PSK codec, so
-// only the gate is per-path. Empty (the whole slice nil) when authentication is disabled.
+// until its handshake succeeds. In the combined PSK+SRP mode the media stays keyed by the
+// shared PSK codec, so only the gate is per-path; in the pure-SRP use_key_as_passphrase
+// mode each path also re-keys its own codec (bondState.codecs) to its session key K, and
+// txKeyGen/rxKeyGen track which K generation is installed. Empty (the whole slice nil)
+// when authentication is disabled.
 type bondAuth struct {
 	client    *eap.Authenticatee // sender role (nil on a receiver)
 	server    *eap.Authenticator // receiver role (nil on a sender)
@@ -27,6 +31,8 @@ type bondAuth struct {
 	startSent bool               // sender: EAPOL-Start emitted once the peer is known
 	lastTx    *eap.Frame         // the outstanding frame to retransmit under loss
 	retx      int                // consecutive keepalive-driven retransmits
+	txKeyGen  uint64             // pure-SRP: generation of the installed per-path send key
+	rxKeyGen  uint64             // pure-SRP: generation of the installed per-path recv key
 }
 
 // This file is the link-bonding / SMPTE 2022-7 host: N network paths feeding one
@@ -114,10 +120,16 @@ type bondState struct {
 	// sequence so a dropped fragment is detected per path. nil unless FEC is enabled.
 	fecReasm []fecCtrlReassembler
 
-	// auth is the per-path EAP-SRP state (combined PSK+SRP mode). nil when no
+	// auth is the per-path EAP-SRP state (both PSK+SRP and pure-SRP modes). nil when no
 	// credentials are configured; otherwise one entry per path, gating that path's
 	// media until its handshake succeeds. See bondAuth.
 	auth []bondAuth
+
+	// codecs are per-path Main codecs, used ONLY in the pure-SRP use_key_as_passphrase
+	// mode so each path can re-key its own media to that path's session key K. nil in
+	// every other mode (including PSK+SRP), where the one shared s.main codec carries all
+	// paths. When non-nil, bondCodec(idx) returns codecs[idx] in place of s.main.
+	codecs []*mainCodec
 
 	// everConnected records that the host connect callback has fired (the first path
 	// to authenticate); the bonded session connects once though paths auth per-path.
@@ -144,6 +156,7 @@ func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config, e
 		}
 		s.authed.Store(false) // hold every path's media until its handshake succeeds
 	}
+	buildBondCodecs(s, bs, len(conns))
 	for i := range conns {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
 		// Register the path with the default duplicate weight / priority 0 unless
@@ -178,6 +191,7 @@ func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bond
 		}
 		s.authed.Store(false) // hold media until at least one path's handshake succeeds
 	}
+	buildBondCodecs(s, bs, len(remotes))
 	for i := range remotes {
 		bs.peers[i] = peer.New(cfg.SessionTimeout)
 		bs.peers[i].Media = remotes[i][0]
@@ -437,6 +451,29 @@ func (s *Session) bondObserveRTT(now clock.Timestamp, idx uint8, fbs []wire.Feed
 	}
 }
 
+// buildBondCodecs allocates n per-path Main codecs (clones of s.main) into bs.codecs
+// when the pure-SRP use_key_as_passphrase mode is active, so each bonded path can re-key
+// its media to that path's own session key K. A no-op in every other mode (bs.codecs stays
+// nil and the one shared s.main codec carries all paths).
+func buildBondCodecs(s *Session, bs *bondState, n int) {
+	if !s.useKeyAsPassphrase || s.main == nil {
+		return
+	}
+	bs.codecs = make([]*mainCodec, n)
+	for i := range bs.codecs {
+		bs.codecs[i] = s.main.cloneFresh()
+	}
+}
+
+// bondCodec returns the Main codec carrying path idx: the per-path codec in the pure-SRP
+// mode (each path keyed to its own K), else the one shared s.main codec.
+func (s *Session) bondCodec(idx uint8) *mainCodec {
+	if int(idx) < len(s.bond.codecs) {
+		return s.bond.codecs[idx]
+	}
+	return s.main
+}
+
 // bondPathAuthed reports whether path idx may carry media: always true when bonded
 // authentication is disabled, otherwise once that path's EAP-SRP handshake has succeeded.
 func (s *Session) bondPathAuthed(idx uint8) bool {
@@ -492,6 +529,11 @@ func (s *Session) handleBondEAP(now clock.Timestamp, idx uint8, payload []byte) 
 		a.lastTx = out
 		s.sendBondEAP(idx, *out, now)
 	}
+	// Pure-SRP: re-key this path's codec from its session key K once available (sent the
+	// EAPOL reply cleartext first; keying is idempotent per generation). A no-op in PSK+SRP.
+	if s.useKeyAsPassphrase {
+		s.installBondEAPKeying(idx)
+	}
 	wasAuthed := a.authed
 	a.authed = authedAt
 	if a.authed && !wasAuthed {
@@ -510,13 +552,59 @@ func (s *Session) handleBondEAP(now clock.Timestamp, idx uint8, payload []byte) 
 	}
 }
 
-// sendBondEAP frames an EAPOL payload through the shared codec and sends it on path idx
+// installBondEAPKeying re-keys path idx's codec from that path's EAP-SRP session key K
+// (the pure-SRP use_key_as_passphrase mode), once the handshake has produced keying
+// material. It is the per-path analog of installEAPKeying: idempotent per direction via
+// the per-path key generation (a no-op until K is available and after the current
+// generation is installed). K never reaches a log here.
+func (s *Session) installBondEAPKeying(idx uint8) {
+	if int(idx) >= len(s.bond.codecs) || int(idx) >= len(s.bond.auth) {
+		return
+	}
+	a := &s.bond.auth[idx]
+	codec := s.bond.codecs[idx]
+	keyBits := crypto.KeySize128
+	if s.eapKeySize256 {
+		keyBits = crypto.KeySize256
+	}
+	var (
+		tx, rx         eap.Passphrase
+		haveTx, haveRx bool
+	)
+	switch {
+	case a.client != nil:
+		tx, haveTx = a.client.TxKeying()
+		rx, haveRx = a.client.RxKeying()
+	case a.server != nil:
+		tx, haveTx = a.server.TxKeying()
+		rx, haveRx = a.server.RxKeying()
+	}
+	if haveTx && tx.Gen != a.txKeyGen {
+		if k, err := crypto.NewKeyRaw(tx.Key, keyBits, s.eapKeyRotation, false); err != nil {
+			s.logf("bond: derive send key path %d: %v", idx, err)
+		} else {
+			codec.setSendKey(k, s.eapKeySize256)
+			a.txKeyGen = tx.Gen
+		}
+	}
+	if haveRx && rx.Gen != a.rxKeyGen {
+		if d, err := crypto.NewDecryptorRaw(rx.Key, keyBits); err != nil {
+			s.logf("bond: derive recv key path %d: %v", idx, err)
+		} else {
+			codec.setRecvKey(d)
+			a.rxKeyGen = rx.Gen
+		}
+	}
+}
+
+// sendBondEAP frames an EAPOL payload through path idx's codec and sends it on path idx
 // to that path's peer: a sender writes its one socket to remote idx; a receiver writes
-// path idx's socket to the learned sender address.
+// path idx's socket to the learned sender address. EAPOL rides the path's codec while it
+// is still cleartext (pre-K), so each path's GRE sequence stays self-consistent.
 func (s *Session) sendBondEAP(idx uint8, f eap.Frame, now clock.Timestamp) {
 	s.lastTx = now
 	s.rtcpBuf = s.rtcpBuf[:0]
-	b, err := s.main.encodeEAPOL(s.rtcpBuf, f.AppendTo(nil))
+	b, err := s.bondCodec(idx).encodeEAPOL(s.rtcpBuf, f.AppendTo(nil))
 	if err != nil {
 		s.logf("bond: encode eap path %d: %v", idx, err)
 		return
@@ -596,20 +684,21 @@ func (s *Session) handleBondSimple(now clock.Timestamp, idx uint8, p *peer.Peer,
 func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, bi bondInbound) {
 	p.LearnMedia(bi.src)
 	p.LearnRTCP(bi.src)
-	if oob, proto, ok, oerr := s.main.peekOOB(bi.data); ok {
+	codec := s.bondCodec(idx)
+	if oob, proto, ok, oerr := codec.peekOOB(bi.data); ok {
 		if oerr == nil {
 			s.deliverOOB(proto, oob)
 		}
 		return
 	}
-	// EAP-SRP authentication frame: route to this path's handshake (combined PSK+SRP).
+	// EAP-SRP authentication frame: route to this path's handshake (both auth modes).
 	if len(s.bond.auth) > 0 {
-		if eapPayload, ok := s.main.peekEAPOL(bi.data); ok {
+		if eapPayload, ok := codec.peekEAPOL(bi.data); ok {
 			s.handleBondEAP(now, idx, eapPayload)
 			return
 		}
 	}
-	isMedia, pkt, fbs, bn, err := s.main.decodeMain(bi.data, s.highestSent)
+	isMedia, pkt, fbs, bn, err := codec.decodeMain(bi.data, s.highestSent)
 	if err != nil {
 		return
 	}
@@ -625,7 +714,7 @@ func (s *Session) handleBondMain(now clock.Timestamp, idx uint8, p *peer.Peer, b
 		}
 		s.feedMedia(now, idx, pkt)
 		if s.fecEnabled() {
-			s.fecRecvRTP(now, s.main.dec.lastWireTS, pkt)
+			s.fecRecvRTP(now, codec.dec.lastWireTS, pkt)
 		}
 		return
 	}
@@ -723,6 +812,12 @@ func addrPortEqual(a, b netip.AddrPort) bool {
 // across paths, and the receiver reads each datagram's transport seq from the
 // wire (libRIST frames per-peer but the receiver merges on the same RTP key).
 func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
+	// Pure-SRP mode: each path encodes with its own K-keyed codec (different ciphertext
+	// per path), so the encode moves inside the fan. FEC is disallowed in this mode.
+	if len(s.bond.codecs) > 0 {
+		s.sendBondMediaPerPath(now, pkt)
+		return
+	}
 	s.mediaBuf = s.mediaBuf[:0]
 	var (
 		b   []byte
@@ -775,6 +870,42 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	if s.fecEnabled() {
 		s.fecOnSend(now, pkt, b) // generate row/column FEC and fan it across the paths
 	}
+}
+
+// sendBondMediaPerPath is sendBondMedia's pure-SRP variant: each path encodes the packet
+// with its OWN codec (keyed to that path's session key K), so the ciphertext differs per
+// path. It mirrors the duplicate + weighted fan, gating each path on its handshake; the
+// dedup key is still the inner RTP (Seq, SourceTime), identical across paths. FEC is not
+// supported here (rejected at construction), so there is no FEC fan.
+func (s *Session) sendBondMediaPerPath(now clock.Timestamp, pkt wire.MediaPacket) {
+	send := func(i uint8) {
+		s.mediaBuf = s.mediaBuf[:0]
+		b, err := s.bond.codecs[i].encodeMainMedia(s.mediaBuf, pkt)
+		if err != nil {
+			s.logf("bond: encode media path %d seq %d: %v", i, pkt.Seq, err)
+			return
+		}
+		s.mediaBuf = b
+		s.bond.group.CountSent(i, len(pkt.Payload), pkt.Retransmit)
+		if werr := s.bond.conns[0].WriteMedia(b, s.bond.remotes[i][0]); werr != nil {
+			s.logf("bond: write media path %d: %v", i, werr)
+		}
+	}
+	for i := range s.bond.remotes {
+		// Skip a proven-dead path or one whose handshake has not completed.
+		if !s.bond.group.ShouldDuplicate(uint8(i), now) || !s.bondPathAuthed(uint8(i)) {
+			continue
+		}
+		send(uint8(i))
+	}
+	// Weighted load-share paths: one elected path carries this datagram (disjoint from
+	// the duplicate paths above), recorded for the (absent) FEC fan's parity.
+	idx, ok := s.bond.group.SelectWeighted(now)
+	s.bond.lastWeighted, s.bond.lastWeightedOK = idx, ok && int(idx) < len(s.bond.remotes) && s.bondPathAuthed(idx)
+	if s.bond.lastWeightedOK {
+		send(idx)
+	}
+	s.lastTx = now
 }
 
 // sendBondFEC fans one FEC packet across the bonded paths in the configured

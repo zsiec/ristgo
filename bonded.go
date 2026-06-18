@@ -380,20 +380,22 @@ func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Con
 	return &BondedSender{sess: sess, remote: remotes[0][0], maxWrite: maxWrite, paths: len(remotes), profile: cfg.Profile}, nil
 }
 
-// bondedSupported fails closed on the bonded features not implemented: DTLS over
-// multipath, and EAP-SRP over multipath WITHOUT a pre-shared Secret. All three
-// profiles (Simple, Main, Advanced) are supported, including Main/Advanced PSK
-// encryption. Bonded EAP-SRP is supported only in the combined PSK+SRP mode (a Secret
-// is set): each path authenticates with its own handshake but the media stays keyed by
-// the shared PSK, so the per-path gate rides on one shared codec. The pure-SRP
-// use_key_as_passphrase mode (no Secret) would re-key each path's media to its own SRP
-// session key and is not supported on bonded (the single-flow path supports it).
+// bondedSupported fails closed on the one bonded feature not implemented: DTLS over
+// multipath. All three profiles (Simple, Main, Advanced) are supported, including
+// Main/Advanced PSK encryption and EAP-SRP authentication. Bonded EAP-SRP runs in two
+// modes, both per-path (each path authenticates with its own handshake): the combined
+// PSK+SRP mode (a Secret is set) keeps the media keyed by the shared PSK so the gate
+// rides on one shared codec; the pure-SRP use_key_as_passphrase mode (no Secret) re-keys
+// each path's media to its own SRP session key K on a per-path codec.
 func bondedSupported(cfg Config) error {
 	if cfg.DTLS != nil {
 		return fmt.Errorf("%w: bonded DTLS is not supported", ErrInvalidConfig)
 	}
-	if cfg.Username != "" && cfg.Secret == "" {
-		return fmt.Errorf("%w: bonded EAP-SRP requires a Secret (the PSK+SRP mode); pure-SRP bonding is not supported", ErrInvalidConfig)
+	// Pure-SRP bonding re-keys each path's media to its own session key K on a per-path
+	// codec; FEC's per-path fan would then need per-path encryption, which is not wired.
+	// PSK+SRP bonding (a Secret is set) keeps the shared codec, so it combines with FEC.
+	if cfg.Username != "" && cfg.Secret == "" && cfg.FEC != nil {
+		return fmt.Errorf("%w: bonded pure-SRP (no Secret) with FEC is not supported; set a Secret to use the PSK+SRP mode with FEC", ErrInvalidConfig)
 	}
 	return nil
 }

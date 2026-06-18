@@ -117,13 +117,118 @@ func TestE2EBondedEAPSRP(t *testing.T) {
 
 // TestBondedEAPRequiresSecret verifies pure-SRP bonding (SRP without a Secret) is
 // rejected — bonded EAP-SRP is supported only in the combined PSK+SRP mode.
-func TestBondedEAPRequiresSecret(t *testing.T) {
+// bondedPureSRPConfig is a Main-profile bonded config in the pure-SRP
+// use_key_as_passphrase mode (SRP credentials, NO Secret): each path derives its own
+// session key K and keys its media with it on a per-path codec.
+func bondedPureSRPConfig() ristgo.Config {
+	c := ristgo.DefaultConfig()
+	c.Profile = ristgo.ProfileMain
+	c.Username = "rist"
+	c.Password = "bondpw" // no Secret -> pure-SRP
+	c.BufferMin = 300 * time.Millisecond
+	c.BufferMax = 300 * time.Millisecond
+	return c
+}
+
+// TestE2EBondedPureSRP verifies pure-SRP bonded end to end: a two-path bonded sender and
+// receiver each run a per-path EAP-SRP handshake with NO pre-shared Secret, each path
+// re-keys its own codec to its session key K, and the deduplicated stream is delivered
+// bit-exact. This exercises the per-path-codec path (distinct from the shared-codec
+// PSK+SRP mode in TestE2EBondedEAPSRP).
+func TestE2EBondedPureSRP(t *testing.T) {
+	pA := freeMainPort(t)
+	pB := freeMainPort(t)
+	for pB == pA {
+		pB = freeMainPort(t)
+	}
+	addrs := []string{fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)}
+
+	var mu sync.Mutex
+	var seenUser string
+	recvCfg := bondedPureSRPConfig()
+	recvCfg.OnConnect = func(info ristgo.ConnectInfo) bool {
+		mu.Lock()
+		seenUser = info.Username
+		mu.Unlock()
+		return true
+	}
+
+	rx, err := ristgo.NewBondedReceiver(addrs, recvCfg)
+	if err != nil {
+		t.Fatalf("NewBondedReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := ristgo.NewBondedSender(addrs, bondedPureSRPConfig())
+	if err != nil {
+		t.Fatalf("NewBondedSender: %v", err)
+	}
+	defer tx.Close()
+
+	payload := make([]byte, 96*1024)
+	for i := range payload {
+		payload[i] = byte(i*7 + 1)
+	}
+	want := sha256.Sum256(payload)
+
+	const chunk = 1024
+	var wg sync.WaitGroup
+	var got [32]byte
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+		acc := make([]byte, 0, len(payload))
+		buf := make([]byte, 4096)
+		h := sha256.New()
+		for len(acc) < len(payload) {
+			n, rerr := rx.Read(buf)
+			if n > 0 {
+				h.Write(buf[:n])
+				acc = append(acc, buf[:n]...)
+			}
+			if rerr != nil {
+				return
+			}
+		}
+		copy(got[:], h.Sum(nil))
+	}()
+
+	tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	for off := 0; off < len(payload); off += chunk {
+		end := off + chunk
+		if end > len(payload) {
+			end = len(payload)
+		}
+		if _, werr := tx.Write(payload[off:end]); werr != nil {
+			t.Fatalf("Write at %d: %v", off, werr)
+		}
+		if (off/chunk)%8 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	flush := make([]byte, chunk)
+	for i := 0; i < 24; i++ {
+		tx.Write(flush)
+		time.Sleep(time.Millisecond)
+	}
+	wg.Wait()
+	if got != want {
+		t.Fatalf("pure-SRP bonded delivery hash mismatch (delivered=%d)", rx.Stats().Delivered)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seenUser != "rist" {
+		t.Fatalf("pure-SRP bonded connect callback username = %q, want \"rist\"", seenUser)
+	}
+}
+
+// TestBondedPureSRPFECRejected verifies pure-SRP bonding combined with FEC is rejected
+// (the per-path FEC encryption fan is not wired); PSK+SRP bonding combines with FEC.
+func TestBondedPureSRPFECRejected(t *testing.T) {
 	addr := fmt.Sprintf("127.0.0.1:%d", freeMainPort(t))
-	cfg := ristgo.DefaultConfig()
-	cfg.Profile = ristgo.ProfileMain
-	cfg.Username = "rist"
-	cfg.Password = "pw" // no Secret
+	cfg := bondedPureSRPConfig()
+	cfg.FEC = &ristgo.FECConfig{Columns: 5, Rows: 5}
 	if _, err := ristgo.NewBondedReceiver([]string{addr}, cfg); !errors.Is(err, ristgo.ErrInvalidConfig) {
-		t.Fatalf("pure-SRP bonded = %v, want ErrInvalidConfig", err)
+		t.Fatalf("pure-SRP bonded + FEC = %v, want ErrInvalidConfig", err)
 	}
 }

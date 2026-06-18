@@ -231,6 +231,15 @@ func newMainCodec(sendKey *crypto.Key, recvKey *crypto.Decryptor, keySize256 boo
 	}
 }
 
+// cloneFresh returns a new codec carrying this one's configuration (virtual ports, NPD,
+// SSRC, CNAME, bitmask) and current keys, but with reset per-stream state (a fresh GRE
+// sequence and decoder). It is the per-path seam for bonded EAP-SRP: each bonded path
+// needs its own codec so the pure-SRP use_key_as_passphrase mode can re-key each path's
+// media to that path's own session key K, and so each path's GRE sequence is independent.
+func (c *mainCodec) cloneFresh() *mainCodec {
+	return newMainCodec(c.sendKey, c.recvKey, c.keySize256, c.srcPort, c.dstPort, c.npdEnabled, c.ssrc, c.cname, c.bitmask)
+}
+
 // setSendKey installs (or replaces) the PSK encryptor used for outbound
 // datagrams, with keySize256 selecting the GRE H bit. It is the re-key seam for
 // the EAP-SRP use_key_as_passphrase mode: a Main session starts cleartext (no
