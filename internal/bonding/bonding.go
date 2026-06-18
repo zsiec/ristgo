@@ -142,6 +142,19 @@ func (g *Group) AddPath(index uint8, weight int, priority uint32) *Path {
 	return p
 }
 
+// RemovePath drops the path with the given index (libRIST rist_peer_destroy) from
+// the fan-out, NACK selection, and per-peer stats. Unknown indices are ignored.
+// Returns whether a path was removed.
+func (g *Group) RemovePath(index uint8) bool {
+	for i, p := range g.paths {
+		if p.Index == index {
+			g.paths = append(g.paths[:i], g.paths[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // HasPath reports whether a path with the given index is already registered.
 // The host uses it to avoid overwriting a path's priority/weight that was
 // configured before the session was built.

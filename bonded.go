@@ -44,6 +44,10 @@ type BondedSender struct {
 	// paths is the number of bonded paths (== len(addrs) at construction), used to
 	// bounds-check SetWeight's path index.
 	paths int
+
+	// profile resolves a runtime AddPath address (Simple needs the even/odd pair;
+	// Main/Advanced use the single port).
+	profile Profile
 }
 
 // newBondingGroup builds the per-flow bonding group from cfg's liveness and RTT
@@ -343,7 +347,7 @@ func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Con
 	if cfg.FragmentSize > 0 {
 		maxWrite = cfg.FragmentSize * maxFragmentsPerWrite
 	}
-	return &BondedSender{sess: sess, remote: remotes[0][0], maxWrite: maxWrite, paths: len(remotes)}, nil
+	return &BondedSender{sess: sess, remote: remotes[0][0], maxWrite: maxWrite, paths: len(remotes), profile: cfg.Profile}, nil
 }
 
 // bondedSupported fails closed on the bonded features not implemented: DTLS over
@@ -552,6 +556,39 @@ func (s *BondedSender) SetWeight(path int, weight int) error {
 		return fmt.Errorf("%w: weight must be >= 0 (0 = duplicate)", ErrInvalidConfig)
 	}
 	return s.sess.SetPathWeight(uint8(path), weight)
+}
+
+// AddPath adds a bonded destination path at runtime (libRIST rist_peer_create): the
+// sender begins transmitting to addr ("host:port") at index, with load-share weight
+// (0 = full SMPTE 2022-7 duplication). The caller owns the index space — the
+// construction paths are 0..N, so a fresh path uses an unused index >= N; a duplicate
+// index is ignored. The path joins the fan-out on the next media send. It is safe to
+// call from any goroutine. It returns an error for an out-of-range index/weight or a
+// bad address, or the close reason if the sender is closed.
+func (s *BondedSender) AddPath(index int, addr string, weight int) error {
+	if index < 0 || index > 255 {
+		return fmt.Errorf("%w: path index %d out of range [0,255]", ErrInvalidConfig, index)
+	}
+	if weight < 0 {
+		return fmt.Errorf("%w: weight must be >= 0 (0 = duplicate)", ErrInvalidConfig)
+	}
+	remote, err := bondSenderRemote(addr, s.profile)
+	if err != nil {
+		return err
+	}
+	return s.sess.AddPath(uint8(index), remote, weight, 0)
+}
+
+// RemovePath removes a bonded path at runtime (libRIST rist_peer_destroy): the sender
+// stops transmitting on index and drops it from NACK selection and per-peer stats. The
+// shared source socket stays open for the remaining paths. An unknown index is a no-op.
+// It is safe to call from any goroutine. It returns an error for an out-of-range index,
+// or the close reason if the sender is closed.
+func (s *BondedSender) RemovePath(index int) error {
+	if index < 0 || index > 255 {
+		return fmt.Errorf("%w: path index %d out of range [0,255]", ErrInvalidConfig, index)
+	}
+	return s.sess.RemovePath(uint8(index))
 }
 
 // SetNullPacketDeletion enables or disables null-packet deletion on the send path at

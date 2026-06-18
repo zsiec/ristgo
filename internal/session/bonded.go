@@ -56,6 +56,18 @@ type weightSet struct {
 	weight int
 }
 
+// peerSet is a runtime bonded-path add/remove (BondedSender.AddPath/RemovePath,
+// libRIST rist_peer_create/_destroy) delivered to the event loop, which owns the
+// bonding Group and the per-path remotes. remove drops the path at index; otherwise
+// it adds a destination at index sending to media (weight 0 = full 2022-7 duplication).
+type peerSet struct {
+	remove   bool
+	index    uint8
+	remote   [2]netip.AddrPort // {media, rtcp}
+	weight   int
+	priority uint32
+}
+
 // bondState holds the per-path I/O and policy for a bonded session.
 type bondState struct {
 	group *bonding.Group
@@ -140,8 +152,74 @@ func NewBondedSender(conn *socket.Conn, remotes [][2]netip.AddrPort, group *bond
 	s.bond = bs
 	s.bondIn = make(chan bondInbound, 256)
 	s.weightCmd = make(chan weightSet, 4) // runtime BondedSender.SetWeight
+	s.peerCmd = make(chan peerSet, 4)     // runtime BondedSender.AddPath/RemovePath
 	s.start()
 	return s
+}
+
+// AddPath adds a bonded destination path at runtime (BondedSender.AddPath, libRIST
+// rist_peer_create): the sender begins transmitting to media at index, with load-share
+// weight (0 = full SMPTE 2022-7 duplication). The caller owns the index space (the
+// construction paths are 0..N); a duplicate index is ignored. It marshals the change
+// onto the event loop, which owns the bonding Group and remotes, so it is safe from any
+// goroutine. Returns ErrOOBUnsupported on a non-bonded sender and the close reason once
+// the session is closed.
+func (s *Session) AddPath(index uint8, remote [2]netip.AddrPort, weight int, priority uint32) error {
+	if s.peerCmd == nil {
+		return s.cfg.ErrOOBUnsupported
+	}
+	select {
+	case s.peerCmd <- peerSet{index: index, remote: remote, weight: weight, priority: priority}:
+		return nil
+	case <-s.done:
+		return s.closeReason()
+	}
+}
+
+// RemovePath removes a bonded path at runtime (BondedSender.RemovePath, libRIST
+// rist_peer_destroy): the sender stops transmitting on index and drops it from NACK
+// selection and per-peer stats. An unknown index is a no-op. Returns ErrOOBUnsupported
+// on a non-bonded sender and the close reason once the session is closed.
+func (s *Session) RemovePath(index uint8) error {
+	if s.peerCmd == nil {
+		return s.cfg.ErrOOBUnsupported
+	}
+	select {
+	case s.peerCmd <- peerSet{remove: true, index: index}:
+		return nil
+	case <-s.done:
+		return s.closeReason()
+	}
+}
+
+// applyPeerCmd applies one runtime path add/remove on the loop goroutine, which owns
+// the bonding Group and the per-path remotes/peers. Add grows the remotes/peers (filling
+// any index gap with placeholders the Group never selects) and registers the path so the
+// next fan-out reaches it; Remove drops it from the Group (the shared socket stays for
+// the others), leaving its remotes slot as an inert tombstone.
+func (s *Session) applyPeerCmd(ps peerSet) {
+	if s.bond == nil {
+		return
+	}
+	if ps.remove {
+		s.bond.group.RemovePath(ps.index)
+		return
+	}
+	if s.bond.group.HasPath(ps.index) {
+		return // duplicate index: ignore (matches Group.AddPath)
+	}
+	for int(ps.index) >= len(s.bond.remotes) {
+		s.bond.remotes = append(s.bond.remotes, [2]netip.AddrPort{})
+		s.bond.peers = append(s.bond.peers, peer.New(s.cfg.SessionTimeout))
+		if s.bond.fecReasm != nil {
+			s.bond.fecReasm = append(s.bond.fecReasm, fecCtrlReassembler{})
+		}
+	}
+	p := peer.New(s.cfg.SessionTimeout)
+	p.Media, p.RTCP = ps.remote[0], ps.remote[1]
+	s.bond.peers[ps.index] = p
+	s.bond.remotes[ps.index] = ps.remote
+	s.bond.group.AddPath(ps.index, ps.weight, ps.priority)
 }
 
 // SetPathWeight changes path's load-balancing weight at runtime (BondedSender.

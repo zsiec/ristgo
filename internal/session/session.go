@@ -446,6 +446,10 @@ type Session struct {
 	// libRIST rist_peer_weight_set) onto the event loop, which owns the (not
 	// concurrency-safe) bonding Group. Non-nil only on a bonded sender.
 	weightCmd chan weightSet
+	// peerCmd carries runtime bonded-path add/remove (BondedSender.AddPath/RemovePath,
+	// libRIST rist_peer_create/_destroy) onto the event loop, which owns the Group and
+	// the per-path remotes. Non-nil only on a bonded sender.
+	peerCmd chan peerSet
 
 	// ctrlCmd carries runtime config setters (nack-type, rtt-multiplier, NPD —
 	// libRIST rist_receiver_nack_type_set / rist_recovery_rtt_multiplier_set /
@@ -938,6 +942,10 @@ func (s *Session) loop() {
 			if s.bond != nil {
 				s.bond.group.SetWeight(wc.path, wc.weight)
 			}
+		case ps := <-s.peerCmd:
+			// Apply a runtime bonded-path add/remove on the loop goroutine, which owns
+			// the Group and remotes. Takes effect on the next media send.
+			s.applyPeerCmd(ps)
 		case c := <-s.ctrlCmd:
 			// Apply a runtime config setter (nack-type / rtt-multiplier / NPD) on the
 			// loop goroutine, which owns the flow, codec, and live cfg.Bitmask.
