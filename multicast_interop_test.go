@@ -12,6 +12,7 @@
 package ristgo_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"net/netip"
@@ -90,8 +91,12 @@ func TestInteropMulticastLibristRxFromGoTx(t *testing.T) {
 	}
 	capPort := freeUDPPort(t, port, port+1)
 
-	data, want := randomData(t, interopN)
-	capt := newUDPCapture(t, capPort, len(data))
+	// Simple profile has no handshake, so libRIST anchors its receive flow on the first RTP
+	// packet it gets over the group; a brief paced warmup lets it anchor before the counted
+	// data, which we then assert is intact at the capture tail (see TestInteropLibristRxFromGoTx).
+	const warmup = 24
+	data, _ := randomData(t, interopN)
+	capt := newUDPCapture(t, capPort, (warmup+interopN)*interopChunk)
 	spawnTool(t, receiver, "-p", "0", "-b", "300",
 		"-i", fmt.Sprintf("rist://@%s:%d?miface=%s", group, port, iface),
 		"-o", fmt.Sprintf("udp://127.0.0.1:%d", capPort))
@@ -111,8 +116,13 @@ func TestInteropMulticastLibristRxFromGoTx(t *testing.T) {
 	}
 	defer tx.Close()
 
+	filler := bytes.Repeat([]byte{0xAA}, interopChunk)
 	tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
 	go func() {
+		for i := 0; i < warmup; i++ {
+			tx.Write(filler) // let libRIST anchor before the counted data
+			time.Sleep(3 * time.Millisecond)
+		}
 		for off := 0; off < len(data); off += interopChunk {
 			tx.Write(data[off : off+interopChunk])
 			if (off/interopChunk)%8 == 0 {
@@ -125,8 +135,8 @@ func TestInteropMulticastLibristRxFromGoTx(t *testing.T) {
 	if len(got) < len(data) {
 		t.Fatalf("multicast LibristRx: libRIST received %d/%d bytes", len(got), len(data))
 	}
-	if sha256.Sum256(got[:len(data)]) != want {
-		t.Fatalf("multicast LibristRx: byte mismatch at libRIST receiver over %s", group)
+	if !bytes.Equal(got[len(got)-len(data):], data) {
+		t.Fatalf("multicast LibristRx: data not intact at libRIST capture tail over %s", group)
 	}
 	t.Logf("multicast byte-exact: libRIST received %d bytes from ristgo over %s", len(data), group)
 }

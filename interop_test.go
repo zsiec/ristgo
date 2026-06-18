@@ -143,11 +143,18 @@ func randomData(t *testing.T, n int) (data []byte, hash [32]byte) {
 	return data, sha256.Sum256(data)
 }
 
-// feedUDP sends data to 127.0.0.1:port as interopChunk-sized datagrams, lightly
-// paced so the tools and the flow keep up. Each datagram becomes one RTP
-// payload on the wire.
+// feedUDP streams data to 127.0.0.1:port as interopChunk-sized datagrams (each becomes one
+// RTP payload on the wire), as a STEADY, SUSTAINED stream — the way real RIST media flows.
+// It is run as `go feedUDP(t, ...)` and feeds continuously (looping the payload, one
+// datagram per millisecond) until the test ends (t.Context is cancelled just before the
+// test's cleanups run). A burst-then-stop feed made the libRIST sender's pacing/rate
+// estimate collapse and stall the TAIL of its queue under load — it would send ~80-99% then
+// idle at a few kbps, leaving the receiver waiting forever for the last packets; a sustained
+// feed keeps libRIST draining. A receiver reads only the first len(data) bytes — it listens
+// before the sender starts, so it anchors on the first packet and never observes the loop.
 func feedUDP(t *testing.T, port int, data []byte) {
 	t.Helper()
+	ctx := t.Context() // cancelled when the test ends, so the feed stops (no lingering goroutine)
 	c, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 	if err != nil {
 		// feedUDP runs in a detached goroutine that may outlive the test, so
@@ -157,16 +164,19 @@ func feedUDP(t *testing.T, port int, data []byte) {
 		return
 	}
 	defer c.Close()
-	for off := 0; off < len(data); off += interopChunk {
-		end := off + interopChunk
-		if end > len(data) {
-			end = len(data)
-		}
-		if _, err := c.Write(data[off:end]); err != nil {
-			return
-		}
-		if (off/interopChunk)%8 == 0 {
-			time.Sleep(time.Millisecond)
+	for ctx.Err() == nil {
+		for off := 0; off < len(data); off += interopChunk {
+			end := off + interopChunk
+			if end > len(data) {
+				end = len(data)
+			}
+			if _, err := c.Write(data[off:end]); err != nil {
+				return // the tool exited — stop feeding
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(time.Millisecond) // steady, not a burst — keeps libRIST's pacing stable
 		}
 	}
 }
@@ -284,7 +294,14 @@ func TestInteropLibristRxFromGoTx(t *testing.T) {
 	rxPort := freeEvenPort(t)
 	capPort := freeUDPPort(t, rxPort, rxPort+1)
 
-	capt := newUDPCapture(t, capPort, interopN*interopChunk)
+	// The Simple profile has no GRE/auth handshake, so libRIST anchors its receive flow on
+	// the first RTP packet it happens to receive; any packet dropped while it sets that flow
+	// up lands BEFORE the anchor and is unrecoverable (libRIST never NACKs below its base).
+	// Send a brief paced warmup so libRIST anchors before the counted data, capture both,
+	// and assert the data is intact at the tail of the capture — tolerating only the
+	// pre-anchor warmup loss, never any loss within the data (ARQ must recover that).
+	const warmup = 24
+	capt := newUDPCapture(t, capPort, (warmup+interopN)*interopChunk)
 	spawnTool(t, receiver, "-p", "0", "-b", "200",
 		"-i", fmt.Sprintf("rist://@127.0.0.1:%d", rxPort),
 		"-o", fmt.Sprintf("udp://127.0.0.1:%d", capPort))
@@ -296,9 +313,14 @@ func TestInteropLibristRxFromGoTx(t *testing.T) {
 	}
 	defer tx.Close()
 
-	data, want := randomData(t, interopN)
+	data, _ := randomData(t, interopN)
+	filler := bytes.Repeat([]byte{0xAA}, interopChunk)
 	tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
 	go func() {
+		for i := 0; i < warmup; i++ {
+			tx.Write(filler) // distinct seqs; lets libRIST anchor before the data
+			time.Sleep(3 * time.Millisecond)
+		}
 		for off := 0; off < len(data); off += interopChunk {
 			tx.Write(data[off : off+interopChunk])
 			if (off/interopChunk)%8 == 0 {
@@ -308,12 +330,12 @@ func TestInteropLibristRxFromGoTx(t *testing.T) {
 	}()
 
 	got := capt.wait(20 * time.Second)
-	// Clean path: byte count must be exact (no loss, no extra framing).
-	if len(got) != len(data) {
-		t.Fatalf("libRIST received %d bytes, want exactly %d", len(got), len(data))
+	if len(got) < len(data) {
+		t.Fatalf("libRIST received %d bytes, want at least %d (the data)", len(got), len(data))
 	}
-	if sha256.Sum256(got) != want {
-		t.Fatalf("byte mismatch at libRIST receiver")
+	// The counted data must arrive contiguous and byte-exact at the tail of the capture.
+	if !bytes.Equal(got[len(got)-len(data):], data) {
+		t.Fatalf("byte mismatch: data not intact at the libRIST capture tail")
 	}
 }
 
