@@ -152,12 +152,18 @@ func ListenEphemeralEvenOdd(host string) (*Conn, error) {
 // multicast interface/TTL set on it (the ipv4 socket options reject a
 // v6-bound fd with EINVAL). network "udp" (the default) preserves the
 // dual-stack unicast behavior.
-func ListenEphemeralFamily(network, host string) (*Conn, error) {
-	media, err := bindNet(network, host, 0)
+// port 0 binds ephemeral media+RTCP ports; a non-zero value is the libRIST
+// local-port fixed caller source port, with RTCP on the adjacent port+1.
+func ListenEphemeralFamily(network, host string, port int) (*Conn, error) {
+	media, err := bindNet(network, host, port)
 	if err != nil {
 		return nil, fmt.Errorf("rist: socket: bind media: %w", err)
 	}
-	rtcp, err := bindNet(network, host, 0)
+	rtcpPort := 0
+	if port != 0 {
+		rtcpPort = port + 1
+	}
+	rtcp, err := bindNet(network, host, rtcpPort)
 	if err != nil {
 		media.Close()
 		return nil, fmt.Errorf("rist: socket: bind rtcp: %w", err)
@@ -168,8 +174,10 @@ func ListenEphemeralFamily(network, host string) (*Conn, error) {
 // ListenEphemeralSingleFamily is ListenEphemeralSingle with an explicit address
 // family ("udp4"/"udp6"); see ListenEphemeralFamily for why a multicast sender
 // needs it.
-func ListenEphemeralSingleFamily(network, host string) (*Conn, error) {
-	c, err := bindNet(network, host, 0)
+// port 0 binds an ephemeral source port; a non-zero value is the libRIST
+// local-port fixed caller source port.
+func ListenEphemeralSingleFamily(network, host string, port int) (*Conn, error) {
+	c, err := bindNet(network, host, port)
 	if err != nil {
 		return nil, fmt.Errorf("rist: socket: bind main: %w", err)
 	}

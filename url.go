@@ -173,6 +173,13 @@ func applyQuery(cfg *Config, q url.Values) error {
 		}
 		*step.dst = uint16(n)
 	}
+	if v := q.Get("local-port"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 65535 {
+			return fmt.Errorf("%w: local-port=%q is not a valid port", ErrInvalidConfig, v)
+		}
+		cfg.LocalPort = n
+	}
 	if v := q.Get("profile"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -309,11 +316,13 @@ var recognizedURLParams = map[string]bool{
 	// across bonded peers, set via the BondedPeer API (NewBondedReceiverPeers),
 	// not a single per-session URL value — so it is accepted and ignored here.
 	"recovery-priority": true,
-	// reflector (Main one-to-many fan-out) and local-port (caller fixed source
-	// port) are libRIST URL parameters ristgo does not implement. They are
-	// accepted and ignored rather than rejected so a URL authored for libRIST
-	// still parses, matching the recovery-priority treatment above — the
-	// alternative (a hard parse error on a valid libRIST URL) is the worse
-	// failure for URL portability.
-	"reflector": true, "local-port": true,
+	// local-port (caller fixed source port) IS parsed and honored — see the
+	// query loop above and Config.LocalPort.
+	"local-port": true,
+	// reflector (Main one-to-many fan-out) is a libRIST URL parameter ristgo does
+	// not implement. It is accepted and ignored rather than rejected so a URL
+	// authored for libRIST still parses, matching the recovery-priority treatment
+	// above — a hard parse error on a valid libRIST URL is the worse failure for
+	// URL portability.
+	"reflector": true,
 }

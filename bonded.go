@@ -315,7 +315,7 @@ func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Con
 			break
 		}
 	}
-	conn, err := openSenderConn(cfg.Profile != ProfileSimple, mcDst)
+	conn, err := openSenderConn(cfg.Profile != ProfileSimple, mcDst, cfg.LocalPort)
 	if err != nil {
 		return nil, err
 	}

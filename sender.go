@@ -121,7 +121,7 @@ func newSimpleSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: resolve rtcp address: %w", ErrInvalidConfig, err)
 	}
-	conn, err := openSenderConn(false, mediaAddr.Addr())
+	conn, err := openSenderConn(false, mediaAddr.Addr(), cfg.LocalPort)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +159,7 @@ func newMainSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	if mp.EAPClient, err = buildEAPClient(cfg); err != nil {
 		return nil, err
 	}
-	conn, err := openSenderConn(true, remote.Addr())
+	conn, err := openSenderConn(true, remote.Addr(), cfg.LocalPort)
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +204,7 @@ func newAdvSender(addr string, cfg Config, oneWay bool) (*Sender, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := openSenderConn(true, remote.Addr())
+	conn, err := openSenderConn(true, remote.Addr(), cfg.LocalPort)
 	if err != nil {
 		return nil, err
 	}

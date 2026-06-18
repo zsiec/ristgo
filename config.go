@@ -156,6 +156,14 @@ type Config struct {
 	// virt_dst_port). Not used by the Simple profile. Default: 1968.
 	VirtDstPort uint16
 
+	// LocalPort is the fixed local UDP source port a caller (a sender, a
+	// caller-receiver, or a bonded sender) binds its transport socket to
+	// (libRIST local-port). 0 (the default) lets the OS choose an ephemeral
+	// port. Useful for traversing a NAT or firewall pinhole that expects a
+	// known source port. On the Simple profile the RTCP socket binds the
+	// adjacent port (LocalPort+1). Ignored by a plain listener.
+	LocalPort int
+
 	// CNAME is the canonical name advertised in RTCP SDES packets.
 	// When empty, a host-derived name is generated.
 	// Maximum 127 bytes (libRIST RIST_MAX_STRING_SHORT).

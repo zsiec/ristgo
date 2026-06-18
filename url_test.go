@@ -125,17 +125,33 @@ func TestParseURLErrors(t *testing.T) {
 func TestParseURLAcceptsUnimplementedLibristParams(t *testing.T) {
 	// Each is a libRIST URL parameter ristgo does not implement but accepts and
 	// ignores so a libRIST-authored URL still parses: recovery-priority (set via
-	// BondedPeer), reflector (Main one-to-many fan-out), local-port (caller fixed
-	// source port).
+	// BondedPeer) and reflector (Main one-to-many fan-out).
 	for _, raw := range []string{
 		"rist://h:5000?buffer=1000&recovery-priority=5",
 		"rist://h:5000?reflector=1",
-		"rist://h:5000?local-port=5004",
-		"rist://h:5000?reflector=1&local-port=5004&recovery-priority=2",
+		"rist://h:5000?reflector=1&recovery-priority=2",
 	} {
 		if _, _, err := ParseURL(raw, DefaultConfig()); err != nil {
 			t.Fatalf("ParseURL(%q) = %v, want nil (unimplemented libRIST params should be ignored)", raw, err)
 		}
+	}
+}
+
+// TestParseURLLocalPort verifies local-port maps onto Config.LocalPort and that an
+// out-of-range value is rejected.
+func TestParseURLLocalPort(t *testing.T) {
+	_, cfg, err := ParseURL("rist://h:5000?local-port=7000", DefaultConfig())
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	if cfg.LocalPort != 7000 {
+		t.Fatalf("LocalPort = %d, want 7000", cfg.LocalPort)
+	}
+	if DefaultConfig().LocalPort != 0 {
+		t.Fatalf("default LocalPort = %d, want 0 (ephemeral)", DefaultConfig().LocalPort)
+	}
+	if _, _, err := ParseURL("rist://h:5000?local-port=99999", DefaultConfig()); err == nil {
+		t.Fatal("ParseURL(local-port=99999) = nil, want out-of-range error")
 	}
 }
 

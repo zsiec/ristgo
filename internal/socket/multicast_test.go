@@ -74,7 +74,7 @@ func TestJoinMulticastASM(t *testing.T) {
 	}
 
 	// Sender: an IPv4-family ephemeral socket with loopback so we hear ourselves.
-	tx, err := ListenEphemeralFamily("udp4", "")
+	tx, err := ListenEphemeralFamily("udp4", "", 0)
 	if err != nil {
 		t.Fatalf("ListenEphemeralFamily: %v", err)
 	}

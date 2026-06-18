@@ -141,7 +141,8 @@ func receiverMulticastOptions(cfg Config, host string) (socket.MulticastOptions,
 // "udp6") rather than the dual-stack default, because a v6 dual-stack socket
 // cannot have IPv4 multicast options (interface/TTL/loopback) set on it. A
 // unicast destination keeps the original dual-stack ("udp") bind unchanged.
-func openSenderConn(single bool, dst netip.Addr) (*socket.Conn, error) {
+// localPort is the libRIST local-port fixed caller source port (0 = ephemeral).
+func openSenderConn(single bool, dst netip.Addr, localPort int) (*socket.Conn, error) {
 	network := ""
 	if d := dst.Unmap(); d.IsMulticast() {
 		if d.Is4() {
@@ -151,9 +152,9 @@ func openSenderConn(single bool, dst netip.Addr) (*socket.Conn, error) {
 		}
 	}
 	if single {
-		return socket.ListenEphemeralSingleFamily(network, "")
+		return socket.ListenEphemeralSingleFamily(network, "", localPort)
 	}
-	return socket.ListenEphemeralFamily(network, "")
+	return socket.ListenEphemeralFamily(network, "", localPort)
 }
 
 // joinReceiverMulticast joins the multicast group on a freshly-bound receiver
