@@ -22,6 +22,7 @@ import (
 type BondedReceiver struct {
 	sess    *session.Session
 	ctxStop func() // ends the context watcher (set by ListenBonded)
+	cfg     Config // retained so AddPath can bind a new input path's socket
 }
 
 // BondedSender transmits one media flow across several receiver addresses. By
@@ -199,7 +200,7 @@ func newBondedReceiver(addrs []string, priorities []uint32, cfg Config) (*Bonded
 		}
 	}
 	sess := session.NewBondedReceiver(conns, bondingGroupWith(cfg, priorities, nil), sc)
-	return &BondedReceiver{sess: sess}, nil
+	return &BondedReceiver{sess: sess, cfg: cfg}, nil
 }
 
 // bindBondFECSockets binds a column (media port + 2) and, for 2-D FEC, row (media
@@ -497,6 +498,38 @@ func (r *BondedReceiver) SetRTTMultiplier(multiplier int) error {
 		return fmt.Errorf("%w: RTTMultiplier %d out of range [1,%d]", ErrInvalidConfig, multiplier, MaxRTTMultiplier)
 	}
 	return r.sess.SetRTTMultiplier(multiplier)
+}
+
+// AddPath adds a bonded input path at runtime (libRIST rist_peer_create): the receiver
+// binds addr ("host:port") as a new path at index and merges its recovered media into
+// the same flow. index must be the next free slot (the construction paths are 0..N, and
+// the slice is positional); weight is the path's load-share weight. It is safe to call
+// from any goroutine. It returns an error for an out-of-range index/weight or a bad
+// address, or the close reason if the receiver is closed.
+func (r *BondedReceiver) AddPath(index int, addr string, weight int) error {
+	if index < 0 || index > 255 {
+		return fmt.Errorf("%w: path index %d out of range [0,255]", ErrInvalidConfig, index)
+	}
+	if weight < 0 {
+		return fmt.Errorf("%w: weight must be >= 0 (0 = duplicate)", ErrInvalidConfig)
+	}
+	conn, err := listenBondPath(addr, r.cfg)
+	if err != nil {
+		return err
+	}
+	return r.sess.AddPathConn(uint8(index), conn, weight, 0)
+}
+
+// RemovePath removes a bonded input path at runtime (libRIST rist_peer_destroy): the
+// receiver stops reading index's socket and drops it from the merge, NACK selection, and
+// per-peer stats. An unknown index is a no-op. It is safe to call from any goroutine. It
+// returns an error for an out-of-range index, or the close reason if the receiver is
+// closed.
+func (r *BondedReceiver) RemovePath(index int) error {
+	if index < 0 || index > 255 {
+		return fmt.Errorf("%w: path index %d out of range [0,255]", ErrInvalidConfig, index)
+	}
+	return r.sess.RemovePath(uint8(index))
 }
 
 // Close stops the receiver and releases every path's sockets and goroutines.

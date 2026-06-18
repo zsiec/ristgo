@@ -63,7 +63,8 @@ type weightSet struct {
 type peerSet struct {
 	remove   bool
 	index    uint8
-	remote   [2]netip.AddrPort // {media, rtcp}
+	remote   [2]netip.AddrPort // {media, rtcp} for a sender add
+	conn     *socket.Conn      // the bound listen socket for a receiver add (nil otherwise)
 	weight   int
 	priority uint32
 }
@@ -121,6 +122,7 @@ func NewBondedReceiver(conns []*socket.Conn, group *bonding.Group, cfg Config) *
 	}
 	s.bond = bs
 	s.bondIn = make(chan bondInbound, 256*len(conns))
+	s.peerCmd = make(chan peerSet, 4) // runtime BondedReceiver.AddPath/RemovePath
 	s.start()
 	return s
 }
@@ -176,10 +178,32 @@ func (s *Session) AddPath(index uint8, remote [2]netip.AddrPort, weight int, pri
 	}
 }
 
-// RemovePath removes a bonded path at runtime (BondedSender.RemovePath, libRIST
-// rist_peer_destroy): the sender stops transmitting on index and drops it from NACK
-// selection and per-peer stats. An unknown index is a no-op. Returns ErrOOBUnsupported
-// on a non-bonded sender and the close reason once the session is closed.
+// AddPathConn adds a bonded input path at runtime (BondedReceiver.AddPath, libRIST
+// rist_peer_create): the receiver reads conn (a socket the host already bound) as a new
+// path at index, recovering and merging its media into the same flow. index must be the
+// next slot (the conns slice is positional); a non-contiguous index is rejected on the
+// loop and conn closed. The loop owns the Group, conns, and the new reader goroutine, so
+// this is safe from any goroutine. Returns ErrOOBUnsupported on a non-bonded receiver and
+// the close reason once the session is closed.
+func (s *Session) AddPathConn(index uint8, conn *socket.Conn, weight int, priority uint32) error {
+	if s.peerCmd == nil {
+		conn.Close()
+		return s.cfg.ErrOOBUnsupported
+	}
+	select {
+	case s.peerCmd <- peerSet{index: index, conn: conn, weight: weight, priority: priority}:
+		return nil
+	case <-s.done:
+		conn.Close()
+		return s.closeReason()
+	}
+}
+
+// RemovePath removes a bonded path at runtime (BondedSender.RemovePath /
+// BondedReceiver.RemovePath, libRIST rist_peer_destroy): the sender stops transmitting on
+// index, or the receiver stops reading its socket; either way the path drops from NACK
+// selection and per-peer stats. An unknown index is a no-op. Returns ErrOOBUnsupported on
+// a non-bonded session and the close reason once the session is closed.
 func (s *Session) RemovePath(index uint8) error {
 	if s.peerCmd == nil {
 		return s.cfg.ErrOOBUnsupported
@@ -203,23 +227,59 @@ func (s *Session) applyPeerCmd(ps peerSet) {
 	}
 	if ps.remove {
 		s.bond.group.RemovePath(ps.index)
+		// A removed receiver path's reader exits when its socket closes; the closed
+		// conn stays in the slice as an inert tombstone (closeBond is idempotent).
+		if !s.sender && int(ps.index) < len(s.bond.conns) && s.bond.conns[ps.index] != nil {
+			s.bond.conns[ps.index].Close()
+		}
 		return
 	}
 	if s.bond.group.HasPath(ps.index) {
 		return // duplicate index: ignore (matches Group.AddPath)
 	}
-	for int(ps.index) >= len(s.bond.remotes) {
-		s.bond.remotes = append(s.bond.remotes, [2]netip.AddrPort{})
-		s.bond.peers = append(s.bond.peers, peer.New(s.cfg.SessionTimeout))
-		if s.bond.fecReasm != nil {
-			s.bond.fecReasm = append(s.bond.fecReasm, fecCtrlReassembler{})
+	if s.sender {
+		// Grow the per-path remotes/peers, filling any index gap with placeholders the
+		// Group never selects, then register the destination.
+		for int(ps.index) >= len(s.bond.remotes) {
+			s.bond.remotes = append(s.bond.remotes, [2]netip.AddrPort{})
+			s.bond.peers = append(s.bond.peers, peer.New(s.cfg.SessionTimeout))
+			if s.bond.fecReasm != nil {
+				s.bond.fecReasm = append(s.bond.fecReasm, fecCtrlReassembler{})
+			}
 		}
+		p := peer.New(s.cfg.SessionTimeout)
+		p.Media, p.RTCP = ps.remote[0], ps.remote[1]
+		s.bond.peers[ps.index] = p
+		s.bond.remotes[ps.index] = ps.remote
+		s.bond.group.AddPath(ps.index, ps.weight, ps.priority)
+		return
 	}
-	p := peer.New(s.cfg.SessionTimeout)
-	p.Media, p.RTCP = ps.remote[0], ps.remote[1]
-	s.bond.peers[ps.index] = p
-	s.bond.remotes[ps.index] = ps.remote
+	// Receiver: the host bound the socket; append it (contiguous index), register the
+	// path, and spawn its reader(s) feeding the shared inbound channel. A non-contiguous
+	// index is rejected (the conns slice is positional, indexed by the readers).
+	if int(ps.index) != len(s.bond.conns) || ps.conn == nil {
+		if ps.conn != nil {
+			ps.conn.Close()
+		}
+		s.logf("bond: receiver add_path index %d not the next slot (%d); ignored", ps.index, len(s.bond.conns))
+		return
+	}
+	s.bond.conns = append(s.bond.conns, ps.conn)
+	s.bond.peers = append(s.bond.peers, peer.New(s.cfg.SessionTimeout))
+	if s.bond.fecReasm != nil {
+		s.bond.fecReasm = append(s.bond.fecReasm, fecCtrlReassembler{})
+	}
 	s.bond.group.AddPath(ps.index, ps.weight, ps.priority)
+	// Spawn the path reader(s): one media reader for single-port (Main/Advanced), a
+	// media + RTCP pair for the even/odd Simple profile.
+	if s.main != nil || s.adv != nil {
+		s.wg.Add(1)
+		go s.readBond(ps.index, false, ps.conn.ReadMedia)
+	} else {
+		s.wg.Add(2)
+		go s.readBond(ps.index, false, ps.conn.ReadMedia)
+		go s.readBond(ps.index, true, ps.conn.ReadRTCP)
+	}
 }
 
 // SetPathWeight changes path's load-balancing weight at runtime (BondedSender.
