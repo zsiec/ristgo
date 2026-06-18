@@ -702,10 +702,9 @@ func (cfg *Config) validate() error {
 		// fires there. Set AESKeyBits explicitly to interoperate with a 256 peer.
 		cfg.AESKeyBits = 128
 	} else if cfg.Secret == "" && cfg.Username != "" && cfg.AESKeyBits == 0 {
-		// SRP without a Secret = use_key_as_passphrase: the media key is derived
-		// from the SRP session key K. libRIST's _librist_crypto_psk_set_passphrase
-		// defaults key_size to 256 when it is unset (which it is when the tools are
-		// given no aes-type), so default to 256 here to interoperate.
+		// SRP without a Secret = use_key_as_passphrase: the media stays cleartext and the
+		// SRP session key K keys only the feedback channel. libRIST defaults the K-derived
+		// key size to 256 when no aes-type is given, so default to 256 here to interoperate.
 		cfg.AESKeyBits = 256
 	}
 	switch cfg.AESKeyBits {
@@ -720,8 +719,8 @@ func (cfg *Config) validate() error {
 	default:
 		return errors.New("rist: AESKeyBits must be 0, 128, 192, or 256")
 	}
-	// AESKeyBits requires either a Secret (PSK keying) or SRP credentials
-	// (use_key_as_passphrase keying from K). It is meaningless without a key.
+	// AESKeyBits requires either a Secret (PSK keying) or SRP credentials (the
+	// use_key_as_passphrase K-derived feedback key). It is meaningless without a key.
 	if cfg.AESKeyBits != 0 && cfg.Secret == "" && cfg.Username == "" {
 		return errors.New("rist: AESKeyBits requires a Secret or SRP credentials")
 	}
@@ -739,18 +738,16 @@ func (cfg *Config) validate() error {
 		return errors.New("rist: Password must be at most 255 bytes")
 	}
 	// SRP credentials WITHOUT a pre-shared Secret select libRIST's
-	// use_key_as_passphrase mode: the media AES key is derived from the SRP
-	// session key K on a successful handshake (so the channel is still encrypted,
-	// keyed by the mutually-authenticated K — no confidentiality downgrade), and
-	// both GRE directions key from K. This is valid and interoperates with a
-	// libRIST peer given username/password and no secret. SRP WITH an explicit
-	// Secret keeps using the Secret-derived PSK (SRP only gates the channel).
-	// Both forms are accepted here; no rejection.
+	// use_key_as_passphrase mode: SRP mutually AUTHENTICATES the peers, but the media is
+	// NOT encrypted — it stays cleartext. Only the receiver→sender feedback (the RTCP
+	// carrying NACKs/RTT) is keyed with the SRP session key K. This matches libRIST and
+	// interoperates with a libRIST peer given username/password and no secret. For media
+	// confidentiality, configure a Secret too (the combined PSK+SRP mode: the Secret
+	// encrypts the media and SRP gates the channel). Both forms are accepted; no rejection.
 	//
-	// AESKeyBits without a Secret is the use_key_as_passphrase key size (128/256);
-	// the AESKeyBits-requires-Secret check above would have rejected it, so allow
-	// it here when SRP credentials are present (see the AESKeyBits block below,
-	// which now permits it under SRP).
+	// AESKeyBits without a Secret is the K-derived feedback key size (128/256); the
+	// AESKeyBits-requires-Secret check above would have rejected it, so allow it here when
+	// SRP credentials are present (see the AESKeyBits block below, which permits it under SRP).
 
 	if cfg.Weight < 0 {
 		return errors.New("rist: Weight must be at least 0 (0 = duplicate)")

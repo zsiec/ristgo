@@ -255,11 +255,11 @@ func buildMainParams(cfg Config) (*session.MainParams, error) {
 		NPD:         cfg.NullPacketDeletion,
 	}
 	if cfg.Secret == "" {
-		// No pre-shared secret. With SRP credentials this is the
-		// use_key_as_passphrase mode: the session derives the media keys from the
-		// SRP session key K once the handshake succeeds (see the session's
-		// installEAPKeying), so the codec starts cleartext and is re-keyed in flight.
-		// Without SRP credentials the Main flow is genuinely cleartext.
+		// No pre-shared secret. With SRP credentials this is the use_key_as_passphrase
+		// mode: SRP authenticates and the media stays cleartext; the session keys only the
+		// receiver→sender feedback from the SRP session key K once the handshake succeeds
+		// (see the session's installEAPKeying). Without SRP credentials the Main flow is
+		// genuinely cleartext (no auth).
 		if cfg.Username != "" {
 			mp.UseKeyAsPassphrase = true
 			mp.EAPKeySize256 = cfg.AESKeyBits == crypto.KeySize256

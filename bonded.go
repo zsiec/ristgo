@@ -385,15 +385,16 @@ func newBondedSender(addrs []string, priorities []uint32, weights []int, cfg Con
 // Main/Advanced PSK encryption and EAP-SRP authentication. Bonded EAP-SRP runs in two
 // modes, both per-path (each path authenticates with its own handshake): the combined
 // PSK+SRP mode (a Secret is set) keeps the media keyed by the shared PSK so the gate
-// rides on one shared codec; the pure-SRP use_key_as_passphrase mode (no Secret) re-keys
-// each path's media to its own SRP session key K on a per-path codec.
+// rides on one shared codec; the pure-SRP use_key_as_passphrase mode (no Secret) keeps the
+// media cleartext (SRP authenticates) and keys each path's feedback channel with that
+// path's own SRP session key K on a per-path codec.
 func bondedSupported(cfg Config) error {
 	if cfg.DTLS != nil {
 		return fmt.Errorf("%w: bonded DTLS is not supported", ErrInvalidConfig)
 	}
-	// Pure-SRP bonding re-keys each path's media to its own session key K on a per-path
-	// codec; FEC's per-path fan would then need per-path encryption, which is not wired.
-	// PSK+SRP bonding (a Secret is set) keeps the shared codec, so it combines with FEC.
+	// Pure-SRP bonding gives each path its own per-path codec keyed (feedback only) to that
+	// path's session key K; FEC's per-path fan would then need per-path handling that is not
+	// wired. PSK+SRP bonding (a Secret is set) keeps the shared codec, so it combines with FEC.
 	if cfg.Username != "" && cfg.Secret == "" && cfg.FEC != nil {
 		return fmt.Errorf("%w: bonded pure-SRP (no Secret) with FEC is not supported; set a Secret to use the PSK+SRP mode with FEC", ErrInvalidConfig)
 	}

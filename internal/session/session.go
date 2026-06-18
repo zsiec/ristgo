@@ -413,11 +413,12 @@ type Session struct {
 	// by Authenticated() (hence atomic).
 	authed atomic.Bool
 
-	// useKeyAsPassphrase enables the EAP-SRP use_key_as_passphrase keying: on a
-	// successful handshake the media PSK keys are derived from the SRP session key
-	// K and installed into s.main. eapKeySize256 selects the derived AES key size
-	// (256-bit to match libRIST's default when no aes-type is given). pwReqSent
-	// latches the one-shot post-SUCCESS PASSWORD_REQUEST the authenticator emits.
+	// useKeyAsPassphrase enables the EAP-SRP use_key_as_passphrase keying: SRP
+	// authenticates but the media stays cleartext; on a successful handshake only the
+	// receiver→sender feedback keys are derived from the SRP session key K and installed
+	// into s.main (the directional install in installEAPKeying). eapKeySize256 selects the
+	// derived AES key size (256-bit to match libRIST's default when no aes-type is given).
+	// pwReqSent latches the one-shot post-SUCCESS PASSWORD_REQUEST the authenticatee emits.
 	// txKeyGen/rxKeyGen track the last installed keying generation so a rollover
 	// (a repeated K) still re-derives.
 	useKeyAsPassphrase bool
@@ -777,8 +778,8 @@ func newSession(conn *socket.Conn, cfg Config, sender bool) *Session {
 		s.eapKeyRotation = mp.EAPKeyRotation
 		if s.eapClient != nil || s.eapServer != nil {
 			s.authed.Store(false) // hold the data channel until the handshake succeeds
-			// Under use_key_as_passphrase the media key is derived from K during
-			// the handshake; arm both EAP roles for that keying.
+			// Under use_key_as_passphrase the media stays cleartext and only the feedback
+			// is keyed from K; arm both EAP roles to export that keying.
 			if mp.UseKeyAsPassphrase {
 				if s.eapClient != nil {
 					s.eapClient.UseKeyAsPassphrase(true)
@@ -2034,14 +2035,16 @@ func (s *Session) sendPostAuthBeacon(now clock.Timestamp) {
 	}
 }
 
-// installEAPKeying derives and installs the Main media PSK keys from the SRP
-// session key K when the EAP-SRP use_key_as_passphrase mode produced new keying
-// material. It is idempotent: each direction is re-keyed only when its keying
-// generation advances (so a rollover with a repeated K still re-derives, and an
-// unchanged generation is a no-op). The send key is derived with NewKeyRaw and
-// the receive key with NewDecryptorRaw (no NUL-truncation — K is a raw digest),
-// matching libRIST's _librist_crypto_psk_set_passphrase, which hashes the full
-// 32 K bytes. K never reaches a log here.
+// installEAPKeying derives and installs the Main feedback keys from the SRP session key K
+// when the EAP-SRP use_key_as_passphrase mode produced new keying material. The media
+// stays cleartext (SRP authenticates, it does not encrypt); only the receiver→sender
+// feedback is keyed, and each EAP role exposes keying for ONLY its feedback direction (the
+// authenticator a send key, the authenticatee a receive key — the media direction yields
+// no keying), so this installs at most one direction per role. It is idempotent: each
+// direction is re-keyed only when its keying generation advances (so a rollover with a
+// repeated K still re-derives, and an unchanged generation is a no-op). Keys derive with
+// NewKeyRaw / NewDecryptorRaw (no NUL-truncation — K is a raw digest), matching libRIST's
+// full-32-byte key hashing. K never reaches a log here.
 func (s *Session) installEAPKeying() {
 	if !s.useKeyAsPassphrase || s.main == nil {
 		return

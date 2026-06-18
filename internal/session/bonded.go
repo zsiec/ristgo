@@ -127,9 +127,10 @@ type bondState struct {
 	auth []bondAuth
 
 	// codecs are per-path Main codecs, used ONLY in the pure-SRP use_key_as_passphrase
-	// mode so each path can re-key its own media to that path's session key K. nil in
-	// every other mode (including PSK+SRP), where the one shared s.main codec carries all
-	// paths. When non-nil, bondCodec(idx) returns codecs[idx] in place of s.main.
+	// mode so each path can key its own feedback channel to that path's session key K (the
+	// media stays cleartext). nil in every other mode (including PSK+SRP), where the one
+	// shared s.main codec carries all paths. When non-nil, bondCodec(idx) returns
+	// codecs[idx] in place of s.main.
 	codecs []*mainCodec
 
 	// everConnected records that the host connect callback has fired (the first path
@@ -453,11 +454,11 @@ func (s *Session) bondObserveRTT(now clock.Timestamp, idx uint8, fbs []wire.Feed
 }
 
 // buildBondCodecs sets up the pure-SRP use_key_as_passphrase per-path state: a Main codec
-// per path (clone of s.main) so each path can re-key its media to that path's own session
-// key K, and the use_key flag on each per-path EAP role so the handshake exports K as
-// data-channel keying (without it the role yields no TxKeying/RxKeying and the peer's
-// encrypted media cannot be decrypted). A no-op in every other mode (bs.codecs stays nil
-// and the one shared s.main codec carries all paths).
+// per path (clone of s.main) so each path can key its feedback channel to that path's own
+// session key K (the media stays cleartext), and the use_key flag on each per-path EAP role
+// so the handshake exports K as feedback keying (without it the role yields no
+// TxKeying/RxKeying and the peer's encrypted feedback cannot be decrypted). A no-op in
+// every other mode (bs.codecs stays nil and the one shared s.main codec carries all paths).
 func buildBondCodecs(s *Session, bs *bondState, n int) {
 	if !s.useKeyAsPassphrase || s.main == nil {
 		return
