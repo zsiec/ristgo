@@ -129,6 +129,11 @@ type Config struct {
 	// callback runs on the event loop, so it must not block.
 	OnConnect func(info ConnectInfo) bool
 
+	// OnDisconnect, set on a listener, is called once with a connected peer's ConnectInfo
+	// when that peer's session ends (libRIST disconn_cb). nil ignores disconnections. The
+	// callback runs on the event loop, so it must not block.
+	OnDisconnect func(info ConnectInfo)
+
 	// FragmentSize, when > 0, makes the sender split an application payload
 	// larger than this many bytes across consecutive sequences, each an
 	// independently recoverable fragment (Advanced profile only; the codec maps
@@ -393,6 +398,10 @@ type Session struct {
 	// is the role's own internal LOGOFF guard — neither reads the other, so they are not
 	// kept in lockstep across the layer boundary.
 	everAuthed bool
+	// connected holds the admitted peer's connect-time ConnectInfo, retained to pass to the
+	// OnDisconnect callback when the session ends (libRIST disconn_cb). nil until a peer has
+	// connected and been admitted.
+	connected *ConnectInfo
 	// reauthing is true while a NAT-rebind / in-band EAP re-authentication is in flight to
 	// a migrated or regressed tuple: media is held (authed false) and further new-source
 	// datagrams are ignored until the fresh handshake completes (success) or the session is
@@ -848,6 +857,8 @@ func (s *Session) start() {
 // drains the resulting effects after each.
 func (s *Session) loop() {
 	defer s.wg.Done()
+	// Fire the host disconnect callback when the session ends (libRIST disconn_cb).
+	defer s.fireDisconnect()
 	// Backstop: guarantee dtlsReady is closed on every exit path so the reader
 	// goroutine (which waits on it) can never block forever — even if a future
 	// edit adds an early return before the explicit closes below.
@@ -1877,14 +1888,25 @@ func (s *Session) upgradeGREVersion(version uint8) {
 // and returns whether the peer is admitted. Admits unconditionally when no callback is
 // configured.
 func (s *Session) admitPeer() bool {
-	if s.cfg.OnConnect == nil {
-		return true
-	}
 	info := ConnectInfo{Remote: s.peer.Media.String()}
 	if s.eapServer != nil {
 		info.Username = s.eapServer.PeerUsername()
 	}
-	return s.cfg.OnConnect(info)
+	if s.cfg.OnConnect != nil && !s.cfg.OnConnect(info) {
+		return false // the host rejected the connection
+	}
+	// Record the admitted peer for the disconnect callback at session end.
+	s.connected = &info
+	return true
+}
+
+// fireDisconnect notifies the host that a connected peer's session ended (libRIST
+// disconn_cb); a no-op when the peer never connected or there is no disconnect callback.
+// Called once on the event loop's exit.
+func (s *Session) fireDisconnect() {
+	if s.cfg.OnDisconnect != nil && s.connected != nil {
+		s.cfg.OnDisconnect(*s.connected)
+	}
 }
 
 func (s *Session) handleEAP(now clock.Timestamp, payload []byte) {

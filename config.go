@@ -344,6 +344,13 @@ type Config struct {
 	// the session's event loop, so it must not block.
 	OnConnect func(info ConnectInfo) bool
 
+	// OnDisconnect, set on a listener, is the disconnection notification callback (libRIST
+	// rist_auth_handler_set): it is invoked once with a connected peer's [ConnectInfo] when
+	// that peer's session ends (only if it first connected — a rejected or never-connected
+	// peer does not fire it). The mirror of OnConnect. nil (the default) ignores
+	// disconnections. The callback runs on the session's event loop, so it must not block.
+	OnDisconnect func(info ConnectInfo)
+
 	// Interface is the name of the network interface used for multicast
 	// (libRIST "miface"): a sender's outbound multicast egress interface and a
 	// receiver's group-membership interface. Empty (the default) lets the OS

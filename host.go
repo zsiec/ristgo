@@ -588,6 +588,7 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 		ErrSendBlockUnsupported: ErrSendBlockUnsupported,
 		OnFlowAttr:              cfg.OnFlowAttr,
 		OnConnect:               toSessionConnectCB(cfg.OnConnect),
+		OnDisconnect:            toSessionDisconnectCB(cfg.OnDisconnect),
 		SplitMode:               toSplitMode(cfg.SplitMode),
 		MergeMode:               toMergeMode(cfg.MergeMode),
 	}
@@ -601,6 +602,17 @@ func toSessionConnectCB(cb func(ConnectInfo) bool) func(session.ConnectInfo) boo
 	}
 	return func(si session.ConnectInfo) bool {
 		return cb(ConnectInfo{Remote: si.Remote, Username: si.Username})
+	}
+}
+
+// toSessionDisconnectCB adapts the public OnDisconnect callback to the session's
+// ConnectInfo type (separate types avoid the import cycle).
+func toSessionDisconnectCB(cb func(ConnectInfo)) func(session.ConnectInfo) {
+	if cb == nil {
+		return nil
+	}
+	return func(si session.ConnectInfo) {
+		cb(ConnectInfo{Remote: si.Remote, Username: si.Username})
 	}
 }
 
