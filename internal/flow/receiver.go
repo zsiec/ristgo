@@ -189,6 +189,15 @@ type receiverState struct {
 	senderMaxBuffer clock.Microseconds
 	lossSnap        uint64
 	recoveredSnap   uint64
+
+	// Inter-packet arrival spacing (libRIST min_ips/cur_ips/max_ips): the gap
+	// between consecutive received media packets, sampled on every arrival.
+	// ipsLastArrival is the previous arrival instant; ipsMinUs starts at MaxInt64
+	// (a sentinel Stats reports as 0 until the first delta).
+	ipsLastArrival clock.Timestamp
+	ipsMinUs       int64
+	ipsCurUs       int64
+	ipsMaxUs       int64
 }
 
 // pathBit returns the pathSeen bit for a path index (aliasing mod 64; see
@@ -329,6 +338,20 @@ func (f *Flow) mapSourceTime(sourceTime uint64) clock.Timestamp {
 // scheduling.
 func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	r := &f.receiver
+	// Inter-packet arrival spacing (libRIST min_ips/cur_ips/max_ips): sample the gap
+	// from the previous arrival on every received packet, before any dedup/reset. The
+	// first packet (started == false) only seeds the anchor.
+	if r.started {
+		delta := int64(now.Sub(r.ipsLastArrival))
+		r.ipsCurUs = delta
+		if delta < r.ipsMinUs {
+			r.ipsMinUs = delta
+		}
+		if delta > r.ipsMaxUs {
+			r.ipsMaxUs = delta
+		}
+	}
+	r.ipsLastArrival = now
 	// Flow-id change (libRIST "Detected flow id change ... resetting state"): a
 	// started flow that receives a fresh packet bearing a different flow id (the
 	// SSRC with the retransmit LSB masked) is seeing a new source flow — a sender

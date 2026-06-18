@@ -97,6 +97,13 @@ type Stats struct {
 	// fraction of expected packets that arrived (including via recovery),
 	// 100 * Received / (Received + Lost). 100 when no packets are expected.
 	Quality float64
+
+	// InterPacketMin/Cur/Max are the inter-packet arrival spacing gauges
+	// (libRIST min_ips/cur_ips/max_ips): the gap between consecutive received
+	// media packets. Zero before the first inter-arrival sample, and on a sender.
+	InterPacketMin time.Duration
+	InterPacketCur time.Duration
+	InterPacketMax time.Duration
 }
 
 // toStats maps the internal flow counters and gauges to the public Stats and
@@ -137,6 +144,9 @@ func toStats(f flow.Stats) Stats {
 		BandwidthBps:          uint64(maxI64(f.DataBitrateBps, 0)),
 		RetryBandwidthBps:     uint64(maxI64(f.RetryBitrateBps, 0)),
 		Quality:               quality,
+		InterPacketMin:        time.Duration(maxI64(f.IpsMinUs, 0)) * time.Microsecond,
+		InterPacketCur:        time.Duration(maxI64(f.IpsCurUs, 0)) * time.Microsecond,
+		InterPacketMax:        time.Duration(maxI64(f.IpsMaxUs, 0)) * time.Microsecond,
 	}
 }
 
@@ -160,7 +170,8 @@ func (s Stats) ToJSON() string {
 			`"sent":%d,"sent_bytes":%d,"retransmitted":%d,"retransmitted_bytes":%d,`+
 			`"retransmit_skipped":%d,"retransmit_suppressed":%d,`+
 			`"retransmit_exhausted":%d,"bandwidth_skipped":%d,`+
-			`"rtt_us":%d,"bandwidth_bps":%d,"retry_bandwidth_bps":%d,"quality":%.3f}`,
+			`"rtt_us":%d,"bandwidth_bps":%d,"retry_bandwidth_bps":%d,"quality":%.3f,`+
+			`"ips_min_us":%d,"ips_cur_us":%d,"ips_max_us":%d}`,
 		s.Received, s.ReceivedBytes, s.Delivered, s.Lost,
 		s.Recovered, s.FECRecovered, s.Duplicates, s.Reordered,
 		s.TooLate, s.TooLateRetransmit, s.RetransmittedReceived,
@@ -170,5 +181,6 @@ func (s Stats) ToJSON() string {
 		s.RetransmitSkipped, s.RetransmitSuppressed,
 		s.RetransmitExhausted, s.BandwidthSkipped,
 		s.RTT.Microseconds(), s.BandwidthBps, s.RetryBandwidthBps, s.Quality,
+		s.InterPacketMin.Microseconds(), s.InterPacketCur.Microseconds(), s.InterPacketMax.Microseconds(),
 	)
 }

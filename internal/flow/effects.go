@@ -158,6 +158,13 @@ type Stats struct {
 	// (bits/sec, 1 s window) — libRIST retry_bandwidth. 0 on a receiver flow.
 	RetryBitrateBps int64
 
+	// IpsMinUs/IpsCurUs/IpsMaxUs are the inter-packet arrival spacing gauges in
+	// microseconds (libRIST min_ips/cur_ips/max_ips); 0 before the first
+	// inter-arrival sample, and on a sender flow.
+	IpsMinUs int64
+	IpsCurUs int64
+	IpsMaxUs int64
+
 	// Duplicates counts media packets dropped by the (seq, sourceTime)
 	// duplicate test — ARQ duplicates and extra SMPTE 2022-7 path copies
 	// alike (libRIST stats_instant.dupe).

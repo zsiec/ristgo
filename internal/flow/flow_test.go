@@ -161,7 +161,24 @@ func TestFirstPacketLocksOffsetAndSchedules(t *testing.T) {
 func zeroGauges(s Stats) Stats {
 	s.ReceivedBytes, s.SentBytes, s.RetransmittedBytes = 0, 0, 0
 	s.SmoothedRTTUs, s.DataBitrateBps, s.RetryBitrateBps = 0, 0, 0
+	s.IpsMinUs, s.IpsCurUs, s.IpsMaxUs = 0, 0, 0
 	return s
+}
+
+func TestInterPacketSpacing(t *testing.T) {
+	f := New(RoleReceiver, testConfig())
+	// First packet only seeds the anchor (no delta yet).
+	f.Feed(10_000, 0, mkPkt(100, 0, []byte("a")))
+	if s := f.Stats(); s.IpsMinUs != 0 || s.IpsCurUs != 0 || s.IpsMaxUs != 0 {
+		t.Fatalf("after first packet ips = (min=%d cur=%d max=%d), want all 0", s.IpsMinUs, s.IpsCurUs, s.IpsMaxUs)
+	}
+	// +5 ms, then +3 ms: cur tracks the last gap, min/max the extremes.
+	f.Feed(15_000, 0, mkPkt(101, 7_000, []byte("b")))
+	f.Feed(18_000, 0, mkPkt(102, 11_000, []byte("c")))
+	s := f.Stats()
+	if s.IpsCurUs != 3_000 || s.IpsMinUs != 3_000 || s.IpsMaxUs != 5_000 {
+		t.Fatalf("ips = (min=%d cur=%d max=%d), want (3000,3000,5000)", s.IpsMinUs, s.IpsCurUs, s.IpsMaxUs)
+	}
 }
 
 func TestFirstPacketRetransmitIgnored(t *testing.T) {

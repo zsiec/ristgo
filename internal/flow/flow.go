@@ -43,6 +43,8 @@
 package flow
 
 import (
+	"math"
+
 	"github.com/zsiec/ristgo/internal/clock"
 	"github.com/zsiec/ristgo/internal/rtt"
 	"github.com/zsiec/ristgo/internal/wire"
@@ -331,6 +333,8 @@ func New(role Role, cfg Config) *Flow {
 	case RoleReceiver:
 		f.receiver.ring = make([]slot, size)
 		f.receiver.mask = uint32(size - 1)
+		// Inter-packet spacing min sentinel: reported as 0 until the first delta.
+		f.receiver.ipsMinUs = math.MaxInt64
 		if cfg.ReturnMaxBitrate > 0 {
 			// return-channel bytes/sec divided by bytes-per-NACK-seq = the NACK
 			// sequence rate; burst up to one full per-pass NACK group.
@@ -351,13 +355,18 @@ func New(role Role, cfg Config) *Flow {
 func (f *Flow) Role() Role { return f.role }
 
 // Stats returns a snapshot of the flow's counters, with the live gauges
-// (SmoothedRTTUs and the sender bit-rate fields) filled from the current
-// estimator/bitrate state.
+// (SmoothedRTTUs, the sender bit-rate fields, and the receiver inter-packet-spacing
+// fields) filled from the current estimator/bitrate/receiver state.
 func (f *Flow) Stats() Stats {
 	s := f.stats
 	s.SmoothedRTTUs = int64(f.est.Smoothed())
 	s.DataBitrateBps = f.sender.dataBW.slowBps()
 	s.RetryBitrateBps = f.sender.retryBW.slowBps()
+	if f.receiver.ipsMinUs != math.MaxInt64 {
+		s.IpsMinUs = f.receiver.ipsMinUs
+	}
+	s.IpsCurUs = f.receiver.ipsCurUs
+	s.IpsMaxUs = f.receiver.ipsMaxUs
 	return s
 }
 
