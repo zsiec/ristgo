@@ -33,6 +33,7 @@ type bondAuth struct {
 	retx      int                // consecutive keepalive-driven retransmits
 	txKeyGen  uint64             // pure-SRP: generation of the installed per-path send key
 	rxKeyGen  uint64             // pure-SRP: generation of the installed per-path recv key
+	pwReqSent bool               // pure-SRP sender: post-SUCCESS PASSWORD_REQUEST emitted
 }
 
 // This file is the link-bonding / SMPTE 2022-7 host: N network paths feeding one
@@ -451,10 +452,12 @@ func (s *Session) bondObserveRTT(now clock.Timestamp, idx uint8, fbs []wire.Feed
 	}
 }
 
-// buildBondCodecs allocates n per-path Main codecs (clones of s.main) into bs.codecs
-// when the pure-SRP use_key_as_passphrase mode is active, so each bonded path can re-key
-// its media to that path's own session key K. A no-op in every other mode (bs.codecs stays
-// nil and the one shared s.main codec carries all paths).
+// buildBondCodecs sets up the pure-SRP use_key_as_passphrase per-path state: a Main codec
+// per path (clone of s.main) so each path can re-key its media to that path's own session
+// key K, and the use_key flag on each per-path EAP role so the handshake exports K as
+// data-channel keying (without it the role yields no TxKeying/RxKeying and the peer's
+// encrypted media cannot be decrypted). A no-op in every other mode (bs.codecs stays nil
+// and the one shared s.main codec carries all paths).
 func buildBondCodecs(s *Session, bs *bondState, n int) {
 	if !s.useKeyAsPassphrase || s.main == nil {
 		return
@@ -462,6 +465,14 @@ func buildBondCodecs(s *Session, bs *bondState, n int) {
 	bs.codecs = make([]*mainCodec, n)
 	for i := range bs.codecs {
 		bs.codecs[i] = s.main.cloneFresh()
+	}
+	for i := range bs.auth {
+		if bs.auth[i].client != nil {
+			bs.auth[i].client.UseKeyAsPassphrase(true)
+		}
+		if bs.auth[i].server != nil {
+			bs.auth[i].server.UseKeyAsPassphrase(true)
+		}
 	}
 }
 
@@ -533,6 +544,15 @@ func (s *Session) handleBondEAP(now clock.Timestamp, idx uint8, payload []byte) 
 	// EAPOL reply cleartext first; keying is idempotent per generation). A no-op in PSK+SRP.
 	if s.useKeyAsPassphrase {
 		s.installBondEAPKeying(idx)
+		// Authenticatee: once at SUCCESS (keys installed), drive the post-SUCCESS
+		// PASSWORD_REQUEST, which makes the authenticator install its RX key (= K) so it
+		// can decrypt our media. Without it the peer keys only its TX and drops our media.
+		if a.client != nil && !a.pwReqSent {
+			if f, ok := a.client.PasswordRequest(); ok {
+				a.pwReqSent = true
+				s.sendBondEAP(idx, f, now)
+			}
+		}
 	}
 	wasAuthed := a.authed
 	a.authed = authedAt
