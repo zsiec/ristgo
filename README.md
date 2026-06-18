@@ -5,8 +5,8 @@ protocol, the VSF TR-06 family of technical recommendations.
 
 > **Status: feature-complete, pre-1.0.** The full RIST stack is implemented and
 > tested, covering all three profiles, SMPTE 2022-7 bonding, SMPTE ST 2022-1 and
-> ST 2022-5 FEC, source adaptation, and a pure-Go DTLS transport, and it
-> interoperates with libRIST and OpenSSL.
+> ST 2022-5 FEC, source adaptation, EAP-SRP authentication, and a pure-Go DTLS
+> transport, and it interoperates with libRIST and OpenSSL.
 > The public API is small and stable in shape. No compatibility guarantees are
 > made before a tagged 1.0, so expect occasional changes.
 
@@ -88,7 +88,10 @@ Runnable versions are in [`examples/sender`](examples/sender) and
 [`examples/bonded-rx`](examples/bonded-rx) take one URL (or `host:port`) per path
 and configure the whole session from the first URL's query parameters;
 [`examples/bonded-sender`](examples/bonded-sender) is a minimal variant fixed to
-the default Simple-profile config.
+the default Simple-profile config. [`cmd/rist2rist`](cmd/rist2rist) is a relay that
+receives a stream and re-transmits it to one or more RIST outputs, and the
+[`prometheus`](prometheus) package serves a session's `Stats` on a `/metrics` endpoint
+(`net/http`, no external dependency).
 
 ### Profiles, encryption, bonding
 
@@ -281,7 +284,7 @@ Everything below is implemented and tested.
 | RTT echo + adaptive NACK-retry timing | Simple | TR-06-1 |
 | GRE-over-UDP single-port tunnel | Main | TR-06-2 |
 | PSK encryption (AES-CTR, PBKDF2-HMAC-SHA256) | Main, Advanced | TR-06-2 |
-| EAP-SRP (SRP-SHA256) authentication and key-as-passphrase keying | Main | TR-06-2 |
+| EAP-SRP (SRP-SHA256) auth, combined PSK+SRP and pure-SRP key-as-passphrase, single-flow and bonded | Main | TR-06-2 |
 | Null-packet deletion + 32-bit extended-seq NACK | Main | TR-06-2 |
 | Out-of-band side channel, full-IP passthrough / stream IP preservation (WriteOOB/ReadOOB) | Main, Advanced | TR-06-2 |
 | Any-protocol encapsulation: typed GRE tunnel by EtherType (WriteOOBTyped/ReadOOBTyped) | Main, Advanced | libRIST GRE |
@@ -318,10 +321,13 @@ The stack is three layers around a narrow waist.
 
 ## Interoperability
 
-- **libRIST** (v0.2.18-rc1): Simple, Main, and Advanced profiles, both
-  directions, clear and encrypted, verified for bit-exact recovery and lossy
-  ARQ. See the `//go:build interop` suites, which skip gracefully when the
-  libRIST tools are absent.
+- **libRIST** (v0.2.18-rc2): Simple, Main, and Advanced profiles, both
+  directions, clear and encrypted, including EAP-SRP (combined PSK+SRP and pure-SRP
+  `use_key_as_passphrase`), verified for bit-exact recovery and lossy ARQ. See the
+  `//go:build interop` suites, which skip gracefully when the libRIST tools are absent.
+- **ristrust**: the pure-Rust sibling drives a differential matrix against the ristgo
+  example binaries (profiles, encryption, LZ4, bonding, EAP-SRP single-flow and bonded,
+  split/merge, both directions, clean and lossy).
 - **OpenSSL**: the DTLS layer is validated against `openssl s_server`/`s_client
   -dtls1_2` in both roles for both cipher suites (libRIST has no DTLS of its
   own).
