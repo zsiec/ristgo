@@ -48,11 +48,22 @@ func TestToJSONIsFlatAndContainsFields(t *testing.T) {
 	var f flow.Stats
 	f.Received, f.SentBytes, f.SmoothedRTTUs = 3, 4096, 5000
 	f.RecoveredOneRetry, f.AvgBufferTimeUs = 2, 700_000
-	j := toStats(f).ToJSON()
+	f.RecoveredTwoNacks, f.RecoveredMoreNacks = 6, 1
+	s := toStats(f)
+	// Framing fields are stamped by the handle via Session.Framing() in real use
+	// (not by toStats); set them directly to exercise ToJSON serialization.
+	s.Profile, s.SeqBits, s.AdvancedActive = ProfileAdvanced, 32, true
+	j := s.ToJSON()
 	if !strings.HasPrefix(j, "{") || !strings.HasSuffix(j, "}") {
 		t.Fatalf("not a JSON object: %s", j)
 	}
-	for _, key := range []string{`"received":3`, `"sent_bytes":4096`, `"rtt_us":5000`, `"bandwidth_bps":0`, `"quality":100.000`, `"ips_max_us":0`, `"recovered_one_retry":2`, `"avg_buffer_time_us":700000`} {
+	for _, key := range []string{
+		`"received":3`, `"sent_bytes":4096`, `"rtt_us":5000`, `"bandwidth_bps":0`,
+		`"quality":100.000`, `"ips_max_us":0`, `"recovered_one_retry":2`, `"avg_buffer_time_us":700000`,
+		// libRIST-parity fields (4d55974, 8cf3c81).
+		`"recovered_two_nacks":6`, `"recovered_more_nacks":1`,
+		`"profile":2`, `"seq_bits":32`, `"advanced_active":true`,
+	} {
 		if !strings.Contains(j, key) {
 			t.Fatalf("JSON missing %q: %s", key, j)
 		}

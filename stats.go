@@ -276,7 +276,9 @@ func (s Stats) ToJSON() string {
 	}
 	return fmt.Sprintf(
 		`{"received":%d,"received_bytes":%d,"delivered":%d,"lost":%d,`+
-			`"recovered":%d,"recovered_one_retry":%d,"fec_recovered":%d,"duplicates":%d,"reordered":%d,`+
+			`"recovered":%d,"recovered_one_retry":%d,`+
+			`"recovered_two_nacks":%d,"recovered_three_nacks":%d,"recovered_four_nacks":%d,"recovered_more_nacks":%d,`+
+			`"fec_recovered":%d,"duplicates":%d,"reordered":%d,`+
 			`"too_late":%d,"too_late_retransmit":%d,"retransmitted_received":%d,`+
 			`"clock_resync":%d,"missing":%d,"nacks_sent":%d,"abandoned":%d,`+
 			`"overwritten":%d,"flow_resets":%d,"discontinuities":%d,`+
@@ -285,9 +287,12 @@ func (s Stats) ToJSON() string {
 			`"retransmit_exhausted":%d,"bandwidth_skipped":%d,`+
 			`"rtt_us":%d,"bandwidth_bps":%d,"retry_bandwidth_bps":%d,"quality":%.3f,`+
 			`"ips_min_us":%d,"ips_cur_us":%d,"ips_max_us":%d,"avg_buffer_time_us":%d,`+
+			`"profile":%d,"seq_bits":%d,"advanced_active":%t,`+
 			`"peers":[%s]}`,
 		s.Received, s.ReceivedBytes, s.Delivered, s.Lost,
-		s.Recovered, s.RecoveredOneRetry, s.FECRecovered, s.Duplicates, s.Reordered,
+		s.Recovered, s.RecoveredOneRetry,
+		s.RecoveredTwoNacks, s.RecoveredThreeNacks, s.RecoveredFourNacks, s.RecoveredMoreNacks,
+		s.FECRecovered, s.Duplicates, s.Reordered,
 		s.TooLate, s.TooLateRetransmit, s.RetransmittedReceived,
 		s.ClockResync, s.Missing, s.NACKsSent, s.Abandoned,
 		s.Overwritten, s.FlowResets, s.Discontinuities,
@@ -297,6 +302,7 @@ func (s Stats) ToJSON() string {
 		s.RTT.Microseconds(), s.BandwidthBps, s.RetryBandwidthBps, s.Quality,
 		s.InterPacketMin.Microseconds(), s.InterPacketCur.Microseconds(), s.InterPacketMax.Microseconds(),
 		s.AvgBufferTime.Microseconds(),
+		uint8(s.Profile), s.SeqBits, s.AdvancedActive,
 		strings.Join(peers, ","),
 	)
 }
