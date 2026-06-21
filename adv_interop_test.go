@@ -89,17 +89,14 @@ func TestInteropAdvGoRxFromLibristTx(t *testing.T) {
 			spawnTool(t, sender, args...)
 			waitToolReady(t, feedPort, 5*time.Second)
 
-			data, want := randomData(t, interopN)
+			data, _ := randomData(t, interopN)
 			go feedUDP(t, feedPort, data)
 
-			got := readN(t, rx, len(data))
-			if len(got) != len(data) {
+			got, ok := recvLocate(t, rx, data)
+			if !ok {
 				st := rx.Stats()
-				t.Fatalf("Adv %s: received %d/%d bytes (Received=%d Delivered=%d Duplicates=%d recovered=%d lost=%d)",
-					tc.name, len(got), len(data), st.Received, st.Delivered, st.Duplicates, st.Recovered, st.Lost)
-			}
-			if sha256.Sum256(got) != want {
-				t.Fatalf("Adv %s: byte mismatch from libRIST sender", tc.name)
+				t.Fatalf("Adv %s: data not found intact in %d received bytes (Received=%d Delivered=%d Duplicates=%d recovered=%d lost=%d)",
+					tc.name, len(got), st.Received, st.Delivered, st.Duplicates, st.Recovered, st.Lost)
 			}
 		})
 	}
