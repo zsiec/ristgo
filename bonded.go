@@ -512,6 +512,7 @@ func (r *BondedReceiver) SetReadDeadline(t time.Time) error {
 func (r *BondedReceiver) Stats() Stats {
 	st := toStats(r.sess.Stats())
 	st.FECRecovered = r.sess.FECRecovered()
+	st = withFraming(st, r.sess)
 	return withPeers(st, r.sess.PeerStats())
 }
 
@@ -605,7 +606,7 @@ func (s *BondedSender) SetWriteDeadline(t time.Time) error {
 
 // Stats returns a snapshot of the sender's counters.
 func (s *BondedSender) Stats() Stats {
-	return withPeers(toStats(s.sess.Stats()), s.sess.PeerStats())
+	return withPeers(withFraming(toStats(s.sess.Stats()), s.sess), s.sess.PeerStats())
 }
 
 // RemoteAddr returns the first path's media address.

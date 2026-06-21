@@ -232,6 +232,16 @@ type Stats struct {
 	// losses are clearing on the first retransmission request (a healthy link).
 	RecoveredOneRetry uint64
 
+	// RecoveredTwoNacks/ThreeNacks/FourNacks/MoreNacks bucket Recovered by how
+	// many NACKs the entry needed before its packet arrived (2, 3, 4, or >4),
+	// mirroring libRIST's recovered_{1,2,3,more}nack JSON fields. The depth
+	// distribution shows whether recovery is clearing promptly or grinding
+	// through repeated retries.
+	RecoveredTwoNacks   uint64
+	RecoveredThreeNacks uint64
+	RecoveredFourNacks  uint64
+	RecoveredMoreNacks  uint64
+
 	// Abandoned counts missing entries given up on, either after
 	// MaxRetries NACKs or after ageing past recoveryBuffer*1.1.
 	Abandoned uint64
@@ -311,4 +321,18 @@ type Stats struct {
 	// pacing gate (libRIST stats_sender_instant.bandwidth_skip). The entry is
 	// left resendable, so the receiver re-NACKs it once the rate decays.
 	BandwidthSkipped uint64
+
+	// --- Framing facts (filled by Flow.Stats from receiver state, like the
+	// gauges; the flow stays profile-agnostic, so these describe only the
+	// on-wire sequence framing, never the profile). ---
+
+	// Anchored reports whether the receiver has accepted its first packet and
+	// locked a framing (libRIST receiver_queue_has_items). False on a sender
+	// flow and before the first received packet.
+	Anchored bool
+
+	// ShortSeq reports the anchored wire framing: true for 16-bit (Simple/Main)
+	// sequences, false for the Advanced profile's native 32-bit sequence. Only
+	// meaningful when Anchored; a host maps it to the seq_bits stat (16 vs 32).
+	ShortSeq bool
 }

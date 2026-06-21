@@ -41,7 +41,20 @@ func Encode(s ristgo.Stats) string {
 	counter(&b, "rist_client_flow_lost_packets", "Packets abandoned as unrecoverable.", s.Lost)
 	counter(&b, "rist_client_flow_recovered_packets", "Packets recovered by ARQ or FEC.", s.Recovered)
 	counter(&b, "rist_client_flow_recovered_one_retry_packets", "Packets recovered on the first retry.", s.RecoveredOneRetry)
+	counter(&b, "rist_client_flow_recovered_two_nacks_packets", "Packets recovered after two NACKs.", s.RecoveredTwoNacks)
+	counter(&b, "rist_client_flow_recovered_three_nacks_packets", "Packets recovered after three NACKs.", s.RecoveredThreeNacks)
+	counter(&b, "rist_client_flow_recovered_four_nacks_packets", "Packets recovered after four NACKs.", s.RecoveredFourNacks)
+	counter(&b, "rist_client_flow_recovered_more_nacks_packets", "Packets recovered after more than four NACKs.", s.RecoveredMoreNacks)
 	counter(&b, "rist_client_flow_reordered_packets", "Packets that arrived out of order.", s.Reordered)
+	counter(&b, "rist_client_flow_duplicate_packets", "Duplicate packets received (ARQ re-sends and extra SMPTE 2022-7 path copies).", s.Duplicates)
+	counter(&b, "rist_client_flow_dropped_late_packets", "Packets dropped for arriving too late to deliver.", s.TooLate)
+	// ristgo has no separate buffer-full drop: a packet circularly behind the
+	// playout cursor is shed by the cursor guard and counted in dropped_late, so
+	// this libRIST-parity series is always 0 (the panel stays populated).
+	counter(&b, "rist_client_flow_dropped_full_packets", "Packets dropped because the buffer was full (always 0 in ristgo; see dropped_late).", 0)
+	// retries == the NACK-sequences-queued count, the same underlying counter as
+	// nacks_sent below; exported under libRIST's name for dashboard parity.
+	counter(&b, "rist_client_flow_retries_packets", "Retransmissions requested (NACK sequences queued).", s.NACKsSent)
 	counter(&b, "rist_client_flow_sent_packets", "Media packets sent (sender).", s.Sent)
 	counter(&b, "rist_client_flow_nacks_sent", "NACK requests emitted (receiver).", s.NACKsSent)
 	gauge(&b, "rist_client_flow_missing_packets", "Packets currently outstanding awaiting recovery.", float64(s.Missing))
@@ -54,8 +67,27 @@ func Encode(s ristgo.Stats) string {
 	gauge(&b, "rist_client_flow_max_iat_seconds", "Maximum inter-packet arrival interval.", s.InterPacketMax.Seconds())
 	gauge(&b, "rist_client_flow_avg_buffer_time_seconds", "Average playout buffer depth.", s.AvgBufferTime.Seconds())
 	gauge(&b, "rist_client_flow_peers", "Number of bonded peers.", float64(len(s.Peers)))
+	// Info series: a constant 1 carrying the profile and on-wire framing as labels,
+	// so a scrape can identify an Advanced flow (and 16- vs 32-bit framing) without
+	// changing the label set of the existing series (libRIST rist_*_info).
+	fmt.Fprintf(&b, "# HELP rist_client_flow_info Flow metadata; value is always 1, see profile, seq_bits and advanced_active labels.\n"+
+		"# TYPE rist_client_flow_info gauge\n"+
+		"rist_client_flow_info{profile=%q,seq_bits=\"%d\",advanced_active=\"%d\"} 1\n",
+		s.Profile.String(), s.SeqBits, bool01(s.AdvancedActive))
+	fmt.Fprintf(&b, "# HELP rist_sender_peer_info Sender peer metadata; value is always 1, see profile and advanced_active labels.\n"+
+		"# TYPE rist_sender_peer_info gauge\n"+
+		"rist_sender_peer_info{profile=%q,advanced_active=\"%d\"} 1\n",
+		s.Profile.String(), bool01(s.AdvancedActive))
 	encodePeers(&b, s)
 	return b.String()
+}
+
+// bool01 renders a bool as the "1"/"0" Prometheus label-value convention.
+func bool01(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // encodePeers appends the per-peer (bonded path) metrics, each name{peer="<index>"}

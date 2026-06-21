@@ -425,7 +425,9 @@ func (s *Sender) ReadOOBTyped(buf []byte) (n int, proto uint16, err error) {
 }
 
 // Stats returns a snapshot of the sender's counters.
-func (s *Sender) Stats() Stats { return withPeers(toStats(s.sess.Stats()), s.sess.PeerStats()) }
+func (s *Sender) Stats() Stats {
+	return withPeers(withFraming(toStats(s.sess.Stats()), s.sess), s.sess.PeerStats())
+}
 
 // Authenticated reports whether the data channel is open. For a Main-profile
 // sender configured with EAP-SRP credentials it becomes true once the peer has

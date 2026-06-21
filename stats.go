@@ -7,6 +7,7 @@ import (
 
 	"github.com/zsiec/ristgo/internal/bonding"
 	"github.com/zsiec/ristgo/internal/flow"
+	"github.com/zsiec/ristgo/internal/session"
 )
 
 // PeerStats is per-peer (per-path) statistics for one bonded path, or the single peer
@@ -46,6 +47,14 @@ type Stats struct {
 	// RecoveredOneRetry counts the subset of Recovered that cleared on the first
 	// NACK (libRIST recovered_one_retry) — a high ratio indicates a healthy link.
 	RecoveredOneRetry uint64
+	// RecoveredTwoNacks/ThreeNacks/FourNacks/MoreNacks bucket Recovered by the
+	// number of NACKs the packet needed before it arrived (2, 3, 4, or more than
+	// 4), mirroring libRIST's recovered_{two,three,four,more}_nacks. The depth
+	// distribution shows whether losses clear promptly or grind through retries.
+	RecoveredTwoNacks   uint64
+	RecoveredThreeNacks uint64
+	RecoveredFourNacks  uint64
+	RecoveredMoreNacks  uint64
 	// FECRecovered counts packets reconstructed by SMPTE ST 2022-1 / 2022-5 FEC
 	// (no NACK round trip), distinct from Recovered (ARQ retransmission).
 	FECRecovered uint64
@@ -136,6 +145,20 @@ type Stats struct {
 	// non-bonded session reports exactly one peer mirroring the flow; a bonded session
 	// reports one per path with its own RTT, counters, weight, and liveness.
 	Peers []PeerStats
+
+	// --- Wire framing (for the Prometheus *_info series) ---
+
+	// Profile is the configured RIST wire profile (libRIST stats profile field).
+	Profile Profile
+	// SeqBits is the on-wire sequence-number width: 16 (Simple/Main framing) or
+	// 32 (Advanced framing). An Advanced flow reads 16 until the source upgrades
+	// framing (TR-06-3 §9); always 16 for Simple/Main (libRIST seq_bits).
+	SeqBits uint8
+	// AdvancedActive reports whether Advanced framing is currently active on the
+	// wire: true only for an Advanced-profile session whose framing has upgraded
+	// to 32-bit, false while an Advanced session is still on the Main-framing
+	// fallback window and false for Simple/Main (libRIST advanced_active).
+	AdvancedActive bool
 }
 
 // toStats maps the internal flow counters and gauges to the public Stats and
@@ -153,6 +176,10 @@ func toStats(f flow.Stats) Stats {
 		Lost:                  f.Lost,
 		Recovered:             f.Recovered,
 		RecoveredOneRetry:     f.RecoveredOneRetry,
+		RecoveredTwoNacks:     f.RecoveredTwoNacks,
+		RecoveredThreeNacks:   f.RecoveredThreeNacks,
+		RecoveredFourNacks:    f.RecoveredFourNacks,
+		RecoveredMoreNacks:    f.RecoveredMoreNacks,
 		Duplicates:            f.Duplicates,
 		Reordered:             f.Reordered,
 		TooLate:               f.TooLate,
@@ -195,6 +222,17 @@ func toStats(f flow.Stats) Stats {
 			Alive:              true,
 		}},
 	}
+}
+
+// withFraming stamps the wire-framing fields (Profile/SeqBits/AdvancedActive) onto
+// st from the session's framing snapshot, for the Prometheus *_info series. flow is
+// profile-agnostic, so this metadata is sourced from the session rather than toStats.
+func withFraming(st Stats, sess *session.Session) Stats {
+	profile, seqBits, advActive := sess.Framing()
+	st.Profile = Profile(profile)
+	st.SeqBits = seqBits
+	st.AdvancedActive = advActive
+	return st
 }
 
 // withPeers replaces st.Peers with a bonded session's per-path snapshots when it has

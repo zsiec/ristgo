@@ -569,6 +569,14 @@ type Session struct {
 	// a non-bonded session, where the host derives one peer from the flow). Refreshed
 	// with statsVal under statsMu by the loop goroutine, which owns the bonding Group.
 	statsPeers []bonding.PathStats
+	// statsProfile/statsSeqBits/statsAdvActive are the wire-framing snapshot for the
+	// Prometheus *_info series (profile, on-wire seq width, Advanced-framing-active).
+	// Refreshed with statsVal under statsMu by the loop goroutine — the profile is
+	// static but advanced_active reads the mutable §9 framing state, so it must be
+	// captured here rather than recomputed from a public reader.
+	statsProfile   uint8
+	statsSeqBits   uint8
+	statsAdvActive bool
 
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
@@ -1164,10 +1172,47 @@ func (s *Session) publishStats(now clock.Timestamp) {
 	if s.bond != nil {
 		peers = s.bond.group.PeerSnapshots(now)
 	}
+	// Wire-framing snapshot for the *_info series. Profile is fixed by the codec
+	// in use; advanced_active and seq_bits depend on whether Advanced framing is
+	// live on the wire (§9): a sender leaves the Main-fallback window once the
+	// peer advertises I=1; a receiver is governed by the framing it anchored on.
+	profile, seqBits, advActive := s.framing(v)
 	s.statsMu.Lock()
 	s.statsVal = v
 	s.statsPeers = peers
+	s.statsProfile = profile
+	s.statsSeqBits = seqBits
+	s.statsAdvActive = advActive
 	s.statsMu.Unlock()
+}
+
+// framing computes the profile (0 simple, 1 main, 2 advanced), the on-wire
+// sequence width (16 or 32), and whether Advanced framing is currently active,
+// for the Prometheus *_info series. It runs on the loop goroutine where the
+// mutable §9 state (advInMainWindow) is safe to read; v is the just-read flow
+// snapshot, so the receiver framing comes from it without a second flow read.
+func (s *Session) framing(v flow.Stats) (profile, seqBits uint8, advActive bool) {
+	switch {
+	case s.adv != nil:
+		profile = 2
+	case s.main != nil:
+		profile = 1
+	default:
+		profile = 0
+	}
+	seqBits = 16
+	if s.flow.Role() == flow.RoleSender {
+		// Sender: Advanced framing is active once it has left the §9 Main window.
+		advActive = s.adv != nil && !s.advInMainWindow()
+	} else {
+		// Receiver: framing follows what the flow anchored on the wire — 32-bit
+		// only after an Advanced source has upgraded framing (TR-06-3 §9).
+		advActive = s.adv != nil && v.Anchored && !v.ShortSeq
+	}
+	if advActive {
+		seqBits = 32
+	}
+	return
 }
 
 // fireTimers delivers every due declarative timer to the flow in deadline

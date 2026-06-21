@@ -409,6 +409,15 @@ func (s *Session) Stats() flow.Stats {
 	return v
 }
 
+// Framing returns the most recent wire-framing snapshot for the Prometheus
+// *_info series: the profile (0 simple, 1 main, 2 advanced), the on-wire
+// sequence width (16 or 32), and whether Advanced framing is currently active.
+func (s *Session) Framing() (profile, seqBits uint8, advancedActive bool) {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	return s.statsProfile, s.statsSeqBits, s.statsAdvActive
+}
+
 // PeerStats returns the most recent per-path peer snapshots for a bonded session, or
 // nil for a non-bonded session (the host then derives a single peer from the flow).
 func (s *Session) PeerStats() []bonding.PathStats {

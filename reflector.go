@@ -70,7 +70,7 @@ func (r *Reflector) OutputCount() int { return len(r.senders) }
 
 // Stats returns a snapshot of the input flow's receiver counters (recovered, lost,
 // RTT, …). The reflected outputs are fire-and-forget; per-output stats are not tracked.
-func (r *Reflector) Stats() Stats { return toStats(r.sess.Stats()) }
+func (r *Reflector) Stats() Stats { return withFraming(toStats(r.sess.Stats()), r.sess) }
 
 // Close stops the reflector: it closes the inbound receiver (which ends the pump) and
 // every output sender, releasing all sockets.

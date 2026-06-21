@@ -13,11 +13,19 @@ import (
 
 func TestEncode(t *testing.T) {
 	s := ristgo.Stats{
-		Received:  100,
-		Delivered: 98,
-		Lost:      2,
-		RTT:       20 * time.Millisecond,
-		Quality:   0.98,
+		Received:           100,
+		Delivered:          98,
+		Lost:               2,
+		RecoveredTwoNacks:  5,
+		RecoveredMoreNacks: 1,
+		Duplicates:         7,
+		TooLate:            3,
+		NACKsSent:          9,
+		RTT:                20 * time.Millisecond,
+		Quality:            0.98,
+		Profile:            ristgo.ProfileAdvanced,
+		SeqBits:            32,
+		AdvancedActive:     true,
 		Peers: []ristgo.PeerStats{
 			{Received: 60, RTT: 10 * time.Millisecond},
 			{Received: 40, RTT: 12 * time.Millisecond},
@@ -32,6 +40,16 @@ func TestEncode(t *testing.T) {
 		"rist_client_flow_peers 2\n",
 		"rist_peer_received_packets{peer=\"0\"} 60\n",
 		"rist_peer_received_packets{peer=\"1\"} 40\n",
+		// libRIST-parity counters (8cf3c81).
+		"rist_client_flow_recovered_two_nacks_packets 5\n",
+		"rist_client_flow_recovered_more_nacks_packets 1\n",
+		"rist_client_flow_duplicate_packets 7\n",
+		"rist_client_flow_dropped_late_packets 3\n",
+		"rist_client_flow_dropped_full_packets 0\n",
+		"rist_client_flow_retries_packets 9\n",
+		// Info series with profile/framing labels (4d55974).
+		"rist_client_flow_info{profile=\"advanced\",seq_bits=\"32\",advanced_active=\"1\"} 1\n",
+		"rist_sender_peer_info{profile=\"advanced\",advanced_active=\"1\"} 1\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Encode output missing %q\n--- got ---\n%s", want, out)

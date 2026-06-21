@@ -428,6 +428,7 @@ func (r *Receiver) LocalPort() int { return r.sess.MediaPort() }
 func (r *Receiver) Stats() Stats {
 	st := toStats(r.sess.Stats())
 	st.FECRecovered = r.sess.FECRecovered()
+	st = withFraming(st, r.sess)
 	return withPeers(st, r.sess.PeerStats())
 }
 

@@ -405,6 +405,8 @@ func (f *Flow) Stats() Stats {
 	s.IpsCurUs = f.receiver.ipsCurUs
 	s.IpsMaxUs = f.receiver.ipsMaxUs
 	s.AvgBufferTimeUs = f.avgBufferTimeUs()
+	s.Anchored = f.receiver.started
+	s.ShortSeq = f.receiver.shortSeq
 	return s
 }
 

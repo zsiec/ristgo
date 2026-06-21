@@ -824,8 +824,18 @@ func (f *Flow) processNacks(now clock.Timestamp) {
 		case s.state == slotFilled && s.seq == e.seq:
 			if e.nackCount > 0 {
 				f.stats.Recovered++
-				if e.nackCount == 1 {
+				// Bucket by NACK depth (libRIST recovered_{one_retry,1,2,3,more}nack).
+				switch e.nackCount {
+				case 1:
 					f.stats.RecoveredOneRetry++
+				case 2:
+					f.stats.RecoveredTwoNacks++
+				case 3:
+					f.stats.RecoveredThreeNacks++
+				case 4:
+					f.stats.RecoveredFourNacks++
+				default:
+					f.stats.RecoveredMoreNacks++
 				}
 			}
 			remove = true

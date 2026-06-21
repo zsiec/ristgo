@@ -195,7 +195,8 @@ func zeroGauges(s Stats) Stats {
 	s.ReceivedBytes, s.SentBytes, s.RetransmittedBytes = 0, 0, 0
 	s.SmoothedRTTUs, s.DataBitrateBps, s.RetryBitrateBps = 0, 0, 0
 	s.IpsMinUs, s.IpsCurUs, s.IpsMaxUs = 0, 0, 0
-	s.AvgBufferTimeUs = 0 // gauge: Stats() reports the static buffer, never 0 on a receiver
+	s.AvgBufferTimeUs = 0                 // gauge: Stats() reports the static buffer, never 0 on a receiver
+	s.Anchored, s.ShortSeq = false, false // framing facts, asserted separately
 	return s
 }
 
@@ -637,6 +638,63 @@ func TestNackRecoveredRemoval(t *testing.T) {
 	st = f.Stats()
 	if st.Recovered != 1 || f.receiver.missingCount != 0 {
 		t.Fatalf("recovered/pending = %d/%d, want 1/0", st.Recovered, f.receiver.missingCount)
+	}
+}
+
+func TestRecoveredNackDepthBuckets(t *testing.T) {
+	// A hole NACKed N times before its retransmit arrives is bucketed by depth
+	// (libRIST recovered_{one_retry,1,2,3,more}nack). Drive a fresh flow's single
+	// hole to each depth and assert only the matching bucket increments.
+	buckets := func(st Stats) [5]uint64 {
+		return [5]uint64{st.RecoveredOneRetry, st.RecoveredTwoNacks, st.RecoveredThreeNacks, st.RecoveredFourNacks, st.RecoveredMoreNacks}
+	}
+	for _, tc := range []struct {
+		name  string
+		nacks int
+		want  int // index into buckets()
+	}{
+		{"one retry", 1, 0},
+		{"two nacks", 2, 1},
+		{"three nacks", 3, 2},
+		{"four nacks", 4, 3},
+		{"more than four nacks", 6, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := New(RoleReceiver, testConfig())
+			f.Feed(10_000, 0, mkPkt(100, 0, nil))
+			f.Feed(24_000, 0, mkPkt(102, 14_000, nil)) // hole at 101
+			drainOutputs(f)
+			// Send exactly tc.nacks NACKs: each step clears the next-nack interval
+			// while staying inside the 1.1 s recovery window (no abandon).
+			now := clock.Timestamp(24_000)
+			for i := 0; i < tc.nacks; i++ {
+				now += 30_000
+				f.processNacks(now)
+			}
+			if e := f.receiver.missingHead; e == nil || e.nackCount != tc.nacks {
+				t.Fatalf("nackCount = %v, want %d", e, tc.nacks)
+			}
+			// Retransmit fills the hole; the next pass books the recovery by depth.
+			rt := mkPkt(101, 7_000, nil)
+			rt.Retransmit = true
+			f.Feed(now+1_000, 0, rt)
+			f.processNacks(now + 2_000)
+
+			st := f.Stats()
+			if st.Recovered != 1 {
+				t.Fatalf("Recovered = %d, want 1", st.Recovered)
+			}
+			got := buckets(st)
+			for i, v := range got {
+				exp := uint64(0)
+				if i == tc.want {
+					exp = 1
+				}
+				if v != exp {
+					t.Fatalf("bucket[%d] = %d, want %d (all: %v)", i, v, exp, got)
+				}
+			}
+		})
 	}
 }
 
