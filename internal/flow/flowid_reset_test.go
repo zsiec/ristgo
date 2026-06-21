@@ -75,3 +75,80 @@ func TestFlowIDChangeResets(t *testing.T) {
 		t.Fatalf("a retransmit triggered a reset: FlowResets = %d, want 1", f.stats.FlowResets)
 	}
 }
+
+// TestFramingChangeReanchors covers the TR-06-3 §9 Main↔Advanced interop
+// transition: an Advanced receiver anchored on Main (16-bit) framing that sees the
+// upgrade to Advanced (32-bit) framing on the SAME SSRC and the continuing sequence
+// re-anchors its TIMING baseline for the new timestamp scale while PRESERVING the
+// buffered ring, the delivery cursor, and the missing queue. The switch is lossless:
+// every packet buffered before the upgrade is still delivered, in order, and nothing
+// is counted lost. The SSRC can stay the same across the switch, so the SSRC-change
+// reset alone would miss it.
+func TestFramingChangeReanchors(t *testing.T) {
+	const ssrc = uint32(0x4000_0000)
+	pkt := func(seq uint32, us clock.Microseconds, shortSeq bool) wire.MediaPacket {
+		return wire.MediaPacket{Seq: seq, SourceTime: srcNTP(us), SSRC: ssrc, ShortSeq: shortSeq}
+	}
+
+	f := New(RoleReceiver, DefaultConfig())
+
+	// Anchor on Main (16-bit) framing — the libRIST startup window before upgrade —
+	// and buffer two packets (delivery is time-driven, so they stay in the ring).
+	f.Feed(10_000, 0, pkt(100, 0, true))
+	f.Feed(17_000, 0, pkt(101, 7_000, true))
+	if !f.receiver.shortSeq {
+		t.Fatalf("anchored shortSeq = false, want true (Main framing)")
+	}
+
+	// A retransmit in the other framing must NOT re-anchor (it cannot anchor a flow).
+	rt := pkt(100, 0, false)
+	rt.Retransmit = true
+	f.Feed(18_000, 0, rt)
+	if f.stats.FramingResets != 0 {
+		t.Fatalf("a retransmit wrongly triggered a framing re-anchor: FramingResets = %d", f.stats.FramingResets)
+	}
+
+	// The Main→Advanced upgrade: a fresh 32-bit-framed packet on the SAME SSRC and
+	// the continuing sequence (102 = 101+1). Re-anchor timing, but preserve the ring.
+	f.Feed(24_000, 0, pkt(102, 17_000, false))
+	if f.stats.FramingResets != 1 {
+		t.Fatalf("FramingResets = %d, want 1 after the Main→Advanced framing switch", f.stats.FramingResets)
+	}
+	if f.stats.FlowResets != 0 {
+		t.Fatalf("FlowResets = %d, want 0 (SSRC unchanged across the framing switch)", f.stats.FlowResets)
+	}
+	if f.receiver.shortSeq {
+		t.Fatalf("re-anchored shortSeq = true, want false (Advanced framing)")
+	}
+	// Ring-PRESERVING: the delivery cursor and the buffered slots survive the switch
+	// (a ring-clearing reset would have re-anchored deliverNext to 102 and dropped
+	// 100/101). Confirm the cursor is unmoved and all three packets are buffered.
+	if !f.receiver.started || f.receiver.deliverNext != 100 {
+		t.Fatalf("re-anchor moved the cursor: deliverNext = %d, want 100 (ring preserved)", f.receiver.deliverNext)
+	}
+	for _, seqn := range []uint32{100, 101, 102} {
+		if s := &f.receiver.ring[seqn&f.receiver.mask]; s.state != slotFilled || s.seq != seqn {
+			t.Fatalf("seq %d not buffered after the switch (state=%v) — ring was cleared", seqn, s.state)
+		}
+	}
+
+	// Drive playout past the recovery buffer: all three packets deliver in order,
+	// none lost — the upgrade is lossless.
+	f.deliverDue(24_000 + 2*clock.Timestamp(f.recoveryBuffer))
+	var delivered []uint32
+	for {
+		e, ok := f.PollEvent()
+		if !ok {
+			break
+		}
+		if d, isDeliver := e.(Deliver); isDeliver {
+			delivered = append(delivered, d.Seq)
+		}
+	}
+	if len(delivered) != 3 || delivered[0] != 100 || delivered[1] != 101 || delivered[2] != 102 {
+		t.Fatalf("framing switch was not lossless: delivered %v, want [100 101 102]", delivered)
+	}
+	if f.stats.Lost != 0 {
+		t.Fatalf("framing switch counted %d lost, want 0 (lossless)", f.stats.Lost)
+	}
+}

@@ -305,8 +305,9 @@ func (s *Session) fecHandleRecovered(now clock.Timestamp, r fec.Recovered) {
 		// not the last-seen stream SSRC: a recovery for a packet from a prior SSRC
 		// (a mid-stream SSRC change, or a bonded 2022-7 merge whose paths momentarily
 		// normalize to different SSRCs) keeps the correct label.
-		SSRC:    r.SSRC,
-		Payload: r.Payload,
+		SSRC:     r.SSRC,
+		Payload:  r.Payload,
+		ShortSeq: true, // Simple/Main FEC: reconstructed from 16-bit RTP fields
 	})
 }
 

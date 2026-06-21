@@ -269,6 +269,14 @@ type Stats struct {
 	// "Detected flow id change ... resetting state").
 	FlowResets uint64
 
+	// FramingResets counts wire-framing changes: a fresh non-retransmit packet
+	// whose sequence framing (wire.MediaPacket.ShortSeq — 16-bit Main vs 32-bit
+	// Advanced) differs from the one the flow anchored on, so the receiver
+	// re-anchored rather than blending two framings in one ring. This is the
+	// TR-06-3 §9 Main↔Advanced interop transition (the Main→Advanced upgrade once
+	// a peer advertises I=1).
+	FramingResets uint64
+
 	// --- Sender-half counters ---
 
 	// Sent counts first-transmission media packets emitted by PushApp.

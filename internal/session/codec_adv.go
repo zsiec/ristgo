@@ -138,6 +138,13 @@ type advCodec struct {
 	tsBaseTicks int64
 	tsRefSeq    uint32
 	tsRefTicks  int64
+
+	// peerAdvCap is a side-channel set when an inbound native Advanced keep-alive
+	// advertises (or stops advertising) Advanced capability via its I bit
+	// (adv.KeepaliveCapI). The session consumes it via takePeerAdvCap to drive the
+	// TR-06-3 §9 sender framing upgrade. nil means no keep-alive cap was decoded
+	// since the last read (mirrors the GRE codec's peerCaps pattern).
+	peerAdvCap *bool
 }
 
 // newAdvCodec constructs an Advanced-profile codec. sendKey and recvKey may be
@@ -374,6 +381,7 @@ func (c *advCodec) decodeMediaAdv(p adv.Parsed) (wire.MediaPacket, error) {
 		Payload:    data,
 		Retransmit: p.Retransmit,
 		Frag:       fragRole(p.FirstFrag, p.LastFrag),
+		ShortSeq:   false, // Advanced profile: native 32-bit extended sequence
 	}, nil
 }
 
@@ -477,6 +485,14 @@ func (c *advCodec) decodeControl(payload []byte) ([]wire.Feedback, error) {
 		}
 		return []wire.Feedback{wire.FlowAttribute{JSON: append([]byte(nil), body...)}}, nil
 	case adv.CIKeepalive:
+		// A native Advanced keep-alive carries no flow input, but its capability
+		// word advertises the peer's Advanced support (I bit). Record it on a
+		// side-channel for the session's TR-06-3 §9 sender framing upgrade; a short
+		// or malformed body is ignored (liveness was already observed).
+		if ka, perr := adv.ParseKeepalive(body); perr == nil {
+			i := ka.Caps&adv.KeepaliveCapI != 0
+			c.peerAdvCap = &i
+		}
 		return nil, nil
 	case adv.CIPSKNonce:
 		// PSK Future Nonce Announcement (TR-06-3 §5.3.9): pre-derive the AES key for
@@ -502,6 +518,19 @@ func (c *advCodec) decodeControl(payload []byte) ([]wire.Feedback, error) {
 		copy(head[:], body)
 		return []wire.Feedback{wire.UnsupportedControl{CI: ci, Head: head}}, nil
 	}
+}
+
+// takePeerAdvCap returns the Advanced-capability (I bit) advertised by the most
+// recent inbound native Advanced keep-alive decoded since the last call, and
+// whether one was seen. It consumes the side-channel so a stale value is never
+// re-reported (mirrors the GRE codec's takePeerCaps).
+func (c *advCodec) takePeerAdvCap() (advI bool, ok bool) {
+	if c.peerAdvCap == nil {
+		return false, false
+	}
+	advI = *c.peerAdvCap
+	c.peerAdvCap = nil
+	return advI, true
 }
 
 // ctrlSSRC returns the unprotected (odd) base SSRC used for control datagrams.

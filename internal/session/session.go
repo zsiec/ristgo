@@ -108,6 +108,24 @@ type Config struct {
 	// nil means the Simple profile.
 	Adv *AdvParams
 
+	// AdvSenderStartMain, when true, makes an Advanced sender start its media in
+	// Main-Profile (GRE) framing and upgrade to Advanced (Type=5) framing per
+	// session only once the peer advertises Advanced capability (I=1) — TR-06-3
+	// §9. Off by default: it exists so an Advanced sender can feed a strictly
+	// Main-only receiver; against an Advanced peer the framing upgrade re-anchors
+	// the receiver (a brief in-flight loss) for no benefit, since Advanced
+	// receivers (libRIST and ristgo) already accept our unconditional Type=5.
+	AdvSenderStartMain bool
+
+	// AnswerAdvRTTEcho, when true, makes an Advanced session answer inbound
+	// RTT-echo *requests* (the spec-correct behavior) instead of dropping them.
+	// The drop is the default because libRIST's Advanced echo-response handler
+	// historically mis-scaled the round-trip (>>16 instead of >>32), inflating the
+	// peer's RTT and jamming its retransmit re-queue gate; answering is safe only
+	// against a libRIST built with that fix. Advanced only — Main/Simple always
+	// answer (their echo path was never affected). See dropAdvEchoRequests.
+	AnswerAdvRTTEcho bool
+
 	// Source adaptation (TR-06-4 Part 1, see adapt.go). AdaptLQM makes a
 	// receiver emit periodic Link Quality Messages. RateController + OnRateAdapt,
 	// when both set on a sender, feed each inbound LQM to the controller and
@@ -326,6 +344,15 @@ type Session struct {
 	// auto-scaled buffer changes, so a steady buffer emits no redundant control.
 	advertisedBufMs uint16
 	greBurstSent    bool
+
+	// remoteSupportsAdvanced records that the peer advertised Advanced-profile
+	// capability via the I bit in a keep-alive (the native Advanced keep-alive's
+	// adv.KeepaliveCapI, or the Main GRE keep-alive's extended I bit). In Advanced
+	// mode the sender starts in Main-Profile framing and switches its media to
+	// Advanced (Type=5) framing only once this is set — TR-06-3 §9, matching
+	// libRIST's remote_supports_advanced. Loop-owned; single-path (a bonded peer
+	// advertising Advanced upgrades the whole flow, the common all-Advanced case).
+	remoteSupportsAdvanced bool
 
 	// adv is the Advanced-profile codec, non-nil in Advanced mode. Like main it
 	// reads/writes one UDP socket, demuxing media vs control by the
@@ -1237,6 +1264,13 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	var err error
 	if s.main != nil {
 		b, err = s.main.encodeMainMedia(s.mediaBuf, pkt)
+	} else if s.advInMainWindow() {
+		// TR-06-3 §9 (AdvSenderStartMain): an Advanced device "shall start in Main
+		// Profile mode" and only switch to Advanced (Type=5) framing once the peer
+		// advertises Advanced capability (I=1). Until then, emit Main-conformant media
+		// over the GRE substrate so a Main-only receiver can decode it. The receiver
+		// re-anchors losslessly on the upgrade (ring-preserving, ShortSeq).
+		b, err = s.advGRE.encodeMainMedia(s.mediaBuf, pkt)
 	} else if s.adv != nil {
 		b, err = s.adv.encodeAdvMedia(s.mediaBuf, pkt)
 	} else {
@@ -1255,9 +1289,28 @@ func (s *Session) sendMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	if s.adv != nil {
 		s.maybeAnnounceAdvNonce(now) // PSK Future Nonce, if this packet rotated the key
 	}
-	if s.fecEnabled() {
+	// FEC is suppressed during the §9 Main-framing window: the adv FEC matrix must
+	// not mix Main- and Advanced-framed datagrams. The brief window relies on ARQ.
+	if s.fecEnabled() && !s.advInMainWindow() {
 		s.fecOnSend(now, pkt, b) // generate row/column FEC from this original media
 	}
+}
+
+// advInMainWindow reports whether an Advanced sender is currently in its TR-06-3
+// §9 Main-Profile fallback window: emitting Main framing because the peer has not
+// yet advertised Advanced capability (I=1). Media is then Main-conformant (a
+// Main-only peer can decode it). The window closes — losslessly — the moment the
+// peer's I-bit arrives. Always false unless the Advanced profile with
+// AdvSenderStartMain is set.
+//
+// The fallback is disabled when FEC or payload fragmentation is configured: both
+// are Advanced-only ristgo features a Main-only peer cannot consume anyway (the
+// Main-substrate encoder neither generates FEC nor splits fragments), so starting
+// in Main would only break them across the framing upgrade for no interop benefit.
+// With either on, the sender emits Advanced framing from the first packet.
+func (s *Session) advInMainWindow() bool {
+	return s.adv != nil && s.cfg.AdvSenderStartMain && !s.remoteSupportsAdvanced &&
+		!s.fecEnabled() && s.cfg.FragmentSize == 0
 }
 
 // maybeAnnounceAdvNonce sends a PSK Future Nonce Announcement (TR-06-3 §5.3.9) when
@@ -1522,6 +1575,13 @@ func (s *Session) handleAdvInbound(now clock.Timestamp, data []byte) {
 						// buffered — the receiver-SHALL of §5.2.3 for E-marked packets.
 						s.feedAdvFeedback(now, fbs)
 					}
+					// TR-06-3 §9: a native Advanced keep-alive's I bit advertises the
+					// peer's Advanced capability, upgrading the sender's media framing
+					// from Main to Advanced (how a ristgo receiver advertises; libRIST
+					// also reads this once it sees our adv control).
+					if advI, ok := s.adv.takePeerAdvCap(); ok && advI {
+						s.remoteSupportsAdvanced = true
+					}
 				} else {
 					s.logAt(LogWarning, CatCrypto, "adv: drop undecodable adv datagram (%d bytes): %v", len(data), derr)
 				}
@@ -1546,6 +1606,12 @@ func (s *Session) handleAdvGRE(now clock.Timestamp, data []byte) {
 	if kind, ka, _, cerr := s.advGRE.peekControl(data); kind == controlKeepalive {
 		if cerr == nil {
 			s.applyRemoteCaps(ka.Caps)
+			// TR-06-3 §9: the Main GRE keep-alive's extended I bit advertises the
+			// peer's Advanced capability; it lets the sender upgrade its media framing
+			// from Main to Advanced (libRIST emits this on its Advanced keep-alives).
+			if ka.HasAdvExt && ka.AdvExt.I {
+				s.remoteSupportsAdvanced = true
+			}
 		}
 		return
 	}
@@ -1592,7 +1658,18 @@ func (s *Session) feedAdvFeedback(now clock.Timestamp, fbs []wire.Feedback) {
 		}
 		out = append(out, fb)
 	}
-	s.feedFeedback(now, dropAdvEchoRequests(out))
+	s.feedFeedback(now, s.filterAdvEcho(out))
+}
+
+// filterAdvEcho drops inbound Advanced RTT-echo requests unless the session is
+// configured to answer them (Config.AnswerAdvRTTEcho). It centralizes the gate
+// for every Advanced feedback path (single and bonded). See dropAdvEchoRequests
+// for the libRIST interop rationale behind the default drop.
+func (s *Session) filterAdvEcho(fbs []wire.Feedback) []wire.Feedback {
+	if s.cfg.AnswerAdvRTTEcho {
+		return fbs
+	}
+	return dropAdvEchoRequests(fbs)
 }
 
 // sendAdvUnsupported originates a Control Message Unsupported Response to the peer,

@@ -404,6 +404,42 @@ func TestDropAdvEchoRequests(t *testing.T) {
 	}
 }
 
+// TestFilterAdvEcho covers the Config.AnswerAdvRTTEcho gate: the session drops
+// inbound Advanced RTT-echo requests by default (libRIST >>16 interop) but keeps
+// them — so the flow answers — when answering is explicitly enabled.
+func TestFilterAdvEcho(t *testing.T) {
+	in := func() []wire.Feedback {
+		return []wire.Feedback{
+			wire.RttEchoRequest{Timestamp: 1},
+			wire.NackRequest{SSRC: 7, Missing: []uint32{1}},
+			wire.RttEchoRequest{Timestamp: 2},
+		}
+	}
+
+	// Default: drop the two echo requests, keep the NACK.
+	drop := (&Session{cfg: Config{}}).filterAdvEcho(in())
+	for _, fb := range drop {
+		if _, isReq := fb.(wire.RttEchoRequest); isReq {
+			t.Fatalf("default session left an RttEchoRequest: %#v", drop)
+		}
+	}
+	if len(drop) != 1 {
+		t.Fatalf("default kept %d items, want 1 (the NACK)", len(drop))
+	}
+
+	// Answering enabled: keep everything, including both echo requests.
+	keep := (&Session{cfg: Config{AnswerAdvRTTEcho: true}}).filterAdvEcho(in())
+	reqs := 0
+	for _, fb := range keep {
+		if _, isReq := fb.(wire.RttEchoRequest); isReq {
+			reqs++
+		}
+	}
+	if reqs != 2 || len(keep) != 3 {
+		t.Fatalf("AnswerAdvRTTEcho kept %d items (%d echo requests), want 3 (2 requests)", len(keep), reqs)
+	}
+}
+
 // TestDecodeControlUnsupported verifies the §5.3.10 dispatch: an unrecognized
 // control index is surfaced as a wire.UnsupportedControl (so the host originates a
 // response), while an inbound Unsupported (0x8020) is absorbed with no signal so a

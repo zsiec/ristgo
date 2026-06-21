@@ -105,8 +105,19 @@ func deriveRingSize(cfg Config) int {
 	//         = (windowUs/1e6) * (kbps*1000) / (8 * ringPacketBytes)
 	//         = windowUs * kbps / (8000 * ringPacketBytes)
 	packets := int64(windowUs) * int64(kbps) / (8000 * ringPacketBytes)
-	if packets < DefaultRingSize {
-		return DefaultRingSize
+	floor := int64(DefaultRingSize)
+	// libRIST ?recovery-depth=: size the Advanced recovery ring to 65536<<depth
+	// packets. Apply it as a floor so it only raises the bitrate/buffer-derived
+	// size, never lowers it. ristgo caps the ring at maxDerivedRingSize (its slots
+	// are larger than libRIST's), so depths past that saturate. Validated as
+	// Advanced-only and in range by Config.validate.
+	if cfg.RecoveryDepth > 0 {
+		if d := int64(DefaultRingSize) << uint(cfg.RecoveryDepth); d > floor {
+			floor = d
+		}
+	}
+	if packets < floor {
+		packets = floor
 	}
 	if packets > maxDerivedRingSize {
 		return maxDerivedRingSize
@@ -190,6 +201,12 @@ type Config struct {
 	// worth of in-flight packets always fits); other values are rounded up to a
 	// power of two so seq&mask indexing works.
 	RingSize int
+
+	// RecoveryDepth, when > 0, floors the derived ring at 65536<<RecoveryDepth
+	// slots — libRIST's Advanced ?recovery-depth= knob. It only raises the
+	// bitrate/buffer-derived size, never lowers it, and is ignored when an
+	// explicit RingSize is set. Capped at maxDerivedRingSize. See deriveRingSize.
+	RecoveryDepth int
 
 	// SSRC is the base flow SSRC the sender half stamps into every outgoing
 	// MediaPacket. It must be even — the codec reserves the LSB as the

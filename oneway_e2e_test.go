@@ -285,7 +285,8 @@ func TestOneWayConstructorErrors(t *testing.T) {
 	eap.Profile = ristgo.ProfileMain
 	eap.Username, eap.Password = "u", "p"
 
-	oddSimple := ristgo.DefaultConfig() // Simple profile, odd port below
+	oddSimple := ristgo.DefaultConfig()
+	oddSimple.Profile = ristgo.ProfileSimple // odd-port rejection is a Simple rule (DefaultConfig is Advanced)
 
 	cases := []struct {
 		name string

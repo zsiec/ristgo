@@ -530,8 +530,9 @@ func TestE2EMainOOB(t *testing.T) {
 	t.Fatal("OOB datagram not received within the deadline")
 
 simpleCheck:
-	// A Simple-profile sender has no OOB channel.
-	scfg := ristgo.DefaultConfig() // ProfileSimple
+	// A Simple-profile sender has no OOB channel. (DefaultConfig is Advanced now.)
+	scfg := ristgo.DefaultConfig()
+	scfg.Profile = ristgo.ProfileSimple
 	stx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", freeMainPort(t)&^1), scfg)
 	if err != nil {
 		t.Fatalf("NewSender(Simple): %v", err)

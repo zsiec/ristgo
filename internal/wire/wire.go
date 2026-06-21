@@ -100,6 +100,18 @@ type MediaPacket struct {
 	// carry no virtual ports in their data header.
 	VirtSrcPort uint16
 	VirtDstPort uint16
+
+	// ShortSeq reports the wire framing the packet was decoded from: true for
+	// 16-bit framing (Simple/Main reduced-overhead, the widened RTP sequence)
+	// and false for the Advanced profile's native 32-bit extended sequence. The
+	// flow core treats a change of this value on an already-anchored flow like a
+	// flow-id change and re-anchors, because the two framings carry different
+	// sequence widths and timestamp encodings; mixing them in one ring would
+	// corrupt dedup and playout. This is the TR-06-3 §9 Main↔Advanced interop
+	// case: an Advanced receiver accepts a Main-framed source and follows a
+	// mid-stream Main→Advanced upgrade. It is set by the receiving codec; it has
+	// no meaning on a send-built packet (the sending codec ignores it).
+	ShortSeq bool
 }
 
 // FragRole is the Advanced-profile fragment role of a MediaPacket, mapping to

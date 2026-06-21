@@ -982,6 +982,7 @@ func (c *mainCodec) decodeMediaMain(b []byte) (wire.MediaPacket, error) {
 		Retransmit:  rtp.IsRetransmit(p.SSRC),
 		VirtSrcPort: c.lastVirtSrc,
 		VirtDstPort: c.lastVirtDst,
+		ShortSeq:    true, // Main profile: 16-bit RTP sequence (widened by rollover)
 	}, nil
 }
 

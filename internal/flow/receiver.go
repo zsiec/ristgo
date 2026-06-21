@@ -123,6 +123,13 @@ type receiverState struct {
 	// in NackRequest feedback.
 	ssrc uint32
 
+	// shortSeq is the wire framing of the anchored flow (wire.MediaPacket.ShortSeq):
+	// true for 16-bit Simple/Main framing, false for the Advanced 32-bit native
+	// sequence. A started flow whose next fresh packet carries a different value
+	// is following a mid-stream framing change (TR-06-3 §9 Main↔Advanced) and is
+	// re-anchored like a flow-id change.
+	shortSeq bool
+
 	// lastFound is libRIST's last_seq_found: the newest in-order sequence
 	// accepted, the anchor of missing-detection walks.
 	lastFound uint32
@@ -386,6 +393,28 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 		f.resetReceiver()
 		f.stats.FlowResets++
 	}
+	// Wire framing change (libRIST TR-06-3 §9 Main↔Advanced interop): a started
+	// Advanced flow whose next fresh packet switches sequence framing — Main 16-bit
+	// to Advanced 32-bit (the upgrade once a peer advertises I=1), or vice versa.
+	// The two framings carry different timestamp encodings, so the source-time→local
+	// mapping must be re-derived for the new scale; but the SEQUENCE is continuous
+	// across the switch (one sender counter, and a 16-bit-zero RTP start makes the
+	// Main-widened sequence equal the Advanced sequence), so this is a LOSSLESS
+	// ring-preserving re-anchor: keep the buffered ring, the delivery cursor, and the
+	// missing queue, and only re-lock the timing baseline. Already-buffered packets
+	// keep their stored outputTime; a gap open at the switch still heals via ARQ
+	// (its missing entry survives). Re-set maxSourceTime so the backward-wrap guard
+	// below does not misfire on the timestamp-scale change. (Simple/Main/matched-
+	// Advanced flows never change framing, so this never fires.)
+	if r.started && !pkt.Retransmit && pkt.ShortSeq != r.shortSeq {
+		src := clock.NTPTime(pkt.SourceTime).Timestamp()
+		r.offset = now.Sub(src)
+		r.maxSourceTime = pkt.SourceTime
+		r.lastPacketTime = now
+		r.lastResync = now
+		r.shortSeq = pkt.ShortSeq
+		f.stats.FramingResets++
+	}
 	if !r.started {
 		// A flow cannot start on a retransmit.
 		if pkt.Retransmit {
@@ -584,6 +613,7 @@ func (f *Flow) start(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	r.offset = now.Sub(src)
 	r.started = true
 	r.ssrc = pkt.SSRC
+	r.shortSeq = pkt.ShortSeq
 	r.lastFound = pkt.Seq
 	r.maxSourceTime = pkt.SourceTime
 	r.lastPacketTime = now // == src + offset by construction

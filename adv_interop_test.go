@@ -161,6 +161,68 @@ func TestInteropAdvLibristRxFromGoTx(t *testing.T) {
 	}
 }
 
+// TestInteropAdvMainOnlyRxFromGoTx: ristgo Advanced Sender with
+// Config.AdvSenderStartMain -> libRIST ristreceiver (-p 1, Main-only). This is
+// the TR-06-3 §9 sender fallback: a Main-only receiver never advertises Advanced
+// capability (I=1), so ristgo stays in Main-Profile (GRE) framing for the whole
+// flow and a Main-only peer decodes it. Without AdvSenderStartMain the sender
+// would emit Advanced Type=5 framing the Main-only receiver cannot decode.
+func TestInteropAdvMainOnlyRxFromGoTx(t *testing.T) {
+	receiver := libristTool(t, "ristreceiver")
+	cases := []struct {
+		name    string
+		aesBits int
+	}{
+		{"cleartext", 0},
+		{"aes256", 256},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rxPort := freeMainPort(t)
+			capPort := freeUDPPort(t, rxPort)
+
+			capt := newUDPCapture(t, capPort, interopN*interopChunk)
+			// libRIST Main-Profile (-p 1) receiver: it never sends the Advanced I bit.
+			args := []string{"-p", "1", "-b", "200",
+				"-i", fmt.Sprintf("rist://@127.0.0.1:%d", rxPort),
+				"-o", fmt.Sprintf("udp://127.0.0.1:%d", capPort)}
+			if tc.aesBits != 0 {
+				args = append(args, "-s", advInteropSecret, "-e", strconv.Itoa(tc.aesBits))
+			}
+			spawnTool(t, receiver, args...)
+			waitToolReady(t, rxPort, 5*time.Second)
+
+			cfg := advInteropConfig(tc.aesBits, false)
+			cfg.AdvSenderStartMain = true // TR-06-3 §9: start in Main framing for a Main-only peer
+			tx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", rxPort), cfg)
+			if err != nil {
+				t.Fatalf("NewSender: %v", err)
+			}
+			defer tx.Close()
+
+			data, want := randomData(t, interopN)
+			tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+			go func() {
+				for off := 0; off < len(data); off += interopChunk {
+					tx.Write(data[off : off+interopChunk])
+					if (off/interopChunk)%8 == 0 {
+						time.Sleep(time.Millisecond)
+					}
+				}
+			}()
+
+			got := capt.wait(20 * time.Second)
+			if len(got) < len(data) {
+				t.Fatalf("Adv->Main %s: libRIST Main receiver got %d/%d bytes (Retransmitted=%d)",
+					tc.name, len(got), len(data), tx.Stats().Retransmitted)
+			}
+			if sha256.Sum256(got[:len(data)]) != want {
+				t.Fatalf("Adv->Main %s: byte mismatch at libRIST Main receiver", tc.name)
+			}
+		})
+	}
+}
+
 // TestInteropAdvGoRxLossyRecovery: libRIST ristsender (-p 2) -> lossy proxy ->
 // ristgo Advanced Receiver. Proves the native Advanced NACK control plane
 // interoperates: ristgo's range NACKs drive libRIST's retransmits (R flag) and

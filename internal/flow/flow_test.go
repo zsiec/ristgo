@@ -98,6 +98,39 @@ func TestNewRingSizing(t *testing.T) {
 	}
 }
 
+func TestDeriveRingSizeRecoveryDepth(t *testing.T) {
+	// A zero recovery window derives the DefaultRingSize floor; RecoveryDepth
+	// (libRIST's ?recovery-depth=) raises that floor to 65536<<depth, saturating
+	// at maxDerivedRingSize. 65536<<5 == 2^21 == maxDerivedRingSize.
+	tests := []struct {
+		depth int
+		want  int
+	}{
+		{0, DefaultRingSize},
+		{1, DefaultRingSize << 1},
+		{4, DefaultRingSize << 4},
+		{5, maxDerivedRingSize},
+		{8, maxDerivedRingSize}, // beyond the cap saturates rather than OOMs
+	}
+	for _, tt := range tests {
+		if got := deriveRingSize(Config{RecoveryDepth: tt.depth}); got != tt.want {
+			t.Fatalf("deriveRingSize(RecoveryDepth=%d) = %d, want %d", tt.depth, got, tt.want)
+		}
+	}
+
+	// The depth is a floor, never a ceiling: a window whose derived size already
+	// exceeds the depth floor is unaffected by a small depth.
+	big := Config{RecoveryBufferMax: 5 * clock.Second, RTTMin: 0, RecoveryMaxBitrate: 500000}
+	derived := deriveRingSize(big)
+	if derived <= DefaultRingSize<<1 {
+		t.Fatalf("test setup: derived ring %d not above the depth-1 floor", derived)
+	}
+	big.RecoveryDepth = 1 // floor 131072, below the derived size
+	if got := deriveRingSize(big); got != derived {
+		t.Fatalf("RecoveryDepth lowered an already-larger ring: %d, want %d", got, derived)
+	}
+}
+
 func TestRecoveryBufferFormula(t *testing.T) {
 	// buffer_time = (max-min)/2 + min (librist).
 	tests := []struct {

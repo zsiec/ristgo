@@ -212,7 +212,8 @@ func runSepPortsSimpleFEC(t *testing.T, fecCfg *ristgo.FECConfig) {
 	recvMedia := distinctEvenPort(t)
 	proxyMedia := distinctEvenPort(t, recvMedia)
 
-	cfg := ristgo.DefaultConfig() // Simple profile
+	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple // DefaultConfig is Advanced; this is the Simple separate-port path
 	cfg.BufferMin = 600 * time.Millisecond
 	cfg.BufferMax = 600 * time.Millisecond
 	cfg.FEC = fecCfg

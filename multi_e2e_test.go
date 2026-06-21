@@ -602,6 +602,7 @@ func TestE2EMultiReceiverLossRecovery(t *testing.T) {
 	}
 
 	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple // Simple even/odd demuxed-receiver path (DefaultConfig is Advanced)
 	cfg.BufferMin = 500 * time.Millisecond
 	cfg.BufferMax = 500 * time.Millisecond
 

@@ -71,8 +71,13 @@ func (r *mediaRelay) Dropped() uint64 { return r.dropped.Load() }
 func (r *mediaRelay) Close()          { r.sock.Close(); r.wg.Wait() }
 
 // bondConfig is a fast Simple-profile config for the bonded e2e tests.
+// bondConfig is the shared Simple-profile bonding test config. It pins
+// ProfileSimple because DefaultConfig now defaults to Advanced; these tests
+// predate that flip and exercise Simple-profile bonding (the Advanced bonded path
+// has its own -p 2 interop coverage).
 func bondConfig() ristgo.Config {
 	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple
 	cfg.BufferMin = 300 * time.Millisecond
 	cfg.BufferMax = 300 * time.Millisecond
 	return cfg

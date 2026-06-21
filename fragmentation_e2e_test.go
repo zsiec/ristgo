@@ -590,7 +590,8 @@ func TestE2EAdvFragmentationProvenOnWire(t *testing.T) {
 // FragmentSize is Advanced-only and bounded by MaxMediaPayload, and a Write
 // larger than the per-Write fragment cap is rejected.
 func TestFragmentationConfigAndWriteErrors(t *testing.T) {
-	simple := ristgo.DefaultConfig() // Simple
+	simple := ristgo.DefaultConfig()
+	simple.Profile = ristgo.ProfileSimple // DefaultConfig is Advanced, which allows FragmentSize
 	simple.FragmentSize = 1000
 
 	main := ristgo.DefaultConfig()

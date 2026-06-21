@@ -451,6 +451,7 @@ func toFlowConfig(cfg Config) flow.Config {
 		MaxRetries:         cfg.MaxRetries,
 		RecoveryMaxBitrate: cfg.MaxBitrate,
 		ReturnMaxBitrate:   cfg.ReturnBandwidth,
+		RecoveryDepth:      cfg.RecoveryDepth,
 		CongestionControl:  toFlowCongestion(cfg.CongestionControl),
 		TimingMode:         toFlowTiming(cfg.TimingMode),
 	}
@@ -591,6 +592,8 @@ func toSessionConfig(cfg Config, fc flow.Config, ssrc uint32) session.Config {
 		OnDisconnect:            toSessionDisconnectCB(cfg.OnDisconnect),
 		SplitMode:               toSplitMode(cfg.SplitMode),
 		MergeMode:               toMergeMode(cfg.MergeMode),
+		AnswerAdvRTTEcho:        cfg.AnswerAdvRTTEcho,
+		AdvSenderStartMain:      cfg.AdvSenderStartMain,
 	}
 }
 

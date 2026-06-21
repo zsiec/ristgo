@@ -95,6 +95,23 @@ func TestParseURLKeepaliveAliasAndRetries(t *testing.T) {
 	}
 }
 
+func TestParseURLRecoveryDepth(t *testing.T) {
+	// libRIST's ?recovery-depth= (Advanced ring exponent) parses into RecoveryDepth.
+	_, cfg, err := ParseURL("rist://h:5000?profile=2&recovery-depth=4", DefaultConfig())
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	if cfg.Profile != ProfileAdvanced {
+		t.Errorf("Profile = %v, want ProfileAdvanced", cfg.Profile)
+	}
+	if cfg.RecoveryDepth != 4 {
+		t.Errorf("RecoveryDepth = %d, want 4", cfg.RecoveryDepth)
+	}
+	if err := cfg.validate(); err != nil {
+		t.Errorf("validate() rejected a parsed recovery-depth=4 on Advanced: %v", err)
+	}
+}
+
 func TestParseURLErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -104,6 +121,7 @@ func TestParseURLErrors(t *testing.T) {
 		{"no port", "rist://h"},
 		{"non-integer buffer", "rist://h:5000?buffer=abc"},
 		{"non-integer rtt-min", "rist://h:5000?rtt-min=fast"},
+		{"non-integer recovery-depth", "rist://h:5000?recovery-depth=deep"},
 		{"bad virt-dst-port", "rist://h:5000?virt-dst-port=99999"},
 		{"unknown parameter typo", "rist://h:5000?reoder-buffer=5"},
 		{"underscore not hyphen", "rist://h:5000?aes_type=128"},
@@ -284,7 +302,11 @@ func TestNewSenderInvalidConfigWrapsSentinel(t *testing.T) {
 }
 
 func TestNewSenderOddPortRejected(t *testing.T) {
-	if _, err := NewSender("127.0.0.1:5001", DefaultConfig()); err == nil {
+	// Odd-media-port rejection is a Simple even/odd-pair rule (DefaultConfig is now
+	// Advanced single-port, which accepts any port).
+	cfg := DefaultConfig()
+	cfg.Profile = ProfileSimple
+	if _, err := NewSender("127.0.0.1:5001", cfg); err == nil {
 		t.Fatal("NewSender accepted an odd media port")
 	} else if !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("error %v does not wrap ErrInvalidConfig", err)

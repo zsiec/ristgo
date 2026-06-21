@@ -123,6 +123,7 @@ func (d *mediaDecoder) decode(b []byte) (wire.MediaPacket, error) {
 		SSRC:       rtp.NormalizeSSRC(p.SSRC),
 		Payload:    p.Payload,
 		Retransmit: rtp.IsRetransmit(p.SSRC),
+		ShortSeq:   true, // Simple profile: 16-bit RTP sequence (widened by rollover)
 	}, nil
 }
 

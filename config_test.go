@@ -18,9 +18,9 @@ func TestDefaultConfig(t *testing.T) {
 		got  any
 		want any
 	}{
-		// libRIST RIST_DEFAULT_PROFILE is RIST_PROFILE_MAIN; ristgo
-		// deliberately deviates to ProfileSimple until Main exists.
-		{"Profile", cfg.Profile, ProfileSimple},
+		// libRIST RIST_DEFAULT_PROFILE is now RIST_PROFILE_ADVANCED (recently
+		// changed from Main); ristgo's DefaultConfig matches it.
+		{"Profile", cfg.Profile, ProfileAdvanced},
 		{"BufferMin", cfg.BufferMin, 1000 * time.Millisecond},                 // RIST_DEFAULT_RECOVERY_LENGTH_MIN (1000)
 		{"BufferMax", cfg.BufferMax, 1000 * time.Millisecond},                 // RIST_DEFAULT_RECOVERY_LENGTH_MAX (1000)
 		{"ReorderBuffer", cfg.ReorderBuffer, 15 * time.Millisecond},           // RIST_DEFAULT_RECOVERY_REORDER_BUFFER (15)
@@ -164,7 +164,12 @@ func TestValidateZeroConfig(t *testing.T) {
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate zero config: %v", err)
 	}
-	if want := DefaultConfig(); !reflect.DeepEqual(cfg, want) {
+	// A validated zero Config fills the libRIST RIST_DEFAULT_* parameters, so it
+	// matches DefaultConfig() EXCEPT Profile, whose zero value (ProfileSimple, the
+	// simplest profile) deliberately differs from DefaultConfig's ProfileAdvanced.
+	want := DefaultConfig()
+	want.Profile = ProfileSimple
+	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("validated zero config = %+v, want %+v", cfg, want)
 	}
 }
@@ -510,6 +515,50 @@ func TestConfigValidate(t *testing.T) {
 		{"weight positive", func(c *Config) { c.Weight = 5 }, ""},
 		{"weight negative", func(c *Config) { c.Weight = -1 },
 			"rist: Weight must be at least 0 (0 = duplicate)"},
+
+		// RecoveryDepth: Advanced-only, range 1..16.
+		{"recovery-depth on advanced", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.RecoveryDepth = 3
+		}, ""},
+		{"recovery-depth max on advanced", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.RecoveryDepth = MaxRecoveryDepth
+		}, ""},
+		{"recovery-depth on simple rejected", func(c *Config) { c.RecoveryDepth = 3 },
+			"rist: RecoveryDepth requires ProfileAdvanced"},
+		{"recovery-depth on main rejected", func(c *Config) {
+			c.Profile = ProfileMain
+			c.RecoveryDepth = 3
+		}, "rist: RecoveryDepth requires ProfileAdvanced"},
+		{"recovery-depth too large", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.RecoveryDepth = MaxRecoveryDepth + 1
+		}, "rist: RecoveryDepth must be between 1 and 16"},
+		{"recovery-depth negative", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.RecoveryDepth = -1
+		}, "rist: RecoveryDepth must be between 1 and 16"},
+
+		// AnswerAdvRTTEcho: Advanced-only.
+		{"answer-adv-rtt-echo on advanced", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.AnswerAdvRTTEcho = true
+		}, ""},
+		{"answer-adv-rtt-echo on simple rejected", func(c *Config) { c.AnswerAdvRTTEcho = true },
+			"rist: AnswerAdvRTTEcho requires ProfileAdvanced"},
+
+		// AdvSenderStartMain: an Advanced sender behavior, on by default; tolerated
+		// (ignored) on Simple/Main rather than rejected, so DefaultConfig re-pointed
+		// at another profile still validates.
+		{"adv-sender-start-main on advanced", func(c *Config) {
+			c.Profile = ProfileAdvanced
+			c.AdvSenderStartMain = true
+		}, ""},
+		{"adv-sender-start-main on simple tolerated", func(c *Config) {
+			c.Profile = ProfileSimple
+			c.AdvSenderStartMain = true
+		}, ""},
 
 		// Null-packet deletion: Main profile only.
 		{"npd on main", func(c *Config) {

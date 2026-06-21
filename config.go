@@ -40,6 +40,10 @@ const (
 	// MaxRTTMultiplier is the upper bound for RTTMultiplier.
 	MaxRTTMultiplier = 100
 
+	// MaxRecoveryDepth is the upper bound for RecoveryDepth, matching libRIST's
+	// RIST_RECOVERY_DEPTH_MAX (16 == the full 32-bit sequence space).
+	MaxRecoveryDepth = 16
+
 	// String length limits, matching libRIST's RIST_MAX_STRING_SHORT (128)
 	// and RIST_MAX_STRING_LONG (256) minus the C NUL terminator.
 	maxShortString = 127
@@ -60,16 +64,19 @@ type ConnectInfo struct {
 // Config contains RIST sender/receiver configuration.
 //
 // The zero value of every field means "use the default"; validation fills
-// defaults in place before checking ranges, so Config{} behaves like
-// DefaultConfig().
+// defaults in place before checking ranges. The one exception is Profile:
+// DefaultConfig sets ProfileAdvanced (matching libRIST), but the Config zero value
+// is ProfileSimple (== 0), so a bare Config{} is a Simple-profile session while
+// DefaultConfig() is Advanced. Start from DefaultConfig() for the libRIST-default
+// behavior; set Profile explicitly to be unambiguous.
 type Config struct {
-	// Profile selects the RIST wire profile.
-	// Default: ProfileSimple.
+	// Profile selects the RIST wire profile. DefaultConfig: ProfileAdvanced.
 	//
-	// NOTE: this deviates from libRIST, whose default profile is Main. ristgo
-	// defaults to ProfileSimple — the simplest interoperable profile — so a
-	// zero-value Config needs no tunnelling or keys; set ProfileMain or
-	// ProfileAdvanced explicitly for those profiles.
+	// Like libRIST, ristgo's DefaultConfig profile is ProfileAdvanced: it carries the
+	// most capable framing, an Advanced receiver also decodes Main-framed sources, and
+	// an Advanced sender interoperates with any Advanced peer. Set ProfileSimple or
+	// ProfileMain explicitly to select those profiles. (The Config zero value is
+	// ProfileSimple, since ProfileSimple == 0.)
 	Profile Profile
 
 	// BufferMin is the minimum recovery (retransmission) buffer length
@@ -257,6 +264,40 @@ type Config struct {
 	// Compression enables payload compression (Advanced profile only;
 	// libRIST compression). Receivers auto-detect. Default: false.
 	Compression bool
+
+	// RecoveryDepth, when > 0, sizes the Advanced-profile recovery (retransmit)
+	// ring as 65536<<RecoveryDepth packets — libRIST's ?recovery-depth= knob, a
+	// base-2 exponent over the 16-bit base buffer (depth 3 = 524288 packets is
+	// libRIST's default; the addressable NACK window is roughly half the ring).
+	// It only raises the ring above ristgo's bitrate/buffer-derived size, never
+	// lowers it. Advanced profile only; valid range 1..MaxRecoveryDepth. ristgo
+	// caps the actual ring lower than libRIST (its slots are larger), so very
+	// large depths saturate. Default: 0 (size the ring from bitrate and buffer).
+	RecoveryDepth int
+
+	// AdvSenderStartMain makes an Advanced-profile sender begin in Main-Profile
+	// (GRE) framing and upgrade to Advanced (Type=5/32-bit) framing only once the
+	// peer advertises Advanced capability (the keep-alive I bit) — TR-06-3 §9's
+	// Main/Advanced interop method. Enable it ONLY to feed a strictly Main-only
+	// RECEIVER: it is what lets an Advanced sender reach one. OFF by default because
+	// against an Advanced receiver it is unnecessary (Advanced receivers accept our
+	// Type=5 from the first packet) and counterproductive — the mid-stream framing
+	// reset makes libRIST's own Advanced receiver drop a packet at the switch. (ristgo's
+	// receiver, by contrast, follows the switch losslessly via a ring-preserving
+	// re-anchor.) Disabled automatically when FEC or fragmentation is configured (both
+	// are Advanced-only features a Main-only peer cannot consume). Effective only on the
+	// Advanced profile; ignored on Simple/Main. Default: false.
+	AdvSenderStartMain bool
+
+	// AnswerAdvRTTEcho makes an Advanced-profile session answer inbound RTT-echo
+	// requests (the spec-correct behavior) instead of dropping them. The default
+	// (false) drops them: libRIST's Advanced echo-response handler historically
+	// mis-scaled the round-trip (>>16 instead of >>32), inflating the peer's RTT
+	// and stalling its retransmit re-queue gate, so a reply from us could break
+	// the peer's recovery under loss. Enable this only against a libRIST built
+	// with that fix. Advanced profile only (Main/Simple always answer; their echo
+	// path was never affected). Default: false.
+	AnswerAdvRTTEcho bool
 
 	// FragmentSize, when > 0, makes the sender split a Write larger than this
 	// many bytes into fragments of at most FragmentSize bytes, each an
@@ -467,12 +508,17 @@ const (
 )
 
 // DefaultConfig returns a Config with default values matching libRIST's
-// RIST_DEFAULT_* macros, except Profile: libRIST defaults to the Main profile,
-// while ristgo defaults to ProfileSimple as the simplest interoperable profile
-// (see Config.Profile).
+// RIST_DEFAULT_* macros, including the profile: like libRIST, ristgo defaults to
+// the Advanced profile (TR-06-3). An Advanced receiver decodes both Advanced and
+// Main-framed sources (and follows a libRIST sender's mid-stream Main→Advanced
+// upgrade losslessly), and an Advanced sender interoperates with any Advanced peer.
+// Feeding a strictly Main-only RECEIVER additionally needs the §9 sender fallback
+// (AdvSenderStartMain), which is off by default because it makes libRIST's own
+// Advanced receiver drop a packet at the framing reset. Set Profile to ProfileSimple
+// or ProfileMain explicitly to select those profiles.
 func DefaultConfig() Config {
 	return Config{
-		Profile:           ProfileSimple,
+		Profile:           ProfileAdvanced,
 		BufferMin:         DefaultBufferMin,
 		BufferMax:         DefaultBufferMax,
 		ReorderBuffer:     DefaultReorderBuffer,
@@ -525,6 +571,20 @@ func (cfg *Config) validate() error {
 	if cfg.Compression && cfg.Profile != ProfileAdvanced {
 		return errors.New("rist: Compression requires ProfileAdvanced")
 	}
+	if cfg.RecoveryDepth != 0 {
+		if cfg.Profile != ProfileAdvanced {
+			return errors.New("rist: RecoveryDepth requires ProfileAdvanced")
+		}
+		if cfg.RecoveryDepth < 0 || cfg.RecoveryDepth > MaxRecoveryDepth {
+			return fmt.Errorf("rist: RecoveryDepth must be between 1 and %d", MaxRecoveryDepth)
+		}
+	}
+	if cfg.AnswerAdvRTTEcho && cfg.Profile != ProfileAdvanced {
+		return errors.New("rist: AnswerAdvRTTEcho requires ProfileAdvanced")
+	}
+	// AdvSenderStartMain is an Advanced-profile sender behavior; on Simple/Main it
+	// is simply ignored (no error), so a DefaultConfig (Advanced, fallback on)
+	// re-pointed at ProfileSimple/Main still validates.
 	if cfg.OnFlowAttr != nil && cfg.Profile != ProfileAdvanced {
 		return errors.New("rist: OnFlowAttr (flow attributes) requires ProfileAdvanced")
 	}

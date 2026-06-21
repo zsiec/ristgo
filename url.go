@@ -151,6 +151,7 @@ func applyQuery(cfg *Config, q url.Values) error {
 		{"key-rotation", &cfg.KeyRotation},
 		{"min-retries", &cfg.MinRetries},
 		{"max-retries", &cfg.MaxRetries},
+		{"recovery-depth", &cfg.RecoveryDepth}, // libRIST ?recovery-depth= (Advanced ring exponent)
 	} {
 		if err := intVal(step.key, step.dst); err != nil {
 			return err
@@ -304,7 +305,7 @@ var recognizedURLParams = map[string]bool{
 	"reorder-buffer": true, "session-timeout": true,
 	"keepalive": true, "keepalive-interval": true,
 	"bandwidth": true, "weight": true, "aes-type": true, "key-rotation": true,
-	"min-retries": true, "max-retries": true,
+	"min-retries": true, "max-retries": true, "recovery-depth": true,
 	"virt-src-port": true, "virt-dst-port": true,
 	"profile": true, "cname": true, "secret": true,
 	"username": true, "password": true, "compression": true,

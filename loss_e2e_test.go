@@ -124,6 +124,7 @@ func TestE2ELossRecovery(t *testing.T) {
 	}
 
 	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple // Simple even/odd loss-recovery path (DefaultConfig is Advanced)
 	cfg.BufferMin = 500 * time.Millisecond
 	cfg.BufferMax = 500 * time.Millisecond
 

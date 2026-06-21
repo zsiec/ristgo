@@ -252,6 +252,7 @@ func readN(t *testing.T, rx *ristgo.Receiver, want int) []byte {
 
 func interopReceiverConfig() ristgo.Config {
 	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple // these tests pair with libRIST -p 0 (DefaultConfig is Advanced)
 	cfg.BufferMin = 200 * time.Millisecond
 	cfg.BufferMax = 200 * time.Millisecond
 	return cfg
@@ -352,6 +353,7 @@ func TestInteropGoRxLossyRecovery(t *testing.T) {
 	feedPort := freeUDPPort(t, goPort, goPort+1, proxyPort, proxyPort+1)
 
 	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple // pairs with libRIST -p 0 (DefaultConfig is Advanced)
 	cfg.BufferMin = 700 * time.Millisecond
 	cfg.BufferMax = 700 * time.Millisecond
 	rx, err := ristgo.NewReceiver(fmt.Sprintf("127.0.0.1:%d", goPort), cfg)
@@ -411,6 +413,7 @@ func TestInteropLibristRxLossyRecovery(t *testing.T) {
 	waitToolReady(t, rxPort, 5*time.Second) // ristreceiver bound its RIST input
 
 	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple // pairs with libRIST -p 0 (DefaultConfig is Advanced)
 	cfg.BufferMin = 700 * time.Millisecond
 	cfg.BufferMax = 700 * time.Millisecond
 	tx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", proxyPort), cfg)

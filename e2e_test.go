@@ -52,8 +52,12 @@ func freeEvenPort(t *testing.T) int {
 
 // fastConfig shrinks the recovery buffer so playout latency is ~100ms rather
 // than the 1s default, keeping the e2e tests quick.
+// fastConfig is the shared small-buffer Simple-profile test config. It pins
+// ProfileSimple explicitly because DefaultConfig now defaults to Advanced; these
+// tests predate that flip and exercise the Simple even/odd-port wire.
 func fastConfig() ristgo.Config {
 	cfg := ristgo.DefaultConfig()
+	cfg.Profile = ristgo.ProfileSimple
 	cfg.BufferMin = 100 * time.Millisecond
 	cfg.BufferMax = 100 * time.Millisecond
 	return cfg

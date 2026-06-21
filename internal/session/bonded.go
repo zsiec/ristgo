@@ -769,7 +769,12 @@ func (s *Session) handleBondAdv(now clock.Timestamp, idx uint8, p *peer.Peer, bi
 							s.fecRecvAdv(now, pkt.Seq, data) // FEC over the full datagram
 						}
 					} else {
-						s.bondObserveRTT(now, idx, dropAdvEchoRequests(fbs))
+						s.bondObserveRTT(now, idx, s.filterAdvEcho(fbs))
+					}
+					// TR-06-3 §9: a peer's native Advanced keep-alive I bit upgrades the
+					// sender's media framing to Advanced (see Session.remoteSupportsAdvanced).
+					if advI, ok := s.adv.takePeerAdvCap(); ok && advI {
+						s.remoteSupportsAdvanced = true
 					}
 				}
 				return
@@ -783,6 +788,18 @@ func (s *Session) handleBondAdv(now clock.Timestamp, idx uint8, p *peer.Peer, bi
 // path (the RTCP/keepalive substrate), feeding any NACK/feedback into the flow
 // with per-path RTT attribution.
 func (s *Session) handleBondAdvGRE(now clock.Timestamp, idx uint8, data []byte) {
+	// A GRE keep-alive on a bonded path advertises pair-split (L bit, merge=auto)
+	// and, in Advanced mode, the peer's Advanced capability (extended I bit) that
+	// upgrades the sender's media framing to Advanced (TR-06-3 §9).
+	if kind, ka, _, cerr := s.advGRE.peekControl(data); kind == controlKeepalive {
+		if cerr == nil {
+			s.applyRemoteCaps(ka.Caps)
+			if ka.HasAdvExt && ka.AdvExt.I {
+				s.remoteSupportsAdvanced = true
+			}
+		}
+		return
+	}
 	if oob, proto, ok, oerr := s.advGRE.peekOOB(data); ok {
 		if oerr == nil {
 			s.deliverOOB(proto, oob)
@@ -801,7 +818,7 @@ func (s *Session) handleBondAdvGRE(now clock.Timestamp, idx uint8, data []byte) 
 		s.feedMedia(now, idx, pkt)
 		return
 	}
-	s.bondObserveRTT(now, idx, dropAdvEchoRequests(fbs))
+	s.bondObserveRTT(now, idx, s.filterAdvEcho(fbs))
 }
 
 // bondPathForSrc resolves a sender's inbound source address (a receiver path's
@@ -847,6 +864,11 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 	switch {
 	case s.main != nil:
 		b, err = s.main.encodeMainMedia(s.mediaBuf, pkt)
+	case s.advInMainWindow():
+		// TR-06-3 §9 (AdvSenderStartMain): start in Main framing until a peer
+		// advertises Advanced (I=1). Bonded paths all carry one flow to one logical
+		// receiver, so a single session-level upgrade switches every path together.
+		b, err = s.advGRE.encodeMainMedia(s.mediaBuf, pkt)
 	case s.adv != nil:
 		b, err = s.adv.encodeAdvMedia(s.mediaBuf, pkt)
 	default:
@@ -888,7 +910,9 @@ func (s *Session) sendBondMedia(now clock.Timestamp, pkt wire.MediaPacket) {
 		}
 	}
 	s.lastTx = now
-	if s.fecEnabled() {
+	// Suppressed during the §9 Main-framing window (see advInMainWindow): the adv FEC
+	// matrix must not mix Main- and Advanced-framed datagrams; the window relies on ARQ.
+	if s.fecEnabled() && !s.advInMainWindow() {
 		s.fecOnSend(now, pkt, b) // generate row/column FEC and fan it across the paths
 	}
 }

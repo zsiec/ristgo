@@ -97,8 +97,11 @@ func TestE2EAdvFlowAttribute(t *testing.T) {
 // on a non-Advanced sender (flow attributes are Advanced-only) and that OnFlowAttr
 // is rejected at construction on a non-Advanced receiver.
 func TestE2EFlowAttributeUnsupportedProfile(t *testing.T) {
-	// Simple sender: no flow-attribute channel.
-	stx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", freeEvenPort(t)), ristgo.DefaultConfig())
+	// Simple sender: no flow-attribute channel. (DefaultConfig is Advanced, which DOES
+	// support flow attributes, so pin Simple to exercise the unsupported path.)
+	scfg := ristgo.DefaultConfig()
+	scfg.Profile = ristgo.ProfileSimple
+	stx, err := ristgo.NewSender(fmt.Sprintf("127.0.0.1:%d", freeEvenPort(t)), scfg)
 	if err != nil {
 		t.Fatalf("NewSender(Simple): %v", err)
 	}

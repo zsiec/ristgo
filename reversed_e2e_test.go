@@ -220,7 +220,8 @@ func TestReversedConstructorErrors(t *testing.T) {
 	// caller-receiver authenticator); see TestE2EMainEAPSRPListenerSender. Only DTLS and
 	// the Simple odd-port misuse remain constructor errors here.
 
-	oddSimple := ristgo.DefaultConfig() // Simple profile, odd port below
+	oddSimple := ristgo.DefaultConfig()
+	oddSimple.Profile = ristgo.ProfileSimple // odd-port rejection is a Simple rule (DefaultConfig is Advanced)
 
 	cases := []struct {
 		name string

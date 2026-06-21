@@ -16,6 +16,7 @@ package ristgo_test
 import (
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -158,14 +159,18 @@ func TestInteropMainGoRxHeavyLossRecovery(t *testing.T) {
 // dropped and needs a re-NACK, so those packets are never resent -> lost. At <=10%
 // re-NACKs are rarely needed, so it works.
 //
-// Verified fix: changing that one line so last_rtt keeps rtt_ntp (ticks) makes the
-// sender's bloat_skip go 41->0 and this test pass 5/5 against a patched libRIST;
-// libRIST<->libRIST then recovers the whole 25% stream except seq 0 (a separate
-// cold-start edge — a receiver cannot NACK before its first-seen sequence — which
-// ristgo's receiver does handle). Until that fix lands upstream this stays skipped;
-// Simple/Main 25% (above) and the Go<->Go test carry the heavy-loss coverage.
+// The fix landed upstream (libRIST commit 9a30f7b: the Advanced echo now uses
+// calculate_rtt_delay, like Simple/Main). Against a libRIST built at/after that
+// commit, ristgo answers the echo (Config.AnswerAdvRTTEcho) so the sender gets a
+// correctly-scaled RTT and its retry gate no longer jams, and this test recovers
+// 25% byte-exact. It stays SKIPPED by default because the released libRIST in the
+// wild (v0.2.18-rc1) predates the fix and would still fail; set
+// RISTGO_LIBRIST_FIXED=1 to run it against a fixed build. Simple/Main 25% (above)
+// and the Go<->Go test carry the heavy-loss coverage in the default suite.
 func TestInteropAdvGoRxHeavyLossRecovery(t *testing.T) {
-	t.Skip("libRIST bug (verified): adv_ctrl.c RTT-echo >>16 inflates the sender's last_rtt, tripping its delta<rtt retry gate; fix verified locally. ristgo<->ristgo 25% is byte-exact")
+	if os.Getenv("RISTGO_LIBRIST_FIXED") == "" {
+		t.Skip("requires a libRIST built at/after commit 9a30f7b (Advanced RTT-echo scale fix); set RISTGO_LIBRIST_FIXED=1 to run")
+	}
 
 	sender := libristTool(t, "ristsender")
 	goPort := freeMainPort(t)
@@ -178,6 +183,7 @@ func TestInteropAdvGoRxHeavyLossRecovery(t *testing.T) {
 	cfg := advInteropConfig(256, false)
 	cfg.BufferMin = 1000 * time.Millisecond
 	cfg.BufferMax = 1000 * time.Millisecond
+	cfg.AnswerAdvRTTEcho = true // answer the echo so a fixed libRIST sender measures RTT correctly
 	rx, err := ristgo.NewReceiver(fmt.Sprintf("127.0.0.1:%d", goPort), cfg)
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
