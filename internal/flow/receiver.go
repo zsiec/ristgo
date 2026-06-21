@@ -498,10 +498,12 @@ func (f *Flow) feed(now clock.Timestamp, path uint8, pkt wire.MediaPacket) {
 	// the newest packet time and not the immediate successor of lastFound are
 	// candidates. Skipped in ARRIVAL timing, where playout is not source-paced
 	// (the seq-based cursor guard below sheds the unrecoverable ones instead).
-	// DEVIATION(librist): libRIST computes the expected successor as
-	// (last_seq_found+1) & (UINT16_MAX-1) — the 0xFFFE mask clears bit 0
-	// and looks like a typo for & UINT16_MAX; we compare against the true
-	// widened successor.
+	// The expected successor is the true widened successor (lastFound+1).
+	// libRIST historically masked this with & (UINT16_MAX-1) — the 0xFFFE mask
+	// forced the value even, mis-comparing every odd successor in ARRIVAL
+	// timing — and has since corrected it to the bare successor for 32-bit
+	// flows and & UINT16_MAX for 16-bit flows. Our widened 32-bit comparison
+	// already matches both.
 	outOfOrder := false
 	if f.cfg.TimingMode != TimingArrival && packetTime.Before(r.lastPacketTime) && pkt.Seq != r.lastFound+1 {
 		if now.After(packetTime.Add(f.recoveryBuffer110)) {
@@ -658,20 +660,28 @@ func (f *Flow) markMissing(now clock.Timestamp, path uint8, current uint32, pack
 		return
 	}
 	gap := uint64(current - r.lastFound)
-	// Wraparound guard pinned to seq.MaxGap16 (32768) for flows widened
-	// from 16-bit sequences, matching libRIST's
-	// `if (missing_count > 32768) return`.
-	// See ORCHESTRATION.md, 2026-06-12 WP3 binding.
+	// Wraparound guard: a forward gap larger than the cap is read as a backward
+	// wrap/reorder, not loss, and is not NACKed. The cap is profile-aware,
+	// matching libRIST's receiver_mark_missing
+	// `missing_count > (short_seq ? UINT16_SIZE/2 : receiver_queue_max/2)`:
 	//
-	// CONSEQUENCE for native 32-bit Advanced (TR-06-3) flows: this 16-bit
-	// threshold is applied uniformly (libRIST likewise masks missing_count to
-	// 16 bits via & UINT16_MAX before the test), so a *contiguous* loss burst
-	// wider than 32768 sequences is mistaken for a backward wrap and never
-	// NACKed — those packets are recovered only by playout skip, not ARQ. This
-	// is kept deliberately bug-compatible with libRIST for interop parity; a
-	// burst that large already exceeds any realistic recovery window, so the
-	// packets would age out before they could be recovered regardless.
-	if gap > seq.MaxGap16 {
+	//   - widened 16-bit flows (Simple/Main) pin to seq.MaxGap16 (32768), the
+	//     half-16-bit-space antipode beyond which forward vs backward is
+	//     ambiguous; and
+	//   - native 32-bit Advanced (TR-06-3) flows scale to half the recovery
+	//     ring — the widest contiguous loss the ring can still address and
+	//     therefore retransmit.
+	//
+	// At the default 65536-slot ring the two coincide (len/2 == MaxGap16), so
+	// they diverge only once ?recovery-depth= (Config.RecoveryDepth) grows the
+	// Advanced ring. A burst wider than the cap exceeds the addressable window,
+	// so those packets could not be retransmitted regardless and are left to
+	// playout skip. See ORCHESTRATION.md, 2026-06-12 WP3 binding.
+	maxGap := seq.MaxGap16
+	if !r.shortSeq {
+		maxGap = uint64(len(r.ring) / 2)
+	}
+	if gap > maxGap {
 		return
 	}
 	// DEVIATION(librist): gap == 0 means a re-keyed packet for lastFound

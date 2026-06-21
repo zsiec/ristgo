@@ -412,6 +412,51 @@ func TestMissingGapGuards(t *testing.T) {
 	}
 }
 
+func TestMissingGapCapProfileAware(t *testing.T) {
+	// libRIST receiver_mark_missing caps the missing gap at
+	// `short_seq ? UINT16_SIZE/2 : receiver_queue_max/2`. On a native 32-bit
+	// Advanced flow with a ring deeper than the 16-bit space, a contiguous gap
+	// above MaxGap16 but below ring/2 is real, recoverable loss and must be
+	// NACKed — whereas the same gap on a widened 16-bit flow stays an ambiguous
+	// wraparound and is ignored regardless of ring depth.
+	const ringSize = 1 << 18  // 262144 slots; ring/2 == 131072
+	const gap = uint32(70000) // MaxGap16 (32768) < gap < ring/2 (131072)
+
+	feed := func(short bool) *Flow {
+		cfg := testConfig()
+		cfg.RingSize = ringSize
+		f := New(RoleReceiver, cfg)
+		anchor := mkPkt(100, 0, nil)
+		anchor.ShortSeq = short
+		f.Feed(10_000, 0, anchor)
+		next := mkPkt(100+gap, 7_000, nil)
+		next.ShortSeq = short
+		f.Feed(17_000, 0, next)
+		return f
+	}
+
+	// Advanced (short_seq=false): the gap is within the ring's half-span, so it
+	// is detected as loss (count bounded by missing_counter_max, but non-zero).
+	fa := feed(false)
+	if fa.Stats().Missing == 0 {
+		t.Fatalf("Advanced 32-bit flow: gap %d marked 0 missing, want > 0 (recoverable within ring/2)", gap)
+	}
+	if fa.receiver.lastFound != 100+gap {
+		t.Fatalf("Advanced flow lastFound = %d, want %d", fa.receiver.lastFound, 100+gap)
+	}
+
+	// Widened 16-bit (short_seq=true): the same gap exceeds MaxGap16, so it
+	// stays wraparound — the packet is still accepted (lastFound advances) but
+	// nothing is marked missing.
+	fs := feed(true)
+	if got := fs.Stats().Missing; got != 0 {
+		t.Fatalf("widened 16-bit flow: gap %d marked %d missing, want 0 (wraparound, not loss)", gap, got)
+	}
+	if fs.receiver.lastFound != 100+gap {
+		t.Fatalf("16-bit flow lastFound = %d, want %d (packet must still be accepted)", fs.receiver.lastFound, 100+gap)
+	}
+}
+
 func TestMissingSkippedForRetransmitAndOutOfOrder(t *testing.T) {
 	f := New(RoleReceiver, testConfig())
 	f.Feed(10_000, 0, mkPkt(100, 0, nil))

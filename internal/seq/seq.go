@@ -58,30 +58,29 @@ const (
 )
 
 // MaxGap16 is the largest forward gap, in packets, that may be interpreted as
-// loss for 16-bit sequence numbers. It encodes libRIST's wraparound guard in
-// receiver_mark_missing:
+// loss for widened 16-bit (Simple/Main) sequence numbers. It encodes the
+// short_seq branch of libRIST's wraparound guard in receiver_mark_missing:
 //
-//	uint32_t missing_count = (current_seq - f->last_seq_found) & UINT16_MAX;
-//	if (missing_count > 32768)
+//	missing_count = rist_seq_gap(current_seq, last_seq_found, short_seq);
+//	if (missing_count > (short_seq ? UINT16_SIZE/2 : receiver_queue_max/2))
 //		return; // wraparound or reorder, NOT loss
 //
-// A gap of exactly 32768 is still treated as forward loss; only strictly
-// larger gaps indicate a reordered or wrapped packet.
+// For short_seq flows the cap is UINT16_SIZE/2 == 32768: a gap of exactly
+// 32768 is still treated as forward loss; only strictly larger gaps indicate
+// a reordered or wrapped packet. Native 32-bit Advanced flows instead scale
+// the cap to half their recovery ring (see internal/flow's markMissing) and
+// do not use this constant.
 const MaxGap16 uint64 = 1 << 15
 
-// MaxGap32 is the 32-bit analog of MaxGap16: the largest forward gap that may
-// be interpreted as loss for 32-bit extended sequence numbers, scaling the
-// strictly-greater-than-half-range rule to half the 32-bit space.
+// MaxGap32 is the half-32-bit-space antipode (2^31): the 32-bit analog of
+// MaxGap16 for circular ordering, the point at which a forward gap on a native
+// 32-bit sequence becomes ambiguous with a backward wrap.
 //
-// This is a deliberate generalization that deviates from libRIST's literal
-// code: receiver_mark_missing masks the gap to 16 bits and compares it
-// against 32768 unconditionally, even for 32-bit (non-short_seq, i.e.
-// Advanced) flows, so libRIST rejects any gap above 32768 as wraparound
-// regardless of sequence width. Callers that must match libRIST's reference
-// behavior — in particular internal/flow's missing-packet detection on
-// Simple/Main sequences widened from 16 bits — must pin their loss threshold
-// to MaxGap16, not MaxGap32. See the 2026-06-12 entry in ORCHESTRATION.md's
-// decisions log.
+// NOTE: this is NOT the Advanced-profile missing-packet cap. Since libRIST's
+// 2026-06-20 fix, receiver_mark_missing caps a 32-bit flow's gap at
+// receiver_queue_max/2 — half the recovery ring, not half the sequence space —
+// so internal/flow's markMissing scales its cap to len(ring)/2, not MaxGap32.
+// Wiring MaxGap32 in as that cap would admit gaps the ring cannot address.
 const MaxGap32 uint64 = 1 << 31
 
 // Num16 is a wrapping 16-bit RTP sequence number (Simple/Main profile media
