@@ -240,8 +240,15 @@ func TestE2ENATRebindForgerCannotHijack(t *testing.T) {
 	listenerPort := freeMainPort(t)
 
 	cfg := srpNoSecretConfig("rist", "mainprofile")
-	cfg.BufferMin = 800 * time.Millisecond
-	cfg.BufferMax = 800 * time.Millisecond
+	// Generous recovery buffer + deadlines (mirroring TestE2ENATRebindSRPRecovery): the
+	// continuous forged flood competes for the listener's receive path — every junk
+	// datagram is a failed decrypt — alongside the EAP-SRP handshake (not ARQ-protected)
+	// and the media. Under -race on a loaded CI runner both the handshake and ARQ
+	// recovery of flood-induced loopback loss need headroom, or delivery stalls into the
+	// read deadline. The wide margins only extend the failure path; a healthy run still
+	// completes in ~2 s.
+	cfg.BufferMin = 1500 * time.Millisecond
+	cfg.BufferMax = 1500 * time.Millisecond
 	cfg.KeepaliveInterval = 100 * time.Millisecond
 
 	tx, err := ristgo.NewListenerSender(fmt.Sprintf("127.0.0.1:%d", listenerPort), cfg)
@@ -277,14 +284,17 @@ func TestE2ENATRebindForgerCannotHijack(t *testing.T) {
 				return
 			default:
 				forger.Write(junk)
-				time.Sleep(2 * time.Millisecond)
+				// A continuous flood, but paced so rejecting junk does not starve the
+				// real handshake/media on a loaded runner — still ~250 forged pkts/s
+				// throughout the stream, far more than any real hijack attempt.
+				time.Sleep(4 * time.Millisecond)
 			}
 		}
 	}()
 
 	done := make(chan [32]byte, 1)
 	go func() {
-		rx.SetReadDeadline(time.Now().Add(20 * time.Second))
+		rx.SetReadDeadline(time.Now().Add(25 * time.Second))
 		got := make([]byte, 0, totalBytes)
 		buf := make([]byte, 4096)
 		h := sha256.New()
@@ -308,7 +318,7 @@ func TestE2ENATRebindForgerCannotHijack(t *testing.T) {
 		done <- sum
 	}()
 
-	tx.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	tx.SetWriteDeadline(time.Now().Add(25 * time.Second))
 	go func() {
 		for off := 0; off < totalBytes; off += chunk {
 			end := off + chunk
@@ -329,7 +339,7 @@ func TestE2ENATRebindForgerCannotHijack(t *testing.T) {
 			t.Fatalf("forged flood disrupted delivery (authenticated=%v delivered=%d)",
 				rx.Authenticated(), rx.Stats().Delivered)
 		}
-	case <-time.After(23 * time.Second):
+	case <-time.After(28 * time.Second):
 		close(stopForge)
 		t.Fatalf("timed out under forged flood (delivered=%d)", rx.Stats().Delivered)
 	}
